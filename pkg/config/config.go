@@ -5,6 +5,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"time"
 
 	"gopkg.in/yaml.v3"
 	corev1 "k8s.io/api/core/v1"
@@ -71,6 +72,26 @@ type NodeConfig struct {
 	// explicitly tolerate MacVz. Defaults to the well-known Virtual Kubelet
 	// provider taint with NoSchedule.
 	Taints []TaintConfig `yaml:"taints"`
+
+	// EnableLease toggles the coordination.k8s.io/v1 Lease used as the node
+	// heartbeat. Enabled by default; disable only on clusters without lease
+	// support, where the node status update doubles as the heartbeat.
+	EnableLease bool `yaml:"enableLease"`
+
+	// LeaseDurationSeconds is the node lease duration. Kubernetes marks the node
+	// NotReady when the lease is not renewed within this window. The renew
+	// interval is derived by Virtual Kubelet (a fraction of the duration).
+	LeaseDurationSeconds int32 `yaml:"leaseDurationSeconds"`
+
+	// PingInterval is how often the node liveness Ping runs. When leases are
+	// disabled this is also the node status update cadence. Parsed as a Go
+	// duration (e.g. "10s").
+	PingInterval string `yaml:"pingInterval"`
+
+	// StatusUpdateInterval is how often node status is pushed to the API server
+	// when leases are enabled. It is also the cadence at which MacVz re-probes
+	// runtime readiness. Parsed as a Go duration (e.g. "1m").
+	StatusUpdateInterval string `yaml:"statusUpdateInterval"`
 }
 
 // TaintConfig is a YAML-friendly node taint.
@@ -104,6 +125,11 @@ func Default() Config {
 				Value:  "macvz",
 				Effect: string(corev1.TaintEffectNoSchedule),
 			}},
+			// Heartbeat defaults mirror Virtual Kubelet's own defaults.
+			EnableLease:          true,
+			LeaseDurationSeconds: 40,
+			PingInterval:         "10s",
+			StatusUpdateInterval: "1m",
 		},
 	}
 }
@@ -145,6 +171,25 @@ func (c Config) Taints() ([]corev1.Taint, error) {
 		out = append(out, corev1.Taint{Key: t.Key, Value: t.Value, Effect: effect})
 	}
 	return out, nil
+}
+
+// HeartbeatIntervals parses the configured ping and status-update intervals.
+func (c Config) HeartbeatIntervals() (ping, status time.Duration, err error) {
+	ping, err = time.ParseDuration(c.Node.PingInterval)
+	if err != nil {
+		return 0, 0, fmt.Errorf("node.pingInterval %q: %w", c.Node.PingInterval, err)
+	}
+	if ping <= 0 {
+		return 0, 0, fmt.Errorf("node.pingInterval must be positive, got %q", c.Node.PingInterval)
+	}
+	status, err = time.ParseDuration(c.Node.StatusUpdateInterval)
+	if err != nil {
+		return 0, 0, fmt.Errorf("node.statusUpdateInterval %q: %w", c.Node.StatusUpdateInterval, err)
+	}
+	if status <= 0 {
+		return 0, 0, fmt.Errorf("node.statusUpdateInterval must be positive, got %q", c.Node.StatusUpdateInterval)
+	}
+	return ping, status, nil
 }
 
 // Load reads and parses the YAML config at path, layering it over defaults.
@@ -223,6 +268,12 @@ func (c Config) Validate() error {
 	}
 	if _, err := c.Taints(); err != nil {
 		return err
+	}
+	if _, _, err := c.HeartbeatIntervals(); err != nil {
+		return err
+	}
+	if c.Node.EnableLease && c.Node.LeaseDurationSeconds <= 0 {
+		return fmt.Errorf("node.leaseDurationSeconds must be positive when leases are enabled, got %d", c.Node.LeaseDurationSeconds)
 	}
 	return nil
 }

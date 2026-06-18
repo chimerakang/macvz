@@ -19,6 +19,7 @@ import (
 	"github.com/chimerakang/macvz/pkg/provider"
 	"github.com/chimerakang/macvz/pkg/runtime/container"
 	vknode "github.com/virtual-kubelet/virtual-kubelet/node"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
 )
@@ -117,7 +118,7 @@ func run(ctx context.Context, configPath, runtimeBinary string) error {
 	if internalIP == "" {
 		internalIP = detectInternalIP()
 	}
-	node := p.BuildNode(ctx, provider.NodeSpec{
+	nodeSpec := provider.NodeSpec{
 		KubeletVersion: version.Version,
 		OS:             cfg.Node.OS,
 		Arch:           cfg.Node.Arch,
@@ -126,19 +127,50 @@ func run(ctx context.Context, configPath, runtimeBinary string) error {
 		Labels:         cfg.Node.Labels,
 		Annotations:    cfg.Node.Annotations,
 		Taints:         taints,
-	})
+	}
+	node := p.BuildNode(ctx, nodeSpec)
+
+	pingInterval, statusInterval, err := cfg.HeartbeatIntervals()
+	if err != nil {
+		return fmt.Errorf("heartbeat intervals: %w", err)
+	}
+
 	klog.InfoS("registering virtual node",
 		"node", cfg.NodeName,
 		"cpu", cfg.Node.CPU, "memory", cfg.Node.Memory, "pods", cfg.Node.Pods,
 		"internalIP", internalIP, "taints", len(taints),
+		"enableLease", cfg.Node.EnableLease, "pingInterval", pingInterval, "statusInterval", statusInterval,
 	)
 
-	// Start the Virtual Kubelet node controller. NaiveNodeProvider keeps the node
-	// marked ready via Ping; lease/heartbeat updates (#15) build on this loop.
+	// Node provider re-probes runtime readiness on the status interval and
+	// surfaces changes as node conditions.
+	nodeProvider := p.NewNodeStatusProvider(nodeSpec, statusInterval)
+
+	// Log transient status-update errors and keep going: the control loop retries
+	// on the next interval, and client-go applies its own backoff. Returning nil
+	// signals "handled, retry possible" to Virtual Kubelet.
+	statusErrHandler := func(_ context.Context, err error) error {
+		klog.ErrorS(err, "transient node status update error; will retry", "node", cfg.NodeName)
+		return nil
+	}
+
+	opts := []vknode.NodeControllerOpt{
+		vknode.WithNodePingInterval(pingInterval),
+		vknode.WithNodeStatusUpdateInterval(statusInterval),
+		vknode.WithNodeStatusUpdateErrorHandler(statusErrHandler),
+	}
+	if cfg.Node.EnableLease {
+		// The Lease in kube-node-lease is the modern node heartbeat; Kubernetes
+		// marks the node NotReady if it is not renewed within the lease duration.
+		leaseClient := clientset.CoordinationV1().Leases(corev1.NamespaceNodeLease)
+		opts = append(opts, vknode.WithNodeEnableLeaseV1(leaseClient, cfg.Node.LeaseDurationSeconds))
+	}
+
 	nc, err := vknode.NewNodeController(
-		vknode.NaiveNodeProvider{},
+		nodeProvider,
 		node,
 		clientset.CoreV1().Nodes(),
+		opts...,
 	)
 	if err != nil {
 		return fmt.Errorf("create node controller: %w", err)

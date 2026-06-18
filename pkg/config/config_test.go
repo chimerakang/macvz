@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 )
@@ -131,6 +132,58 @@ func TestLoadOverridesNodeCapacity(t *testing.T) {
 	}
 	if cfg.Node.OS != "linux" {
 		t.Errorf("OS = %q, want default linux", cfg.Node.OS)
+	}
+}
+
+func TestDefaultHeartbeat(t *testing.T) {
+	c := Default()
+	if !c.Node.EnableLease {
+		t.Error("lease should be enabled by default")
+	}
+	if c.Node.LeaseDurationSeconds != 40 {
+		t.Errorf("LeaseDurationSeconds = %d, want 40", c.Node.LeaseDurationSeconds)
+	}
+	ping, status, err := c.HeartbeatIntervals()
+	if err != nil {
+		t.Fatalf("HeartbeatIntervals: %v", err)
+	}
+	if ping != 10*time.Second {
+		t.Errorf("ping = %v, want 10s", ping)
+	}
+	if status != time.Minute {
+		t.Errorf("status = %v, want 1m", status)
+	}
+}
+
+func TestHeartbeatIntervalsRejectsBadDuration(t *testing.T) {
+	c := Default()
+	c.Node.PingInterval = "soon"
+	if _, _, err := c.HeartbeatIntervals(); err == nil {
+		t.Fatal("expected error for invalid ping interval")
+	}
+	if err := c.Validate(); err == nil {
+		t.Fatal("Validate should reject an invalid interval")
+	}
+}
+
+func TestHeartbeatIntervalsRejectsNonPositive(t *testing.T) {
+	c := Default()
+	c.Node.StatusUpdateInterval = "0s"
+	if _, _, err := c.HeartbeatIntervals(); err == nil {
+		t.Fatal("expected error for non-positive status interval")
+	}
+}
+
+func TestValidateRejectsBadLeaseDuration(t *testing.T) {
+	c := Default()
+	c.Node.LeaseDurationSeconds = 0
+	if err := c.Validate(); err == nil {
+		t.Fatal("Validate should reject a non-positive lease duration when leases enabled")
+	}
+	// Disabling leases makes the duration irrelevant.
+	c.Node.EnableLease = false
+	if err := c.Validate(); err != nil {
+		t.Fatalf("lease duration should be ignored when leases disabled: %v", err)
 	}
 }
 

@@ -45,3 +45,12 @@ node:
     - key: virtual-kubelet.io/provider
       value: macvz
       effect: NoSchedule
+
+  # Heartbeat / lease tuning. The coordination.k8s.io Lease is the node
+  # heartbeat: Kubernetes marks the node NotReady if it is not renewed within
+  # leaseDurationSeconds. Disable enableLease only on clusters without lease
+  # support (then node status updates double as the heartbeat).
+  enableLease: true
+  leaseDurationSeconds: 40
+  pingInterval: 10s          # node liveness Ping cadence
+  statusUpdateInterval: 1m   # node status push + runtime readiness re-probe

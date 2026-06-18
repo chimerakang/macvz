@@ -42,7 +42,7 @@ Source of truth for the phased roadmap. Phases map to GitHub **Milestones**; tas
 | #15 | Implement node heartbeat and lease updates | P2 | in progress |
 | #16 | Implement Provider PodLifecycleHandler state and CRUD methods | P2 | in progress |
 | #17 | Translate Kubernetes Pod specs into runtime workload specs | P2 | in progress |
-| #18 | Wire kubectl logs and exec through the runtime | P2 | open |
+| #18 | Wire kubectl logs and exec through the runtime | P2 | in progress |
 | #19 | Add RBAC, manifests, and P2 MVP smoke test docs | P2 | open |
 | #20 | Implement Kubernetes-coordinated Pod IPAM | P3 | open |
 | #21 | Bring up WireGuard mesh between MacVz nodes | P3 | open |

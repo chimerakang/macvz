@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -31,6 +32,15 @@ type recordingRuntime struct {
 	destroyedIDs []string
 
 	pullErr, createErr, startErr, stopErr, destroyErr, statusErr error
+
+	// log/exec behavior
+	logData     string
+	lastLogOpts runtime.LogOptions
+	logErr      error
+	execStdout  string
+	execStderr  string
+	execErr     error
+	lastExecCmd []string
 }
 
 func newRecordingRuntime() *recordingRuntime {
@@ -104,10 +114,29 @@ func (r *recordingRuntime) Status(_ context.Context, id string) (runtime.Status,
 	return st, nil
 }
 
-func (r *recordingRuntime) Logs(context.Context, string, runtime.LogOptions) (io.ReadCloser, error) {
-	return nil, nil
+func (r *recordingRuntime) Logs(_ context.Context, _ string, opts runtime.LogOptions) (io.ReadCloser, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.lastLogOpts = opts
+	if r.logErr != nil {
+		return nil, r.logErr
+	}
+	return io.NopCloser(strings.NewReader(r.logData)), nil
 }
-func (r *recordingRuntime) Exec(context.Context, string, []string, runtime.ExecIO) error { return nil }
+
+func (r *recordingRuntime) Exec(_ context.Context, _ string, cmd []string, sio runtime.ExecIO) error {
+	r.mu.Lock()
+	stdout, stderr, execErr := r.execStdout, r.execStderr, r.execErr
+	r.lastExecCmd = cmd
+	r.mu.Unlock()
+	if sio.Stdout != nil && stdout != "" {
+		io.WriteString(sio.Stdout, stdout)
+	}
+	if sio.Stderr != nil && stderr != "" {
+		io.WriteString(sio.Stderr, stderr)
+	}
+	return execErr
+}
 
 func (r *recordingRuntime) setStatus(id string, st runtime.Status) {
 	r.mu.Lock()

@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/chimerakang/macvz/pkg/metrics"
 	"github.com/chimerakang/macvz/pkg/network"
 	"github.com/chimerakang/macvz/pkg/runtime"
 	"github.com/virtual-kubelet/virtual-kubelet/node"
@@ -47,6 +48,10 @@ type Provider struct {
 	// `kubectl get pod -o wide` and topology-aware routing resolve the host. Set
 	// once at startup before the Pod controller runs; treated as immutable after.
 	hostIP string
+
+	// collector builds the node/Pod resource metrics served through the kubelet
+	// stats and resource-metrics endpoints (#25).
+	collector *metrics.Collector
 }
 
 // Option configures a Provider at construction time.
@@ -104,7 +109,16 @@ func New(nodeName string, rt runtime.Runtime, opts ...Option) *Provider {
 	for _, opt := range opts {
 		opt(p)
 	}
+	if p.collector == nil {
+		p.collector = metrics.NewCollector(nodeName, metrics.DefaultMemorySampler())
+	}
 	return p
+}
+
+// WithCollector overrides the metrics collector, chiefly so tests can inject a
+// fake host memory sampler. Production wiring uses the default in New.
+func WithCollector(c *metrics.Collector) Option {
+	return func(p *Provider) { p.collector = c }
 }
 
 // SetIPAM attaches a Pod IP allocator after construction. The node's Pod CIDR is

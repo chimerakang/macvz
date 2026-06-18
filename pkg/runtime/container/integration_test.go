@@ -321,6 +321,65 @@ func TestExecIntegration(t *testing.T) {
 	}
 }
 
+// TestStatsIntegration confirms the Stater capability reads real resource usage
+// from a running micro-VM and reports ErrStatsUnavailable for a missing one.
+func TestStatsIntegration(t *testing.T) {
+	if os.Getenv("MACVZ_INTEGRATION") != "1" {
+		t.Skip("set MACVZ_INTEGRATION=1 to run against a real apple/container service")
+	}
+
+	d := New(Config{})
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	if err := d.Ready(ctx); err != nil {
+		t.Fatalf("Ready: %v", err)
+	}
+
+	const image = "docker.io/library/alpine:3.20"
+	if err := d.Pull(ctx, image); err != nil {
+		t.Fatalf("Pull: %v", err)
+	}
+	spec := types.ContainerSpec{Name: "macvz-stats-it", Image: image, Command: []string{"sleep", "120"}}
+	_ = d.Destroy(ctx, spec.Name)
+	id, err := d.Create(ctx, spec)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	t.Cleanup(func() { _ = d.Destroy(context.Background(), id) })
+	if err := d.Start(ctx, id); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// Poll until the VM is running so stats are sampleable.
+	for i := 0; i < 30; i++ {
+		if st, _ := d.Status(ctx, id); st.Phase == runtime.PhaseRunning {
+			break
+		}
+		time.Sleep(time.Second)
+	}
+
+	rs, err := d.Stats(ctx, id)
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if rs.MemoryUsageBytes == 0 {
+		t.Error("expected non-zero memory usage for a running VM")
+	}
+	if rs.MemoryLimitBytes == 0 {
+		t.Error("expected a memory limit for a running VM")
+	}
+	if rs.Timestamp.IsZero() {
+		t.Error("expected a sample timestamp")
+	}
+	t.Logf("stats: cpu=%dns mem=%d/%d bytes net=%d/%d",
+		rs.CPUUsageCoreNanoSeconds, rs.MemoryUsageBytes, rs.MemoryLimitBytes, rs.NetworkRxBytes, rs.NetworkTxBytes)
+
+	// A nonexistent workload has no sampleable stats.
+	if _, err := d.Stats(ctx, "macvz-stats-it-absent"); !errors.Is(err, runtime.ErrStatsUnavailable) {
+		t.Errorf("Stats(absent) err = %v, want ErrStatsUnavailable", err)
+	}
+}
+
 // TestArchVerificationIntegration confirms an arm64 image pulls and boots, and a
 // non-arm64 image is rejected with a clear ErrIncompatibleArch — both at Pull
 // (inspect-based) and at Create (auto-pull path).

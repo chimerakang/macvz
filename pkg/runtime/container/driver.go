@@ -400,7 +400,8 @@ func mapErr(err error) error {
 	}
 	msg := strings.ToLower(ce.Stderr)
 	switch {
-	case strings.Contains(msg, "not found"):
+	case strings.Contains(msg, "not found"),
+		strings.Contains(msg, "no such container"):
 		return fmt.Errorf("%w: %v", runtime.ErrNotFound, err)
 	case strings.Contains(msg, "not running"):
 		return fmt.Errorf("%w: %v", runtime.ErrNotRunning, err)

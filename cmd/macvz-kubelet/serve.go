@@ -230,6 +230,8 @@ func startKubeletServer(ctx context.Context, cfg config.Config, p *provider.Prov
 		PortForward:           p.PortForward,
 		GetPods:               p.GetPods,
 		GetPodsFromKubernetes: p.GetPods,
+		GetStatsSummary:       p.StatsSummary,
+		GetMetricsResource:    p.MetricsResource,
 	}, false)
 
 	addr := fmt.Sprintf(":%d", cfg.Node.KubeletPort)

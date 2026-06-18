@@ -92,6 +92,17 @@ type NodeConfig struct {
 	// when leases are enabled. It is also the cadence at which MacVz re-probes
 	// runtime readiness. Parsed as a Go duration (e.g. "1m").
 	StatusUpdateInterval string `yaml:"statusUpdateInterval"`
+
+	// KubeletPort is the port the node's kubelet API (logs/exec) listens on.
+	// The Kubernetes API server connects here to serve `kubectl logs`/`exec`.
+	KubeletPort int32 `yaml:"kubeletPort"`
+
+	// ServingTLSCertFile and ServingTLSKeyFile enable the kubelet HTTPS server.
+	// When either is empty the server is not started: Pods still run, but
+	// `kubectl logs`/`exec` are unavailable. The API server must be able to
+	// reach the node's InternalIP on KubeletPort and trust the serving cert.
+	ServingTLSCertFile string `yaml:"servingTLSCertFile"`
+	ServingTLSKeyFile  string `yaml:"servingTLSKeyFile"`
 }
 
 // TaintConfig is a YAML-friendly node taint.
@@ -130,6 +141,8 @@ func Default() Config {
 			LeaseDurationSeconds: 40,
 			PingInterval:         "10s",
 			StatusUpdateInterval: "1m",
+			// Standard kubelet API port.
+			KubeletPort: 10250,
 		},
 	}
 }
@@ -274,6 +287,12 @@ func (c Config) Validate() error {
 	}
 	if c.Node.EnableLease && c.Node.LeaseDurationSeconds <= 0 {
 		return fmt.Errorf("node.leaseDurationSeconds must be positive when leases are enabled, got %d", c.Node.LeaseDurationSeconds)
+	}
+	if c.Node.KubeletPort <= 0 || c.Node.KubeletPort > 65535 {
+		return fmt.Errorf("node.kubeletPort must be in 1..65535, got %d", c.Node.KubeletPort)
+	}
+	if (c.Node.ServingTLSCertFile == "") != (c.Node.ServingTLSKeyFile == "") {
+		return fmt.Errorf("node.servingTLSCertFile and node.servingTLSKeyFile must be set together")
 	}
 	return nil
 }

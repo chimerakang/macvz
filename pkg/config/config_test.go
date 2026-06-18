@@ -187,6 +187,36 @@ func TestValidateRejectsBadLeaseDuration(t *testing.T) {
 	}
 }
 
+func TestDefaultKubeletPort(t *testing.T) {
+	if Default().Node.KubeletPort != 10250 {
+		t.Errorf("default KubeletPort = %d, want 10250", Default().Node.KubeletPort)
+	}
+}
+
+func TestValidateRejectsBadKubeletPort(t *testing.T) {
+	c := Default()
+	c.Node.KubeletPort = 0
+	if err := c.Validate(); err == nil {
+		t.Fatal("Validate should reject KubeletPort 0")
+	}
+	c.Node.KubeletPort = 70000
+	if err := c.Validate(); err == nil {
+		t.Fatal("Validate should reject KubeletPort > 65535")
+	}
+}
+
+func TestValidateRejectsUnpairedServingTLS(t *testing.T) {
+	c := Default()
+	c.Node.ServingTLSCertFile = "/tmp/cert.pem"
+	if err := c.Validate(); err == nil {
+		t.Fatal("Validate should reject cert without key")
+	}
+	c.Node.ServingTLSKeyFile = "/tmp/key.pem"
+	if err := c.Validate(); err != nil {
+		t.Fatalf("cert+key together should validate: %v", err)
+	}
+}
+
 func TestRestConfigMissingKubeconfigErrors(t *testing.T) {
 	c := Default()
 	c.KubeconfigPath = filepath.Join(t.TempDir(), "absent.kubeconfig")

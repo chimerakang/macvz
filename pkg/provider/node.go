@@ -24,6 +24,9 @@ type NodeSpec struct {
 	Labels, Annotations map[string]string
 	// Taints gate scheduling so only Pods that tolerate MacVz land here.
 	Taints []corev1.Taint
+	// KubeletPort is advertised as the node's kubelet endpoint so the API
+	// server knows where to reach logs/exec. Zero leaves it unset.
+	KubeletPort int32
 }
 
 // BuildNode assembles the corev1.Node this provider registers. The Ready
@@ -68,6 +71,12 @@ func (p *Provider) BuildNode(ctx context.Context, spec NodeSpec) *corev1.Node {
 			},
 			Conditions: nodeConditions(ready, readyMsg),
 		},
+	}
+
+	if spec.KubeletPort > 0 {
+		node.Status.DaemonEndpoints = corev1.NodeDaemonEndpoints{
+			KubeletEndpoint: corev1.DaemonEndpoint{Port: spec.KubeletPort},
+		}
 	}
 
 	if spec.InternalIP != "" {

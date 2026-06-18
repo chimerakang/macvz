@@ -12,6 +12,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 
 	"github.com/chimerakang/macvz/internal/version"
@@ -127,6 +128,7 @@ func run(ctx context.Context, configPath, runtimeBinary string) error {
 		Labels:         cfg.Node.Labels,
 		Annotations:    cfg.Node.Annotations,
 		Taints:         taints,
+		KubeletPort:    cfg.Node.KubeletPort,
 	}
 	node := p.BuildNode(ctx, nodeSpec)
 
@@ -193,10 +195,24 @@ func run(ctx context.Context, configPath, runtimeBinary string) error {
 		return nil
 	}
 
+	// Start the Pod lifecycle controller so scheduled Pods become micro-VMs.
+	stopPods, err := startPodController(ctx, cfg, clientset, p, runtime.NumCPU())
+	if err != nil {
+		return fmt.Errorf("start pod controller: %w", err)
+	}
+	defer stopPods()
+
+	// Start the kubelet API server for kubectl logs/exec (no-op without certs).
+	stopServer, err := startKubeletServer(ctx, cfg, p)
+	if err != nil {
+		return fmt.Errorf("start kubelet server: %w", err)
+	}
+	defer stopServer()
+
 	// Block until shutdown is requested, then let the cancelled context unwind
-	// the controller's run loop.
+	// the controller run loops.
 	<-ctx.Done()
-	klog.InfoS("shutdown signal received; stopping node controller", "node", cfg.NodeName)
+	klog.InfoS("shutdown signal received; stopping controllers", "node", cfg.NodeName)
 	<-nc.Done()
 	if err := nc.Err(); err != nil {
 		return fmt.Errorf("node controller shutdown: %w", err)

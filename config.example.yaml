@@ -54,3 +54,10 @@ node:
   leaseDurationSeconds: 40
   pingInterval: 10s          # node liveness Ping cadence
   statusUpdateInterval: 1m   # node status push + runtime readiness re-probe
+
+  # Kubelet API (kubectl logs/exec). The Kubernetes API server connects to the
+  # node's InternalIP on kubeletPort over HTTPS. Provide a serving cert+key to
+  # enable logs/exec; leave them empty to run Pods without logs/exec support.
+  kubeletPort: 10250
+  servingTLSCertFile: ""     # e.g. /etc/macvz/pki/kubelet.crt
+  servingTLSKeyFile: ""      # e.g. /etc/macvz/pki/kubelet.key

@@ -1,0 +1,62 @@
+# RBAC for a macvz-kubelet virtual node, scoped to the P2 MVP.
+#
+# macvz-kubelet runs as a host process on the Mac (it drives apple/container, a
+# host service) and talks to the cluster with the identity in its kubeconfig.
+# For production, point that kubeconfig at the ServiceAccount token below; for
+# local development an admin kubeconfig already covers these permissions.
+#
+# Apply with: kubectl apply -f deployments/rbac.yaml
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: macvz-kubelet
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: macvz-kubelet
+rules:
+  # Register and maintain the virtual node and its status.
+  - apiGroups: [""]
+    resources: ["nodes", "nodes/status"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # Reconcile Pods scheduled to this node and report their status.
+  - apiGroups: [""]
+    resources: ["pods", "pods/status"]
+    verbs: ["get", "list", "watch", "update", "patch", "delete"]
+
+  # Resolve Pod references (env, projected volumes) via the pod controller's
+  # informers.
+  - apiGroups: [""]
+    resources: ["configmaps", "secrets", "services"]
+    verbs: ["get", "list", "watch"]
+
+  # Emit Pod/node lifecycle events.
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch", "update"]
+
+  # Node heartbeat lease in kube-node-lease.
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: macvz-kubelet
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: macvz-kubelet
+subjects:
+  - kind: ServiceAccount
+    name: macvz-kubelet
+    namespace: kube-system
+# Note on `kubectl logs`/`exec`: these do not need extra permissions for the
+# macvz-kubelet identity (it *serves* them). The API server proxies the request
+# to the node's kubelet endpoint; the requesting user needs the usual
+# pods/log and pods/exec (nodes/proxy) permissions, which cluster-admin has.

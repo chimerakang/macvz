@@ -7,6 +7,8 @@ import (
 	"os"
 
 	"gopkg.in/yaml.v3"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
 )
 
 // Config is the on-disk configuration for a macvz-kubelet node process.
@@ -68,6 +70,45 @@ func Load(path string) (Config, error) {
 		return cfg, err
 	}
 	return cfg, nil
+}
+
+// RestConfig builds the Kubernetes client REST config used to reach the API
+// server, resolving sources in this order:
+//
+//  1. KubeconfigPath, when set. The file must exist and parse, otherwise a clear
+//     error is returned (no silent fallback — a misconfigured node should fail
+//     loudly at startup).
+//  2. The KUBECONFIG env var and the default ~/.kube/config loading rules.
+//  3. In-cluster config, when running inside a Pod.
+func (c Config) RestConfig() (*rest.Config, error) {
+	if c.KubeconfigPath != "" {
+		if _, err := os.Stat(c.KubeconfigPath); err != nil {
+			return nil, fmt.Errorf("kubeconfig %q: %w", c.KubeconfigPath, err)
+		}
+		cfg, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
+			&clientcmd.ClientConfigLoadingRules{ExplicitPath: c.KubeconfigPath},
+			&clientcmd.ConfigOverrides{},
+		).ClientConfig()
+		if err != nil {
+			return nil, fmt.Errorf("load kubeconfig %q: %w", c.KubeconfigPath, err)
+		}
+		return cfg, nil
+	}
+
+	// No explicit path: honor KUBECONFIG / default rules, then in-cluster.
+	rules := clientcmd.NewDefaultClientConfigLoadingRules()
+	cfg, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
+		rules, &clientcmd.ConfigOverrides{},
+	).ClientConfig()
+	if err == nil {
+		return cfg, nil
+	}
+
+	inCluster, inErr := rest.InClusterConfig()
+	if inErr != nil {
+		return nil, fmt.Errorf("no kubeconfig found (%v) and not running in-cluster (%w)", err, inErr)
+	}
+	return inCluster, nil
 }
 
 // Validate checks that required fields are present and coherent.

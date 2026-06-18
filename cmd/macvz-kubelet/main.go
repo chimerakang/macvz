@@ -9,6 +9,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"os/signal"
 	"syscall"
@@ -18,8 +19,6 @@ import (
 	"github.com/chimerakang/macvz/pkg/provider"
 	"github.com/chimerakang/macvz/pkg/runtime/container"
 	vknode "github.com/virtual-kubelet/virtual-kubelet/node"
-	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
 )
@@ -104,14 +103,41 @@ func run(ctx context.Context, configPath, runtimeBinary string) error {
 	// Construct the provider over the runtime driver. Pod lifecycle methods are
 	// stubbed until #16; this issue only wires the node controller loop.
 	p := provider.New(cfg.NodeName, driver)
-	_ = p // pod controller wiring lands with the Pod lifecycle (#16).
+
+	// Resolve the configured node shape (capacity/taints validated at load).
+	capacity, err := cfg.Capacity()
+	if err != nil {
+		return fmt.Errorf("node capacity: %w", err)
+	}
+	taints, err := cfg.Taints()
+	if err != nil {
+		return fmt.Errorf("node taints: %w", err)
+	}
+	internalIP := cfg.Node.InternalIP
+	if internalIP == "" {
+		internalIP = detectInternalIP()
+	}
+	node := p.BuildNode(ctx, provider.NodeSpec{
+		KubeletVersion: version.Version,
+		OS:             cfg.Node.OS,
+		Arch:           cfg.Node.Arch,
+		InternalIP:     internalIP,
+		Capacity:       capacity,
+		Labels:         cfg.Node.Labels,
+		Annotations:    cfg.Node.Annotations,
+		Taints:         taints,
+	})
+	klog.InfoS("registering virtual node",
+		"node", cfg.NodeName,
+		"cpu", cfg.Node.CPU, "memory", cfg.Node.Memory, "pods", cfg.Node.Pods,
+		"internalIP", internalIP, "taints", len(taints),
+	)
 
 	// Start the Virtual Kubelet node controller. NaiveNodeProvider keeps the node
-	// marked ready via Ping; capacity/conditions (#14) and lease/heartbeat (#15)
-	// build on this loop.
+	// marked ready via Ping; lease/heartbeat updates (#15) build on this loop.
 	nc, err := vknode.NewNodeController(
 		vknode.NaiveNodeProvider{},
-		buildNode(cfg.NodeName),
+		node,
 		clientset.CoreV1().Nodes(),
 	)
 	if err != nil {
@@ -147,35 +173,18 @@ func run(ctx context.Context, configPath, runtimeBinary string) error {
 	return nil
 }
 
-// buildNode returns the minimal Node object the controller registers. Capacity,
-// addresses, taints, and detailed conditions are filled in by #14; here we only
-// establish identity and a Ready condition so the control loop can run.
-func buildNode(name string) *corev1.Node {
-	return &corev1.Node{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: name,
-			Labels: map[string]string{
-				"type":                   "virtual-kubelet",
-				"kubernetes.io/role":     "agent",
-				"kubernetes.io/hostname": name,
-				"kubernetes.io/os":       "linux",
-				"kubernetes.io/arch":     "arm64",
-			},
-		},
-		Status: corev1.NodeStatus{
-			NodeInfo: corev1.NodeSystemInfo{
-				OperatingSystem: "linux",
-				Architecture:    "arm64",
-				KubeletVersion:  version.Version,
-			},
-			Conditions: []corev1.NodeCondition{{
-				Type:               corev1.NodeReady,
-				Status:             corev1.ConditionTrue,
-				Reason:             "KubeletReady",
-				Message:            "macvz-kubelet is ready",
-				LastHeartbeatTime:  metav1.Now(),
-				LastTransitionTime: metav1.Now(),
-			}},
-		},
+// detectInternalIP returns the host's primary outbound IPv4 address, used as
+// the node's InternalIP when not set in config. It opens no connection (UDP
+// dial just selects a route), and returns "" if detection fails — the node then
+// registers without an InternalIP.
+func detectInternalIP() string {
+	conn, err := net.Dial("udp", "8.8.8.8:80")
+	if err != nil {
+		return ""
 	}
+	defer conn.Close()
+	if addr, ok := conn.LocalAddr().(*net.UDPAddr); ok {
+		return addr.IP.String()
+	}
+	return ""
 }

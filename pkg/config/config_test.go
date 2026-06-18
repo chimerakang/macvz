@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	corev1 "k8s.io/api/core/v1"
 )
 
 func TestLoadMissingPathReturnsDefaults(t *testing.T) {
@@ -56,6 +58,79 @@ func TestRuntimeSocketIsOptional(t *testing.T) {
 	c.RuntimeSocket = ""
 	if err := c.Validate(); err != nil {
 		t.Fatalf("RuntimeSocket is reserved for future service API use and should be optional: %v", err)
+	}
+}
+
+func TestDefaultNodeCapacity(t *testing.T) {
+	c := Default()
+	cap, err := c.Capacity()
+	if err != nil {
+		t.Fatalf("Capacity: %v", err)
+	}
+	if cap.Cpu().String() != "2" {
+		t.Errorf("default cpu = %q, want 2", cap.Cpu().String())
+	}
+	if _, ok := cap[corev1.ResourcePods]; !ok {
+		t.Error("pods capacity missing")
+	}
+}
+
+func TestDefaultNodeTaint(t *testing.T) {
+	c := Default()
+	taints, err := c.Taints()
+	if err != nil {
+		t.Fatalf("Taints: %v", err)
+	}
+	if len(taints) != 1 || taints[0].Key != DefaultProviderTaintKey {
+		t.Fatalf("expected default provider taint, got %v", taints)
+	}
+	if string(taints[0].Effect) != "NoSchedule" {
+		t.Errorf("default taint effect = %q, want NoSchedule", taints[0].Effect)
+	}
+}
+
+func TestCapacityRejectsBadQuantity(t *testing.T) {
+	c := Default()
+	c.Node.Memory = "not-a-quantity"
+	if _, err := c.Capacity(); err == nil {
+		t.Fatal("expected error for invalid memory quantity")
+	}
+	if err := c.Validate(); err == nil {
+		t.Fatal("Validate should reject an invalid capacity quantity")
+	}
+}
+
+func TestTaintsRejectsBadEffect(t *testing.T) {
+	c := Default()
+	c.Node.Taints = []TaintConfig{{Key: "k", Effect: "Nonsense"}}
+	if _, err := c.Taints(); err == nil {
+		t.Fatal("expected error for invalid taint effect")
+	}
+	if err := c.Validate(); err == nil {
+		t.Fatal("Validate should reject an invalid taint effect")
+	}
+}
+
+func TestLoadOverridesNodeCapacity(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "config.yaml")
+	const body = "node:\n  cpu: \"8\"\n  memory: 16Gi\n"
+	if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Node.CPU != "8" || cfg.Node.Memory != "16Gi" {
+		t.Errorf("node overrides not applied: %+v", cfg.Node)
+	}
+	// Unspecified node fields keep their defaults.
+	if cfg.Node.Pods != "20" {
+		t.Errorf("Pods = %q, want default 20", cfg.Node.Pods)
+	}
+	if cfg.Node.OS != "linux" {
+		t.Errorf("OS = %q, want default linux", cfg.Node.OS)
 	}
 }
 

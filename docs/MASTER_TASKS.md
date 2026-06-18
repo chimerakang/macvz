@@ -38,7 +38,7 @@ Source of truth for the phased roadmap. Phases map to GitHub **Milestones**; tas
 | #11 | Density & per-VM RAM-overhead benchmark | P1 | open |
 | #12 | arm64 image pull verification | P1 | open |
 | #13 | Wire Virtual Kubelet controller into macvz-kubelet | P2 | in progress |
-| #14 | Register virtual node with capacity, addresses, taints, and conditions | P2 | open |
+| #14 | Register virtual node with capacity, addresses, taints, and conditions | P2 | in progress |
 | #15 | Implement node heartbeat and lease updates | P2 | open |
 | #16 | Implement Provider PodLifecycleHandler state and CRUD methods | P2 | open |
 | #17 | Translate Kubernetes Pod specs into runtime workload specs | P2 | open |

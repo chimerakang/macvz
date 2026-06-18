@@ -50,7 +50,7 @@ Source of truth for the phased roadmap. Phases map to GitHub **Milestones**; tas
 | #23 | Report Pod IPs and readiness so Services resolve across MacVz nodes | P3 | closed |
 | #24 | Implement kubectl port-forward for MacVz-backed Pods | P3 | closed |
 | #25 | Implement node and pod metrics reporting | P4 | closed |
-| #26 | Support VirtioFS-backed volumes for MacVz Pods | P4 | open |
+| #26 | Support VirtioFS-backed volumes for MacVz Pods | P4 | closed |
 | #27 | Handle image architecture and Rosetta-for-Linux behavior | P4 | open |
 | #28 | Harden mTLS, RBAC, and runtime access boundaries | P4 | open |
 | #29 | Add signed and notarized macvz-kubelet release flow | P4 | open |

@@ -54,6 +54,30 @@ func TestValidate(t *testing.T) {
 	}
 }
 
+func TestValidateVolumes(t *testing.T) {
+	c := Default()
+	if c.Node.Volumes.Root != "/var/lib/macvz/volumes" {
+		t.Errorf("default volume root = %q, want /var/lib/macvz/volumes", c.Node.Volumes.Root)
+	}
+
+	c.Node.Volumes.Root = "relative/path"
+	if err := c.Validate(); err == nil {
+		t.Error("expected error for relative volumes.root")
+	}
+
+	c = Default()
+	c.Node.Volumes.HostPathAllowedPrefixes = []string{"relative"}
+	if err := c.Validate(); err == nil {
+		t.Error("expected error for relative hostPath allowlist prefix")
+	}
+
+	c = Default()
+	c.Node.Volumes.HostPathAllowedPrefixes = []string{"/srv/data"}
+	if err := c.Validate(); err != nil {
+		t.Errorf("absolute prefix should validate: %v", err)
+	}
+}
+
 func TestRuntimeSocketIsOptional(t *testing.T) {
 	c := Default()
 	c.RuntimeSocket = ""

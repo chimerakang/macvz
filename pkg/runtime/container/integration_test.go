@@ -380,6 +380,81 @@ func TestStatsIntegration(t *testing.T) {
 	}
 }
 
+// TestVolumeMountIntegration confirms VirtioFS bind mounts and a guest tmpfs
+// work end-to-end: a read-only host share is readable inside the VM, a
+// read-write share persists a write back to the host, and a tmpfs is writable.
+func TestVolumeMountIntegration(t *testing.T) {
+	if os.Getenv("MACVZ_INTEGRATION") != "1" {
+		t.Skip("set MACVZ_INTEGRATION=1 to run against a real apple/container service")
+	}
+
+	d := New(Config{})
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	if err := d.Ready(ctx); err != nil {
+		t.Fatalf("Ready: %v", err)
+	}
+
+	// A read-only host source with a known file, and a read-write scratch dir.
+	roSrc := t.TempDir()
+	if err := os.WriteFile(roSrc+"/hello.txt", []byte("from-host"), 0o644); err != nil {
+		t.Fatalf("seed ro source: %v", err)
+	}
+	rwSrc := t.TempDir()
+
+	const image = "docker.io/library/alpine:3.20"
+	if err := d.Pull(ctx, image); err != nil {
+		t.Fatalf("Pull: %v", err)
+	}
+	spec := types.ContainerSpec{
+		Name:    "macvz-vol-it",
+		Image:   image,
+		Command: []string{"sleep", "120"},
+		Mounts: []types.Mount{
+			{Source: roSrc, Target: "/ro", ReadOnly: true},
+			{Source: rwSrc, Target: "/rw"},
+			{Target: "/cache", Tmpfs: true},
+		},
+	}
+	_ = d.Destroy(ctx, spec.Name)
+	id, err := d.Create(ctx, spec)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	t.Cleanup(func() { _ = d.Destroy(context.Background(), id) })
+	if err := d.Start(ctx, id); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	for i := 0; i < 30; i++ {
+		if st, _ := d.Status(ctx, id); st.Phase == runtime.PhaseRunning {
+			break
+		}
+		time.Sleep(time.Second)
+	}
+
+	// Read-only share is readable inside the guest.
+	var out strings.Builder
+	if err := d.Exec(ctx, id, []string{"cat", "/ro/hello.txt"}, runtime.ExecIO{Stdout: &out}); err != nil {
+		t.Fatalf("Exec cat /ro/hello.txt: %v", err)
+	}
+	if !strings.Contains(out.String(), "from-host") {
+		t.Errorf("ro mount content = %q, want from-host", out.String())
+	}
+
+	// Read-write share persists a guest write back to the host.
+	if err := d.Exec(ctx, id, []string{"sh", "-c", "echo from-guest > /rw/out.txt"}, runtime.ExecIO{}); err != nil {
+		t.Fatalf("Exec write /rw: %v", err)
+	}
+	if b, err := os.ReadFile(rwSrc + "/out.txt"); err != nil || !strings.Contains(string(b), "from-guest") {
+		t.Errorf("rw mount did not persist to host: data=%q err=%v", string(b), err)
+	}
+
+	// tmpfs is writable inside the guest.
+	if err := d.Exec(ctx, id, []string{"sh", "-c", "echo x > /cache/f && cat /cache/f"}, runtime.ExecIO{}); err != nil {
+		t.Errorf("Exec write tmpfs: %v", err)
+	}
+}
+
 // TestArchVerificationIntegration confirms an arm64 image pulls and boots, and a
 // non-arm64 image is rejected with a clear ErrIncompatibleArch — both at Pull
 // (inspect-based) and at Create (auto-pull path).

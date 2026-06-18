@@ -173,6 +173,21 @@ func (d *Driver) Create(ctx context.Context, spec types.ContainerSpec) (string, 
 		args = append(args, "--memory", strconv.FormatInt(mib, 10)+"M")
 	}
 
+	// Filesystem mounts, in spec order. A tmpfs is guest-local; a bind mount
+	// shares a host path over VirtioFS using the docker-style
+	// "source:target[:ro]" volume syntax.
+	for _, m := range spec.Mounts {
+		if m.Tmpfs {
+			args = append(args, "--tmpfs", m.Target)
+			continue
+		}
+		vol := m.Source + ":" + m.Target
+		if m.ReadOnly {
+			vol += ":ro"
+		}
+		args = append(args, "--volume", vol)
+	}
+
 	args = append(args, spec.Image)
 	// Command replaces the image entrypoint; Args are appended after it. When
 	// Command is empty the image's own entrypoint runs with Args.

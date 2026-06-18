@@ -33,13 +33,20 @@ func (p *Provider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 		return nil
 	}
 
-	// Translate the Pod into a single workload spec. An unsupported shape is
-	// terminal: record a clear Failed status instead of retrying forever.
-	spec, err := translatePod(pod)
+	// Translate the Pod into a single workload spec, resolving its volumes
+	// against the node policy. An unsupported shape or volume is terminal: record
+	// a clear Failed status instead of retrying forever.
+	spec, vols, err := translatePod(pod, p.volumes)
 	if err != nil {
 		return p.markTerminalFailure(key, pod, "UnsupportedPodSpec", err)
 	}
 	c := pod.Spec.Containers[0]
+
+	// Materialize ephemeral (emptyDir) backing directories before the VM starts.
+	// A failure here is host/config-level and worth retrying, not terminal.
+	if err := p.ensureVolumeDirs(vols.ephemeralDirs); err != nil {
+		return fmt.Errorf("prepare volumes for pod %q: %w", key, err)
+	}
 
 	// Allocate a stable Pod IP from this node's Pod CIDR. Until the Pod is
 	// committed to the store, any early return must release it so a retry (or a
@@ -135,13 +142,15 @@ func (p *Provider) markTerminalFailure(key string, pod *corev1.Pod, reason strin
 	return nil
 }
 
-// rollback destroys any workloads already started for a failed CreatePod.
+// rollback destroys any workloads already started for a failed CreatePod and
+// removes any ephemeral volume storage it provisioned, so a retry starts clean.
 func (p *Provider) rollback(ctx context.Context, st *podState) {
 	for _, w := range st.workloads {
 		if err := p.rt.Destroy(ctx, w.id); err != nil && !errors.Is(err, runtime.ErrNotFound) {
 			klog.ErrorS(err, "rollback: failed to destroy workload", "id", w.id, "container", w.container)
 		}
 	}
+	p.cleanupVolumeDirs(st.pod)
 }
 
 // UpdatePod reconciles metadata for a tracked Pod. Container specs are treated
@@ -192,6 +201,7 @@ func (p *Provider) DeletePod(ctx context.Context, pod *corev1.Pod) error {
 			klog.ErrorS(err, "DeletePod: failed to destroy workload", "id", w.id, "container", w.container)
 		}
 	}
+	p.cleanupVolumeDirs(st.pod)
 	klog.InfoS("deleted Pod", "pod", key, "containers", len(st.workloads))
 	return nil
 }

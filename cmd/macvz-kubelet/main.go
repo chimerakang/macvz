@@ -109,7 +109,13 @@ func run(ctx context.Context, configPath, runtimeBinary string) error {
 
 	// Construct the provider over the runtime driver. The node's reachable
 	// address is reported as each Pod's HostIP so Services/`-o wide` resolve it.
-	p := provider.New(cfg.NodeName, driver, provider.WithHostIP(internalIP))
+	p := provider.New(cfg.NodeName, driver,
+		provider.WithHostIP(internalIP),
+		provider.WithVolumePolicy(provider.VolumePolicy{
+			Root:                    cfg.Node.Volumes.Root,
+			HostPathAllowedPrefixes: cfg.Node.Volumes.HostPathAllowedPrefixes,
+		}),
+	)
 
 	// Resolve the configured node shape (capacity/taints validated at load).
 	capacity, err := cfg.Capacity()

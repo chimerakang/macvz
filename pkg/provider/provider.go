@@ -52,6 +52,11 @@ type Provider struct {
 	// collector builds the node/Pod resource metrics served through the kubelet
 	// stats and resource-metrics endpoints (#25).
 	collector *metrics.Collector
+
+	// volumes is the policy governing which Pod volumes are mounted into
+	// micro-VMs and where ephemeral storage is backed (#26). The zero value is
+	// safe: hostPath disabled, no ephemeral root.
+	volumes VolumePolicy
 }
 
 // Option configures a Provider at construction time.
@@ -72,6 +77,13 @@ func WithPodNetwork(pn PodNetwork) Option {
 // WithHostIP sets the node address reported as each Pod's HostIP.
 func WithHostIP(ip string) Option {
 	return func(p *Provider) { p.hostIP = ip }
+}
+
+// WithVolumePolicy sets the Pod volume policy (#26): the ephemeral storage root
+// and the hostPath allowlist. Without it, hostPath is disabled and emptyDir is
+// rejected for want of a root.
+func WithVolumePolicy(policy VolumePolicy) Option {
+	return func(p *Provider) { p.volumes = policy }
 }
 
 // podState tracks one Pod and the runtime workloads backing its containers.

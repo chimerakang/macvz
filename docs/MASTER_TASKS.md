@@ -54,4 +54,4 @@ Source of truth for the phased roadmap. Phases map to GitHub **Milestones**; tas
 | #27 | Handle image architecture and Rosetta-for-Linux behavior | P4 | closed |
 | #28 | Harden mTLS, RBAC, and runtime access boundaries | P4 | closed |
 | #29 | Add signed and notarized macvz-kubelet release flow | P4 | closed |
-| #30 | Build multi-node end-to-end test suite for beta readiness | P4 | open |
+| #30 | Build multi-node end-to-end test suite for beta readiness | P4 | closed |

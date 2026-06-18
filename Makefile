@@ -47,6 +47,10 @@ fmt: ## Format all Go source
 tidy: ## Tidy module dependencies
 	go mod tidy
 
+.PHONY: e2e
+e2e: ## Run the multi-node end-to-end suite against a real cluster (see docs/E2E.md)
+	MACVZ_E2E=1 go test -tags e2e -count=1 -v -timeout 30m ./test/e2e/
+
 .PHONY: release
 release: ## Build, sign, and package a darwin/arm64 release into dist/ (see docs/RELEASE.md)
 	VERSION=$(VERSION) COMMIT=$(COMMIT) DATE=$(DATE) ./scripts/macos-release.sh

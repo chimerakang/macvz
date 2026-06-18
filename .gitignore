@@ -1,7 +1,6 @@
 # Binaries
 /bin/
 /dist/
-macvz-kubelet
 *.exe
 *.test
 *.out

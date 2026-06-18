@@ -1,0 +1,16 @@
+# Example macvz-kubelet configuration.
+# All fields are optional; omitted values fall back to built-in defaults.
+# Run with: macvz-kubelet --config ./config.yaml
+
+# Kubernetes node name this process registers as. Defaults to the OS hostname.
+nodeName: mac-mini-01
+
+# Path to the kubeconfig used to reach the API server.
+# Leave empty to use in-cluster config or the KUBECONFIG environment variable.
+kubeconfigPath: ""
+
+# Path to the apple/container service API socket.
+runtimeSocket: /var/run/com.apple.container.sock
+
+# Log verbosity: "info" or "debug" (klog -v levels also honored via flags).
+logLevel: info

@@ -78,6 +78,12 @@ func TestValidateVolumes(t *testing.T) {
 	}
 }
 
+func TestRosettaDefaultsOff(t *testing.T) {
+	if Default().RuntimeRosetta {
+		t.Error("Rosetta must be disabled by default (amd64 images rejected unless opted in)")
+	}
+}
+
 func TestRuntimeSocketIsOptional(t *testing.T) {
 	c := Default()
 	c.RuntimeSocket = ""

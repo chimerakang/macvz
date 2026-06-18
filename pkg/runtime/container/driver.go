@@ -41,6 +41,11 @@ type Config struct {
 	// Binary is the path or name of the apple/container CLI. Defaults to
 	// DefaultBinary, resolved through PATH.
 	Binary string
+	// Rosetta enables running linux/amd64 images via Rosetta-for-Linux
+	// translation on Apple Silicon. When false (the default), only linux/arm64
+	// images are accepted and amd64-only images are rejected with a clear,
+	// actionable error.
+	Rosetta bool
 }
 
 // Driver implements runtime.Runtime (and runtime.Pinger) over apple/container.
@@ -53,6 +58,8 @@ type Config struct {
 type Driver struct {
 	run   runner
 	locks keyedMutex
+	// rosetta allows booting linux/amd64 images via Rosetta translation.
+	rosetta bool
 }
 
 var (
@@ -66,7 +73,7 @@ func New(cfg Config) *Driver {
 	if bin == "" {
 		bin = DefaultBinary
 	}
-	return &Driver{run: &cliRunner{bin: bin}}
+	return &Driver{run: &cliRunner{bin: bin}, rosetta: cfg.Rosetta}
 }
 
 // Ready reports whether the apple/container service is reachable and healthy by
@@ -79,9 +86,11 @@ func (d *Driver) Ready(ctx context.Context) error {
 }
 
 // Pull fetches an OCI image into the local content store and verifies it
-// provides a linux/arm64 variant the micro-VM can boot. A non-arm64 image pulls
-// without error but is rejected here with a clear ErrIncompatibleArch, rather
-// than failing later with the runtime's cryptic create-time message.
+// provides a variant the micro-VM can boot under the driver's architecture
+// policy: linux/arm64 always, and linux/amd64 when Rosetta is enabled. An image
+// with no bootable variant pulls without error but is rejected here with a
+// clear ErrIncompatibleArch, rather than failing later with the runtime's
+// cryptic create-time message.
 func (d *Driver) Pull(ctx context.Context, image string) error {
 	if image == "" {
 		return fmt.Errorf("pull: image reference is empty")
@@ -89,7 +98,8 @@ func (d *Driver) Pull(ctx context.Context, image string) error {
 	if _, err := d.run.output(ctx, "image", "pull", image); err != nil {
 		return fmt.Errorf("pull %q: %w", image, mapErr(err))
 	}
-	return d.verifyArch(ctx, image)
+	_, err := d.selectPlatform(ctx, image)
+	return err
 }
 
 // imageInspect is the subset of `container image inspect` JSON used to confirm
@@ -103,42 +113,79 @@ type imageInspect struct {
 	} `json:"variants"`
 }
 
-// verifyArch confirms the image exposes a linux/arm64 variant. It returns a
-// clear, actionable ErrIncompatibleArch listing the architectures that were
-// found when arm64 is absent.
-func (d *Driver) verifyArch(ctx context.Context, image string) error {
+// emulatedArch is the secondary guest architecture MacVz can boot on Apple
+// Silicon through Rosetta-for-Linux translation, when explicitly enabled.
+const emulatedArch = "amd64"
+
+// platformChoice is the resolved platform to boot an image with, plus whether
+// it requires Rosetta translation (an amd64 guest on Apple Silicon).
+type platformChoice struct {
+	// platform is the OCI platform string, e.g. "linux/arm64" or "linux/amd64".
+	platform string
+	// rosetta is true when booting this platform needs Rosetta translation.
+	rosetta bool
+}
+
+// selectPlatform inspects the image and chooses the variant to boot under the
+// driver's architecture policy: native linux/arm64 when available, otherwise
+// linux/amd64 via Rosetta when Rosetta is enabled. It returns a clear,
+// actionable ErrIncompatibleArch — tailored to whether an amd64 variant exists
+// and whether Rosetta is enabled — when no bootable variant is found.
+func (d *Driver) selectPlatform(ctx context.Context, image string) (platformChoice, error) {
 	out, err := d.run.output(ctx, "image", "inspect", image)
 	if err != nil {
-		return fmt.Errorf("verify arch %q: %w", image, mapErr(err))
+		return platformChoice{}, fmt.Errorf("verify arch %q: %w", image, mapErr(err))
 	}
 	var results []imageInspect
 	if err := json.Unmarshal(out, &results); err != nil {
-		return fmt.Errorf("verify arch %q: parse inspect output: %w", image, err)
+		return platformChoice{}, fmt.Errorf("verify arch %q: parse inspect output: %w", image, err)
 	}
 	if len(results) == 0 {
-		return fmt.Errorf("verify arch %q: %w", image, runtime.ErrNotFound)
+		return platformChoice{}, fmt.Errorf("verify arch %q: %w", image, runtime.ErrNotFound)
 	}
 
 	seen := map[string]bool{}
 	var found []string
+	hasAMD64 := false
 	for _, v := range results[0].Variants {
 		os, arch := v.Config.OS, v.Config.Architecture
 		if os == "" || arch == "" || os == "unknown" || arch == "unknown" {
 			continue // skip attestation / unknown manifest entries
 		}
 		if os == targetOS && arch == targetArch {
-			return nil
+			// Native arm64 is always preferred, no translation needed.
+			return platformChoice{platform: targetOS + "/" + targetArch}, nil
+		}
+		if os == targetOS && arch == emulatedArch {
+			hasAMD64 = true
 		}
 		if plat := os + "/" + arch; !seen[plat] {
 			seen[plat] = true
 			found = append(found, plat)
 		}
 	}
+
+	// No native arm64. Fall back to amd64 via Rosetta when allowed.
+	if hasAMD64 && d.rosetta {
+		return platformChoice{platform: targetOS + "/" + emulatedArch, rosetta: true}, nil
+	}
 	if len(found) == 0 {
 		found = append(found, "none")
 	}
-	return fmt.Errorf("%w: image %q has no %s/%s variant (found: %s); macvz boots arm64 micro-VMs on Apple Silicon, and amd64 emulation (Rosetta) is deferred to P4",
-		runtime.ErrIncompatibleArch, image, targetOS, targetArch, strings.Join(found, ", "))
+	if hasAMD64 && !d.rosetta {
+		return platformChoice{}, fmt.Errorf("%w: image %q has no %s/%s variant (found: %s); enable Rosetta-for-Linux (runtimeRosetta: true) to run amd64 images on Apple Silicon, or use an arm64/multi-arch image",
+			runtime.ErrIncompatibleArch, image, targetOS, targetArch, strings.Join(found, ", "))
+	}
+	return platformChoice{}, fmt.Errorf("%w: image %q has no %s/%s%s variant (found: %s); macvz boots arm64 micro-VMs on Apple Silicon",
+		runtime.ErrIncompatibleArch, image, targetOS, targetArch, rosettaSuffix(d.rosetta), strings.Join(found, ", "))
+}
+
+// rosettaSuffix names the amd64 fallback in error messages when Rosetta is on.
+func rosettaSuffix(rosetta bool) string {
+	if rosetta {
+		return " or " + targetOS + "/" + emulatedArch
+	}
+	return ""
 }
 
 // Create provisions (but does not start) a workload, returning its ID. The
@@ -154,6 +201,23 @@ func (d *Driver) Create(ctx context.Context, spec types.ContainerSpec) (string, 
 	defer d.locks.lock(spec.Name)()
 
 	args := []string{"create", "--name", spec.Name}
+
+	// With Rosetta enabled, pin the platform explicitly: native arm64 when the
+	// image has it, otherwise amd64 with translation. The runtime defaults to the
+	// host arch (arm64) and will not auto-select amd64, so an amd64-only image
+	// needs the platform spelled out. With Rosetta disabled we leave platform
+	// unset; the runtime then rejects an arm64-less image, which mapErr surfaces
+	// as ErrIncompatibleArch (Pull also pre-validates).
+	if d.rosetta {
+		choice, err := d.selectPlatform(ctx, spec.Image)
+		if err != nil {
+			return "", fmt.Errorf("create %q: %w", spec.Name, err)
+		}
+		args = append(args, "--platform", choice.platform)
+		if choice.rosetta {
+			args = append(args, "--rosetta")
+		}
+	}
 
 	// Environment, sorted for deterministic argument order.
 	for _, k := range sortedKeys(spec.Env) {

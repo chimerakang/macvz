@@ -35,6 +35,12 @@ type Config struct {
 	// name). Defaults to "container".
 	RuntimeBinary string `yaml:"runtimeBinary"`
 
+	// RuntimeRosetta enables running linux/amd64 images via Rosetta-for-Linux
+	// translation on Apple Silicon (#27). Disabled by default: only linux/arm64
+	// images run, and amd64-only images fail with an actionable error. Enabling
+	// it requires Rosetta to be installed on the host.
+	RuntimeRosetta bool `yaml:"runtimeRosetta"`
+
 	// LogLevel is the klog verbosity ("info", "debug") or a numeric V level.
 	LogLevel string `yaml:"logLevel"`
 

@@ -506,3 +506,47 @@ func TestArchVerificationIntegration(t *testing.T) {
 		t.Errorf("Create(amd64) err = %v, want ErrIncompatibleArch", err)
 	}
 }
+
+// TestRosettaIntegration confirms that, with Rosetta enabled, an amd64-only
+// image pulls, boots, and reports an x86_64 guest architecture.
+func TestRosettaIntegration(t *testing.T) {
+	if os.Getenv("MACVZ_INTEGRATION") != "1" {
+		t.Skip("set MACVZ_INTEGRATION=1 to run against a real apple/container service")
+	}
+
+	d := New(Config{Rosetta: true})
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	if err := d.Ready(ctx); err != nil {
+		t.Fatalf("Ready: %v", err)
+	}
+
+	const amd64Image = "docker.io/amd64/alpine:3.20"
+	if err := d.Pull(ctx, amd64Image); err != nil {
+		t.Fatalf("Pull(amd64) with Rosetta should succeed: %v", err)
+	}
+	spec := types.ContainerSpec{Name: "macvz-rosetta", Image: amd64Image, Command: []string{"sleep", "60"}}
+	_ = d.Destroy(ctx, spec.Name)
+	id, err := d.Create(ctx, spec)
+	if err != nil {
+		t.Fatalf("Create(amd64) with Rosetta: %v", err)
+	}
+	t.Cleanup(func() { _ = d.Destroy(context.Background(), id) })
+	if err := d.Start(ctx, id); err != nil {
+		t.Fatalf("Start(amd64) with Rosetta: %v", err)
+	}
+	for i := 0; i < 30; i++ {
+		if st, _ := d.Status(ctx, id); st.Phase == runtime.PhaseRunning {
+			break
+		}
+		time.Sleep(time.Second)
+	}
+
+	var out strings.Builder
+	if err := d.Exec(ctx, id, []string{"uname", "-m"}, runtime.ExecIO{Stdout: &out}); err != nil {
+		t.Fatalf("Exec uname -m: %v", err)
+	}
+	if got := strings.TrimSpace(out.String()); got != "x86_64" {
+		t.Errorf("guest arch = %q, want x86_64 (amd64 via Rosetta)", got)
+	}
+}

@@ -44,11 +44,11 @@ Source of truth for the phased roadmap. Phases map to GitHub **Milestones**; tas
 | #17 | Translate Kubernetes Pod specs into runtime workload specs | P2 | in progress |
 | #18 | Wire kubectl logs and exec through the runtime | P2 | in progress |
 | #19 | Add RBAC, manifests, and P2 MVP smoke test docs | P2 | in progress |
-| #20 | Implement Kubernetes-coordinated Pod IPAM | P3 | open |
-| #21 | Bring up WireGuard mesh between MacVz nodes | P3 | open |
-| #22 | Connect micro-VM networking to the controllable Pod network path | P3 | open |
-| #23 | Report Pod IPs and readiness so Services resolve across MacVz nodes | P3 | open |
-| #24 | Implement kubectl port-forward for MacVz-backed Pods | P3 | open |
+| #20 | Implement Kubernetes-coordinated Pod IPAM | P3 | closed |
+| #21 | Bring up WireGuard mesh between MacVz nodes | P3 | closed |
+| #22 | Connect micro-VM networking to the controllable Pod network path | P3 | closed |
+| #23 | Report Pod IPs and readiness so Services resolve across MacVz nodes | P3 | closed |
+| #24 | Implement kubectl port-forward for MacVz-backed Pods | P3 | closed |
 | #25 | Implement node and pod metrics reporting | P4 | open |
 | #26 | Support VirtioFS-backed volumes for MacVz Pods | P4 | open |
 | #27 | Handle image architecture and Rosetta-for-Linux behavior | P4 | open |

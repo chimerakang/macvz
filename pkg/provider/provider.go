@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/chimerakang/macvz/pkg/network"
 	"github.com/chimerakang/macvz/pkg/runtime"
 	"github.com/virtual-kubelet/virtual-kubelet/node"
 	corev1 "k8s.io/api/core/v1"
@@ -27,6 +28,45 @@ type Provider struct {
 
 	mu   sync.RWMutex
 	pods map[string]*podState
+
+	// createMu serializes CreatePod. Virtual Kubelet can retry or race the same
+	// Pod key; serializing keeps the idempotency check and runtime side effects
+	// together so duplicate workloads are not leaked.
+	createMu sync.Mutex
+
+	// ipam, when set, allocates each Pod a stable IP from this node's
+	// Kubernetes-assigned Pod CIDR. It is nil on clusters without coordinated
+	// IPAM, in which case the Pod IP falls back to the runtime-reported address.
+	ipam *network.PodIPAM
+
+	// podNet, when set, wires each Pod's micro-VM into the Pod network path so it
+	// is reachable at its assigned Pod IP across the mesh (#22). Nil disables it.
+	podNet PodNetwork
+
+	// hostIP is this node's reachable address, reported as each Pod's HostIP so
+	// `kubectl get pod -o wide` and topology-aware routing resolve the host. Set
+	// once at startup before the Pod controller runs; treated as immutable after.
+	hostIP string
+}
+
+// Option configures a Provider at construction time.
+type Option func(*Provider)
+
+// WithIPAM attaches a Pod IP allocator so Pods receive stable, collision-free
+// addresses from this node's Kubernetes-assigned Pod CIDR.
+func WithIPAM(ipam *network.PodIPAM) Option {
+	return func(p *Provider) { p.ipam = ipam }
+}
+
+// WithPodNetwork attaches the Pod network path that makes each micro-VM
+// reachable at its Pod IP across the mesh (#22).
+func WithPodNetwork(pn PodNetwork) Option {
+	return func(p *Provider) { p.podNet = pn }
+}
+
+// WithHostIP sets the node address reported as each Pod's HostIP.
+func WithHostIP(ip string) Option {
+	return func(p *Provider) { p.hostIP = ip }
 }
 
 // podState tracks one Pod and the runtime workloads backing its containers.
@@ -40,6 +80,12 @@ type podState struct {
 	// unsupported spec, or an image with no arm64 variant), so they surface a
 	// clear, stable Failed status instead of being re-derived as Pending.
 	terminalStatus *corev1.PodStatus
+	// vmIP is the micro-VM's apple/container host-only address, observed once the
+	// VM has booted. It is mapped to the Pod IP by the Pod network path (#22).
+	vmIP string
+	// attached records whether the Pod's micro-VM has been wired into the Pod
+	// network path, so DeletePod knows to tear the mapping down.
+	attached bool
 }
 
 // workload binds a Pod container to a runtime workload ID.
@@ -49,12 +95,34 @@ type workload struct {
 }
 
 // New constructs a Provider bound to a node name and runtime driver.
-func New(nodeName string, rt runtime.Runtime) *Provider {
-	return &Provider{
+func New(nodeName string, rt runtime.Runtime, opts ...Option) *Provider {
+	p := &Provider{
 		nodeName: nodeName,
 		rt:       rt,
 		pods:     make(map[string]*podState),
 	}
+	for _, opt := range opts {
+		opt(p)
+	}
+	return p
+}
+
+// SetIPAM attaches a Pod IP allocator after construction. The node's Pod CIDR is
+// only known once Kubernetes assigns it (after node registration), so the
+// allocator is wired in then, before the Pod controller starts. It must not be
+// called once Pods are being reconciled.
+func (p *Provider) SetIPAM(ipam *network.PodIPAM) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.ipam = ipam
+}
+
+// SetPodNetwork attaches the Pod network path after construction, before the Pod
+// controller starts. It must not be called once Pods are being reconciled.
+func (p *Provider) SetPodNetwork(pn PodNetwork) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.podNet = pn
 }
 
 // Compile-time assertion that Provider satisfies the Virtual Kubelet contract.

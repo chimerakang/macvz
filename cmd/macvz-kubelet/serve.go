@@ -9,11 +9,16 @@ import (
 	"time"
 
 	"github.com/chimerakang/macvz/pkg/config"
+	"github.com/chimerakang/macvz/pkg/network"
+	"github.com/chimerakang/macvz/pkg/network/podnet"
+	"github.com/chimerakang/macvz/pkg/network/wireguard"
 	"github.com/chimerakang/macvz/pkg/provider"
 	vknode "github.com/virtual-kubelet/virtual-kubelet/node"
 	vkapi "github.com/virtual-kubelet/virtual-kubelet/node/api"
 	"github.com/virtual-kubelet/virtual-kubelet/node/nodeutil"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -24,6 +29,75 @@ import (
 
 // informerResync is how often the shared informers do a full relist.
 const informerResync = time.Minute
+
+// podCIDRWaitTimeout bounds how long startup waits for Kubernetes to assign this
+// node a Pod CIDR before continuing without coordinated IPAM.
+const podCIDRWaitTimeout = 30 * time.Second
+
+// setupIPAM enables coordinated Pod IPAM for this node. The address range is the
+// node's Kubernetes-assigned Spec.PodCIDR (or cfg.Node.PodCIDR when set as an
+// override). It then recovers existing allocations from the API server so a
+// restart neither leaks addresses nor reassigns a live Pod's IP.
+//
+// IPAM is best-effort: on a cluster that assigns no Pod CIDR (and with no
+// override configured), it logs and returns nil so Pods still run with the Pod
+// IP derived from the runtime-reported address.
+func setupIPAM(ctx context.Context, cfg config.Config, clientset *kubernetes.Clientset, p *provider.Provider) error {
+	cidr := cfg.Node.PodCIDR
+	if cidr == "" {
+		var err error
+		cidr, err = waitForPodCIDR(ctx, clientset, cfg.NodeName)
+		if err != nil {
+			klog.ErrorS(err, "coordinated Pod IPAM disabled; Pod IPs will come from the runtime",
+				"hint", "run kube-controller-manager with --allocate-node-cidrs or set node.podCIDR")
+			return nil
+		}
+	}
+
+	ipam, err := network.NewPodIPAM(cidr)
+	if err != nil {
+		return fmt.Errorf("build pod IPAM for %q: %w", cidr, err)
+	}
+	p.SetIPAM(ipam)
+	klog.InfoS("coordinated Pod IPAM enabled", "node", cfg.NodeName, "podCIDR", ipam.CIDR())
+
+	// Rebuild allocations from Kubernetes state before the Pod controller runs.
+	podList, err := clientset.CoreV1().Pods(corev1.NamespaceAll).List(ctx, metav1.ListOptions{
+		FieldSelector: fields.OneTermEqualSelector("spec.nodeName", cfg.NodeName).String(),
+	})
+	if err != nil {
+		// A failed recovery list is non-fatal: the allocator starts empty and
+		// re-derives IPs as Pods are (re)created.
+		klog.ErrorS(err, "could not list existing Pods for IPAM recovery", "node", cfg.NodeName)
+		return nil
+	}
+	pods := make([]*corev1.Pod, 0, len(podList.Items))
+	for i := range podList.Items {
+		pods = append(pods, &podList.Items[i])
+	}
+	p.RecoverAllocations(pods)
+	return nil
+}
+
+// waitForPodCIDR polls the node until Kubernetes assigns its Spec.PodCIDR, which
+// happens shortly after registration on clusters with node-CIDR allocation.
+func waitForPodCIDR(ctx context.Context, clientset *kubernetes.Clientset, nodeName string) (string, error) {
+	deadlineCtx, cancel := context.WithTimeout(ctx, podCIDRWaitTimeout)
+	defer cancel()
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		node, err := clientset.CoreV1().Nodes().Get(deadlineCtx, nodeName, metav1.GetOptions{})
+		if err == nil && node.Spec.PodCIDR != "" {
+			return node.Spec.PodCIDR, nil
+		}
+		select {
+		case <-deadlineCtx.Done():
+			return "", fmt.Errorf("node %q has no Spec.PodCIDR after %s", nodeName, podCIDRWaitTimeout)
+		case <-ticker.C:
+		}
+	}
+}
 
 // startPodController wires the Virtual Kubelet pod controller: pod/configmap/
 // secret/service informers (pods filtered to this node), an event recorder, and
@@ -77,6 +151,64 @@ func startPodController(ctx context.Context, cfg config.Config, clientset *kuber
 	return eb.Shutdown, nil
 }
 
+// setupMesh brings up this node's WireGuard mesh when enabled, returning a
+// cleanup func that tears it back down. The mesh encrypts and routes cross-host
+// Pod traffic (issue #21); each peer's Pod CIDR becomes a route through the
+// tunnel. When the mesh is disabled it is a no-op returning a no-op cleanup.
+func setupMesh(ctx context.Context, cfg config.Config) (func(), error) {
+	if !cfg.Mesh.Enabled {
+		klog.InfoS("WireGuard mesh disabled; Pods are reachable only on their local node")
+		return func() {}, nil
+	}
+
+	ifc, err := cfg.MeshInterfaceConfig()
+	if err != nil {
+		return nil, fmt.Errorf("resolve mesh config: %w", err)
+	}
+	mesh := wireguard.New(ifc)
+	if err := mesh.Up(ctx); err != nil {
+		return nil, fmt.Errorf("bring up mesh interface %q: %w", ifc.Name, err)
+	}
+	klog.InfoS("WireGuard mesh up",
+		"interface", mesh.InterfaceName(),
+		"publicKey", ifc.PrivateKey.PublicKey().String(),
+		"peers", mesh.Peers(),
+		"routes", mesh.InstalledRoutes(),
+	)
+
+	return func() {
+		// Tear down with a fresh context: the root ctx is already cancelled by
+		// the time cleanup runs during shutdown.
+		if err := mesh.Down(context.Background()); err != nil {
+			klog.ErrorS(err, "failed to tear down mesh", "interface", ifc.Name)
+		}
+	}, nil
+}
+
+// setupPodNetwork starts the host Pod network path (when enabled) and attaches
+// it to the provider so each micro-VM is reachable at its Pod IP across the mesh
+// (#22). It returns a cleanup func that flushes the host rules. When disabled it
+// is a no-op returning a no-op cleanup.
+func setupPodNetwork(ctx context.Context, cfg config.Config, p *provider.Provider) (func(), error) {
+	if !cfg.PodNetwork.Enabled {
+		klog.InfoS("Pod network path disabled; Pods keep the runtime host-only address")
+		return func() {}, nil
+	}
+
+	router := podnet.New(cfg.PodNetworkRouterConfig())
+	if err := router.Start(ctx); err != nil {
+		return nil, fmt.Errorf("start pod network path: %w", err)
+	}
+	p.SetPodNetwork(router)
+	klog.InfoS("Pod network path started", "interface", cfg.PodNetwork.Interface)
+
+	return func() {
+		if err := router.Stop(context.Background()); err != nil {
+			klog.ErrorS(err, "failed to stop pod network path")
+		}
+	}, nil
+}
+
 // startKubeletServer starts the HTTPS kubelet API used by `kubectl logs`/`exec`,
 // routing to the provider. It is a no-op (returning a no-op cleanup) when no
 // serving certificate is configured, mirroring upstream Virtual Kubelet: Pods
@@ -95,6 +227,7 @@ func startKubeletServer(ctx context.Context, cfg config.Config, p *provider.Prov
 	handler := vkapi.PodHandler(vkapi.PodHandlerConfig{
 		RunInContainer:        p.RunInContainer,
 		GetContainerLogs:      p.GetContainerLogs,
+		PortForward:           p.PortForward,
 		GetPods:               p.GetPods,
 		GetPodsFromKubernetes: p.GetPods,
 	}, false)

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/chimerakang/macvz/pkg/network/podnet"
 	"github.com/chimerakang/macvz/pkg/runtime"
 	"github.com/virtual-kubelet/virtual-kubelet/errdefs"
 	corev1 "k8s.io/api/core/v1"
@@ -20,6 +21,9 @@ import (
 // so a later retry starts from a clean slate.
 func (p *Provider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	key := podKey(pod.Namespace, pod.Name)
+
+	p.createMu.Lock()
+	defer p.createMu.Unlock()
 
 	p.mu.RLock()
 	_, exists := p.pods[key]
@@ -37,9 +41,26 @@ func (p *Provider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	}
 	c := pod.Spec.Containers[0]
 
+	// Allocate a stable Pod IP from this node's Pod CIDR. Until the Pod is
+	// committed to the store, any early return must release it so a retry (or a
+	// terminal failure) does not leak the address.
+	podIP, err := p.allocateIP(key)
+	if err != nil {
+		return fmt.Errorf("allocate pod IP for %q: %w", key, err)
+	}
+	committed := false
+	if podIP != "" {
+		defer func() {
+			if !committed {
+				p.releaseIP(key)
+			}
+		}()
+	}
+
 	st := &podState{pod: pod.DeepCopy()}
 	now := metav1.Now()
 	st.pod.Status.StartTime = &now
+	st.pod.Status.PodIP = podIP
 
 	if err := p.rt.Pull(ctx, spec.Image); err != nil {
 		// An image with no arm64 variant can never run here (P1 surfaces this
@@ -62,11 +83,30 @@ func (p *Provider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 		return fmt.Errorf("start container %q: %w", c.Name, err)
 	}
 
+	// Wire the micro-VM into the Pod network path so it is reachable at its Pod
+	// IP across the mesh (#22). This needs both the assigned Pod IP and the VM's
+	// host-only address; if either is unavailable, roll back so the retry starts
+	// clean (a missing VM IP is transient — the guest is still acquiring DHCP).
+	if pn := p.podNetRef(); pn != nil && podIP != "" {
+		vmIP := p.observeVMIP(ctx, st)
+		if vmIP == "" {
+			p.rollback(ctx, st)
+			return fmt.Errorf("pod %q: micro-VM address not available yet for network attach", key)
+		}
+		if err := pn.Attach(ctx, podnet.Endpoint{PodKey: key, PodIP: podIP, VMIP: vmIP}); err != nil {
+			p.rollback(ctx, st)
+			return fmt.Errorf("attach pod %q network path (%s -> %s): %w", key, podIP, vmIP, err)
+		}
+		st.vmIP = vmIP
+		st.attached = true
+	}
+
 	st.pod.Status = p.reconcileStatus(ctx, st)
 	p.mu.Lock()
 	p.pods[key] = st
 	p.mu.Unlock()
-	klog.InfoS("created Pod", "pod", key, "workloadID", spec.Name)
+	committed = true // the allocated Pod IP is now owned by the stored Pod.
+	klog.InfoS("created Pod", "pod", key, "workloadID", spec.Name, "podIP", podIP)
 	return nil
 }
 
@@ -137,6 +177,11 @@ func (p *Provider) DeletePod(ctx context.Context, pod *corev1.Pod) error {
 	if !ok {
 		return errdefs.NotFoundf("pod %q is not known to this node", key)
 	}
+
+	// Tear down the network path mapping, then return the Pod's IP to the pool so
+	// it can be reused by a future Pod.
+	p.detachPodNetwork(ctx, st, key)
+	p.releaseIP(key)
 
 	timeout := stopTimeout(pod)
 	for _, w := range st.workloads {

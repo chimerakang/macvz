@@ -8,8 +8,8 @@ Source of truth for the phased roadmap. Phases map to GitHub **Milestones**; tas
 
 | Phase | Title | Goal | Status |
 | --- | --- | --- | --- |
-| P0 | Scaffolding & Foundations | Buildable Go project: module, layout, CLI skeleton, CI, build tooling | 🚧 Active |
-| P1 | Runtime Integration | Drive `apple/container` from Go on a single Mac: micro-VM lifecycle, logs/exec, density benchmark | ⬜ Planned |
+| P0 | Scaffolding & Foundations | Buildable Go project: module, layout, CLI skeleton, CI, build tooling | ✅ Complete |
+| P1 | Runtime Integration | Drive `apple/container` from Go on a single Mac: micro-VM lifecycle, logs/exec, density benchmark | 🚧 Next |
 | P2 | Virtual Kubelet Provider MVP | Mac registers as a k8s virtual node and runs real Pods as micro-VMs | ⬜ Planned |
 | P3 | Cross-host Mesh Networking | WireGuard mesh + Pod IPAM so Pods across Macs communicate and Services resolve | ⬜ Planned |
 | P4 | Hardening & Beta | Metrics, volumes, image arch/Rosetta, mTLS/RBAC, signing/notarization, multi-node e2e | ⬜ Planned |
@@ -26,11 +26,11 @@ Source of truth for the phased roadmap. Phases map to GitHub **Milestones**; tas
 
 | Issue | Title | Phase | Status |
 | --- | --- | --- | --- |
-| #1 | Initialize Go module and base project layout | P0 | open |
-| #2 | macvz-kubelet CLI entrypoint: flags, config loading, structured logging | P0 | open |
-| #3 | Define core package interfaces (runtime / provider boundaries) | P0 | open |
-| #4 | CI pipeline on macOS runner (build, vet, golangci-lint, test) | P0 | open |
-| #5 | Build & release tooling (Makefile, version stamping) | P0 | open |
+| #1 | Initialize Go module and base project layout | P0 | closed |
+| #2 | macvz-kubelet CLI entrypoint: flags, config loading, structured logging | P0 | closed |
+| #3 | Define core package interfaces (runtime / provider boundaries) | P0 | closed |
+| #4 | CI pipeline on macOS runner (build, vet, golangci-lint, test) | P0 | closed |
+| #5 | Build & release tooling (Makefile, version stamping) | P0 | closed |
 
 > P1–P4 issues are created when each phase begins (use `/task-add`), to avoid a backlog of speculative tickets. Planned task seeds:
 >

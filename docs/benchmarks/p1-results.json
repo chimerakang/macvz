@@ -1,0 +1,28 @@
+{
+  "image": "docker.io/library/alpine:3.20",
+  "totalRAMBytes": 34359738368,
+  "guestMemBytesPerVM": 268435456,
+  "launched": 12,
+  "ceilingReached": false,
+  "bootLatencyMs": {
+    "n": 12,
+    "min": 2236.03,
+    "p50": 2884.886,
+    "p90": 3129.905,
+    "p99": 3232.627,
+    "max": 3232.627,
+    "mean": 2807.5205
+  },
+  "perVMRSSBytes": {
+    "n": 12,
+    "min": 21561344,
+    "p50": 22233088,
+    "p90": 24117248,
+    "p99": 39157760,
+    "max": 39157760,
+    "mean": 23900160
+  },
+  "sysUsedDeltaBytes": 1283244032,
+  "sysPerVMBytes": 106937002,
+  "overheadPerVMRSSBytes": 23900160
+}

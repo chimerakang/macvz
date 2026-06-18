@@ -45,8 +45,16 @@ func TestValidate(t *testing.T) {
 	if err := c.Validate(); err != nil {
 		t.Fatalf("default config should validate: %v", err)
 	}
-	c.RuntimeSocket = ""
+	c.NodeName = ""
 	if err := c.Validate(); err == nil {
-		t.Error("expected error when RuntimeSocket is empty")
+		t.Error("expected error when NodeName is empty")
+	}
+}
+
+func TestRuntimeSocketIsOptional(t *testing.T) {
+	c := Default()
+	c.RuntimeSocket = ""
+	if err := c.Validate(); err != nil {
+		t.Fatalf("RuntimeSocket is reserved for future service API use and should be optional: %v", err)
 	}
 }

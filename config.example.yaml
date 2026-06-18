@@ -9,8 +9,11 @@ nodeName: mac-mini-01
 # Leave empty to use in-cluster config or the KUBECONFIG environment variable.
 kubeconfigPath: ""
 
-# Path to the apple/container service API socket.
+# Reserved for future apple/container service API support. P1 uses runtimeBinary.
 runtimeSocket: /var/run/com.apple.container.sock
+
+# apple/container CLI to drive (path or PATH-resolved name). Defaults to "container".
+runtimeBinary: container
 
 # Log verbosity: "info" or "debug" (klog -v levels also honored via flags).
 logLevel: info

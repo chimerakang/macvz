@@ -40,6 +40,7 @@ jobs:
           cache: true
 
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v6
+        uses: golangci/golangci-lint-action@v7
         with:
-          version: latest
+          # v2.10.x is built with Go 1.25; v1.x cannot lint a go 1.25 module.
+          version: v2.10.1

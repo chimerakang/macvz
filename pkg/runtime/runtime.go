@@ -31,7 +31,7 @@ type Status struct {
 	Phase    Phase
 	ExitCode int
 	// Message carries human-readable detail for failures.
-	Message string
+	Message   string
 	StartedAt time.Time
 	// IP is the workload's address once networking is wired up (P3).
 	IP string

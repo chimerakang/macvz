@@ -17,3 +17,47 @@ runtimeBinary: container
 
 # Log verbosity: "info" or "debug" (klog -v levels also honored via flags).
 logLevel: info
+
+# Node shape advertised to Kubernetes. All fields are optional.
+node:
+  # Capacity / allocatable resources. Kept conservative until P1 density data is
+  # recorded; raise once per-VM RAM overhead is measured.
+  cpu: "2"
+  memory: 4Gi
+  pods: "20"
+
+  # Workload platform reported in node info and kubernetes.io/{os,arch} labels.
+  # MacVz runs Linux micro-VMs on Apple Silicon, so this is linux/arm64 — not
+  # the Darwin host.
+  os: linux
+  arch: arm64
+
+  # Node InternalIP. Leave empty to auto-detect the host's primary outbound IPv4.
+  internalIP: ""
+
+  # Extra labels/annotations merged onto the node (override built-ins on clash).
+  labels: {}
+  annotations: {}
+
+  # Scheduling taints. Defaults to the well-known Virtual Kubelet provider taint
+  # so only Pods that tolerate MacVz are scheduled here. Set to [] to disable.
+  taints:
+    - key: virtual-kubelet.io/provider
+      value: macvz
+      effect: NoSchedule
+
+  # Heartbeat / lease tuning. The coordination.k8s.io Lease is the node
+  # heartbeat: Kubernetes marks the node NotReady if it is not renewed within
+  # leaseDurationSeconds. Disable enableLease only on clusters without lease
+  # support (then node status updates double as the heartbeat).
+  enableLease: true
+  leaseDurationSeconds: 40
+  pingInterval: 10s          # node liveness Ping cadence
+  statusUpdateInterval: 1m   # node status push + runtime readiness re-probe
+
+  # Kubelet API (kubectl logs/exec). The Kubernetes API server connects to the
+  # node's InternalIP on kubeletPort over HTTPS. Provide a serving cert+key to
+  # enable logs/exec; leave them empty to run Pods without logs/exec support.
+  kubeletPort: 10250
+  servingTLSCertFile: ""     # e.g. /etc/macvz/pki/kubelet.crt
+  servingTLSKeyFile: ""      # e.g. /etc/macvz/pki/kubelet.key

@@ -293,6 +293,33 @@ func TestStatusCreatedVsStopped(t *testing.T) {
 	}
 }
 
+func TestStatusParsesNonZeroExitCode(t *testing.T) {
+	body := `[{"id":"x","status":{"state":"stopped","startedDate":"2026-06-18T13:55:56Z","exitCode":7,"networks":[]}}]`
+	f := &fakeRunner{outputs: map[string][]byte{"inspect": []byte(body)}}
+	st, err := driverWith(f).Status(context.Background(), "x")
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if st.Phase != runtime.PhaseFailed {
+		t.Errorf("Phase = %q, want Failed", st.Phase)
+	}
+	if st.ExitCode != 7 {
+		t.Errorf("ExitCode = %d, want 7", st.ExitCode)
+	}
+}
+
+func TestStatusParsesExitStatusAlias(t *testing.T) {
+	body := `[{"id":"x","status":{"state":"stopped","startedDate":"2026-06-18T13:55:56Z","exitStatus":3,"networks":[]}}]`
+	f := &fakeRunner{outputs: map[string][]byte{"inspect": []byte(body)}}
+	st, err := driverWith(f).Status(context.Background(), "x")
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if st.Phase != runtime.PhaseFailed || st.ExitCode != 3 {
+		t.Errorf("status = phase %q exit %d, want Failed/3", st.Phase, st.ExitCode)
+	}
+}
+
 func mustPhase(t *testing.T, body string) runtime.Phase {
 	t.Helper()
 	f := &fakeRunner{outputs: map[string][]byte{"inspect": []byte(body)}}

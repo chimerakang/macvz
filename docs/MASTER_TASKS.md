@@ -18,7 +18,7 @@ Source of truth for the phased roadmap. Phases map to GitHub **Milestones**; tas
 
 - **P0** — `go build ./...`, lint, and tests are green in CI.
 - **P1** — Go boots an Alpine micro-VM in seconds; `logs`/`exec` work; per-host concurrent-VM ceiling and per-VM RAM overhead are measured and recorded.
-- **P2** — `kubectl run alpine --image=alpine -- sleep 3600` lands a micro-VM on the Mac; `kubectl logs`/`exec` work; node shows in `kubectl get nodes`.
+- **P2** — `kubectl run alpine --image=alpine --restart=Never -- sleep 3600` lands a micro-VM on the Mac; `kubectl logs`/`exec` work; node shows in `kubectl get nodes`. Operator-facing run/verify/cleanup steps and expected output are documented in [docs/P2_SMOKE_TEST.md](P2_SMOKE_TEST.md); RBAC and manifests under [deployments/](../deployments/).
 - **P3** — A Service backed by Pods on two different Macs is reachable through normal Kubernetes networking.
 - **P4** — Multi-node e2e suite green; signed/notarized `macvz-kubelet` build; volumes + image-arch handling supported.
 
@@ -37,13 +37,13 @@ Source of truth for the phased roadmap. Phases map to GitHub **Milestones**; tas
 | #10 | Exec into running micro-VMs | P1 | open |
 | #11 | Density & per-VM RAM-overhead benchmark | P1 | open |
 | #12 | arm64 image pull verification | P1 | open |
-| #13 | Wire Virtual Kubelet controller into macvz-kubelet | P2 | open |
-| #14 | Register virtual node with capacity, addresses, taints, and conditions | P2 | open |
-| #15 | Implement node heartbeat and lease updates | P2 | open |
-| #16 | Implement Provider PodLifecycleHandler state and CRUD methods | P2 | open |
-| #17 | Translate Kubernetes Pod specs into runtime workload specs | P2 | open |
-| #18 | Wire kubectl logs and exec through the runtime | P2 | open |
-| #19 | Add RBAC, manifests, and P2 MVP smoke test docs | P2 | open |
+| #13 | Wire Virtual Kubelet controller into macvz-kubelet | P2 | in progress |
+| #14 | Register virtual node with capacity, addresses, taints, and conditions | P2 | in progress |
+| #15 | Implement node heartbeat and lease updates | P2 | in progress |
+| #16 | Implement Provider PodLifecycleHandler state and CRUD methods | P2 | in progress |
+| #17 | Translate Kubernetes Pod specs into runtime workload specs | P2 | in progress |
+| #18 | Wire kubectl logs and exec through the runtime | P2 | in progress |
+| #19 | Add RBAC, manifests, and P2 MVP smoke test docs | P2 | in progress |
 | #20 | Implement Kubernetes-coordinated Pod IPAM | P3 | open |
 | #21 | Bring up WireGuard mesh between MacVz nodes | P3 | open |
 | #22 | Connect micro-VM networking to the controllable Pod network path | P3 | open |

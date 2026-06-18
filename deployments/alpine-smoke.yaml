@@ -1,0 +1,34 @@
+# Smoke-test Pod for the P2 MVP: a single Alpine container that sleeps.
+#
+# It tolerates the MacVz provider taint and pins itself to a MacVz node so the
+# scheduler places it on the virtual node rather than a real one. Replace the
+# nodeSelector hostname with your node name (the macvz-kubelet `nodeName`).
+#
+# Apply with: kubectl apply -f deployments/alpine-smoke.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: alpine-smoke
+  namespace: default
+spec:
+  # Land on the MacVz node. Either keep the type label selector, or pin to a
+  # specific host via kubernetes.io/hostname: <your-node-name>.
+  nodeSelector:
+    type: virtual-kubelet
+  tolerations:
+    - key: virtual-kubelet.io/provider
+      operator: Equal
+      value: macvz
+      effect: NoSchedule
+  restartPolicy: Never
+  containers:
+    - name: alpine
+      image: alpine:3.20
+      command: ["sleep", "3600"]
+      resources:
+        requests:
+          cpu: "250m"
+          memory: 64Mi
+        limits:
+          cpu: "500m"
+          memory: 128Mi

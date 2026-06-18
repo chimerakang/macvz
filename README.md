@@ -110,7 +110,7 @@ macvz/
 - Register the Mac as a virtual node; advertise CPU/RAM capacity so the standard scheduler can place Pods.
 - Translate Pod spec → `pkg/runtime` calls (image, command/args, env, resource limits).
 - Wire up `kubectl logs` and `kubectl exec` through the provider.
-- **Acceptance:** `kubectl run alpine --image=alpine -- sleep 3600` lands a micro-VM on the Mac; `kubectl logs`/`exec` work.
+- **Acceptance:** `kubectl run alpine --image=alpine --restart=Never -- sleep 3600` lands a micro-VM on the Mac; `kubectl logs`/`exec` work.
 
 ### Phase 3 — Cross-host mesh networking
 

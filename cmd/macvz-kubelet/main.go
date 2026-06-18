@@ -9,11 +9,19 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"net"
 	"os"
+	"os/signal"
+	"runtime"
+	"syscall"
 
 	"github.com/chimerakang/macvz/internal/version"
 	"github.com/chimerakang/macvz/pkg/config"
+	"github.com/chimerakang/macvz/pkg/provider"
 	"github.com/chimerakang/macvz/pkg/runtime/container"
+	vknode "github.com/virtual-kubelet/virtual-kubelet/node"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
 )
 
@@ -40,7 +48,11 @@ func main() {
 		return
 	}
 
-	if err := run(configPath, runtimeBinary); err != nil {
+	// Cancel the root context on SIGINT/SIGTERM for graceful shutdown.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	if err := run(ctx, configPath, runtimeBinary); err != nil {
 		klog.ErrorS(err, "macvz-kubelet exited with error")
 		klog.Flush()
 		os.Exit(1)
@@ -48,7 +60,7 @@ func main() {
 	klog.Flush()
 }
 
-func run(configPath, runtimeBinary string) error {
+func run(ctx context.Context, configPath, runtimeBinary string) error {
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
@@ -73,16 +85,156 @@ func run(configPath, runtimeBinary string) error {
 
 	// Build the apple/container driver and report runtime readiness (P1).
 	driver := container.New(container.Config{Binary: bin})
-	if err := driver.Ready(context.Background()); err != nil {
+	if err := driver.Ready(ctx); err != nil {
 		klog.ErrorS(err, "apple/container runtime is not ready",
 			"hint", "ensure the binary is installed and `container system start` has been run")
 	} else {
 		klog.InfoS("apple/container runtime is ready")
 	}
-	_ = driver // handed to the provider in P2
 
-	// TODO(P2): construct the provider from driver and start the Virtual Kubelet
-	// node controller here.
-	klog.InfoS("node registration not yet implemented (lands in P2); exiting cleanly")
+	// Build the Kubernetes client from kubeconfig / in-cluster config.
+	restCfg, err := cfg.RestConfig()
+	if err != nil {
+		return fmt.Errorf("kubernetes client config: %w", err)
+	}
+	clientset, err := kubernetes.NewForConfig(restCfg)
+	if err != nil {
+		return fmt.Errorf("build kubernetes client: %w", err)
+	}
+
+	// Construct the provider over the runtime driver. Pod lifecycle methods are
+	// stubbed until #16; this issue only wires the node controller loop.
+	p := provider.New(cfg.NodeName, driver)
+
+	// Resolve the configured node shape (capacity/taints validated at load).
+	capacity, err := cfg.Capacity()
+	if err != nil {
+		return fmt.Errorf("node capacity: %w", err)
+	}
+	taints, err := cfg.Taints()
+	if err != nil {
+		return fmt.Errorf("node taints: %w", err)
+	}
+	internalIP := cfg.Node.InternalIP
+	if internalIP == "" {
+		internalIP = detectInternalIP()
+	}
+	nodeSpec := provider.NodeSpec{
+		KubeletVersion: version.Version,
+		OS:             cfg.Node.OS,
+		Arch:           cfg.Node.Arch,
+		InternalIP:     internalIP,
+		Capacity:       capacity,
+		Labels:         cfg.Node.Labels,
+		Annotations:    cfg.Node.Annotations,
+		Taints:         taints,
+	}
+	if cfg.Node.ServingTLSCertFile != "" && cfg.Node.ServingTLSKeyFile != "" {
+		nodeSpec.KubeletPort = cfg.Node.KubeletPort
+	}
+	node := p.BuildNode(ctx, nodeSpec)
+
+	pingInterval, statusInterval, err := cfg.HeartbeatIntervals()
+	if err != nil {
+		return fmt.Errorf("heartbeat intervals: %w", err)
+	}
+
+	klog.InfoS("registering virtual node",
+		"node", cfg.NodeName,
+		"cpu", cfg.Node.CPU, "memory", cfg.Node.Memory, "pods", cfg.Node.Pods,
+		"internalIP", internalIP, "taints", len(taints),
+		"enableLease", cfg.Node.EnableLease, "pingInterval", pingInterval, "statusInterval", statusInterval,
+	)
+
+	// Node provider re-probes runtime readiness on the status interval and
+	// surfaces changes as node conditions.
+	nodeProvider := p.NewNodeStatusProvider(nodeSpec, statusInterval)
+
+	// Log transient status-update errors and keep going: the control loop retries
+	// on the next interval, and client-go applies its own backoff. Returning nil
+	// signals "handled, retry possible" to Virtual Kubelet.
+	statusErrHandler := func(_ context.Context, err error) error {
+		klog.ErrorS(err, "transient node status update error; will retry", "node", cfg.NodeName)
+		return nil
+	}
+
+	opts := []vknode.NodeControllerOpt{
+		vknode.WithNodePingInterval(pingInterval),
+		vknode.WithNodeStatusUpdateInterval(statusInterval),
+		vknode.WithNodeStatusUpdateErrorHandler(statusErrHandler),
+	}
+	if cfg.Node.EnableLease {
+		// The Lease in kube-node-lease is the modern node heartbeat; Kubernetes
+		// marks the node NotReady if it is not renewed within the lease duration.
+		leaseClient := clientset.CoordinationV1().Leases(corev1.NamespaceNodeLease)
+		opts = append(opts, vknode.WithNodeEnableLeaseV1(leaseClient, cfg.Node.LeaseDurationSeconds))
+	}
+
+	nc, err := vknode.NewNodeController(
+		nodeProvider,
+		node,
+		clientset.CoreV1().Nodes(),
+		opts...,
+	)
+	if err != nil {
+		return fmt.Errorf("create node controller: %w", err)
+	}
+
+	klog.InfoS("starting virtual-kubelet node controller", "node", cfg.NodeName)
+	go func() {
+		if err := nc.Run(ctx); err != nil && ctx.Err() == nil {
+			klog.ErrorS(err, "node controller stopped unexpectedly")
+		}
+	}()
+
+	select {
+	case <-nc.Ready():
+		klog.InfoS("virtual node registered and ready", "node", cfg.NodeName)
+	case <-nc.Done():
+		return fmt.Errorf("node controller exited before becoming ready: %w", nc.Err())
+	case <-ctx.Done():
+		klog.InfoS("shutdown requested before node became ready")
+		return nil
+	}
+
+	// Start the Pod lifecycle controller so scheduled Pods become micro-VMs.
+	stopPods, err := startPodController(ctx, cfg, clientset, p, runtime.NumCPU())
+	if err != nil {
+		return fmt.Errorf("start pod controller: %w", err)
+	}
+	defer stopPods()
+
+	// Start the kubelet API server for kubectl logs/exec (no-op without certs).
+	stopServer, err := startKubeletServer(ctx, cfg, p)
+	if err != nil {
+		return fmt.Errorf("start kubelet server: %w", err)
+	}
+	defer stopServer()
+
+	// Block until shutdown is requested, then let the cancelled context unwind
+	// the controller run loops.
+	<-ctx.Done()
+	klog.InfoS("shutdown signal received; stopping controllers", "node", cfg.NodeName)
+	<-nc.Done()
+	if err := nc.Err(); err != nil {
+		return fmt.Errorf("node controller shutdown: %w", err)
+	}
+	klog.InfoS("macvz-kubelet stopped cleanly")
 	return nil
+}
+
+// detectInternalIP returns the host's primary outbound IPv4 address, used as
+// the node's InternalIP when not set in config. It opens no connection (UDP
+// dial just selects a route), and returns "" if detection fails — the node then
+// registers without an InternalIP.
+func detectInternalIP() string {
+	conn, err := net.Dial("udp", "8.8.8.8:80")
+	if err != nil {
+		return ""
+	}
+	defer func() { _ = conn.Close() }()
+	if addr, ok := conn.LocalAddr().(*net.UDPAddr); ok {
+		return addr.IP.String()
+	}
+	return ""
 }

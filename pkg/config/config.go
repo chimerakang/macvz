@@ -19,8 +19,14 @@ type Config struct {
 	// When empty, in-cluster config (or KUBECONFIG env) is used.
 	KubeconfigPath string `yaml:"kubeconfigPath"`
 
-	// RuntimeSocket is the path to the apple/container service API socket.
+	// RuntimeSocket is reserved for a future apple/container service API path.
+	// P1 drives the runtime through RuntimeBinary, but the field remains in the
+	// config so the eventual service transport has a stable home.
 	RuntimeSocket string `yaml:"runtimeSocket"`
+
+	// RuntimeBinary is the apple/container CLI to drive (path or PATH-resolved
+	// name). Defaults to "container".
+	RuntimeBinary string `yaml:"runtimeBinary"`
 
 	// LogLevel is the klog verbosity ("info", "debug") or a numeric V level.
 	LogLevel string `yaml:"logLevel"`
@@ -32,6 +38,7 @@ func Default() Config {
 	return Config{
 		NodeName:      host,
 		RuntimeSocket: "/var/run/com.apple.container.sock",
+		RuntimeBinary: "container",
 		LogLevel:      "info",
 	}
 }
@@ -67,9 +74,6 @@ func Load(path string) (Config, error) {
 func (c Config) Validate() error {
 	if c.NodeName == "" {
 		return fmt.Errorf("nodeName must be set (hostname lookup failed)")
-	}
-	if c.RuntimeSocket == "" {
-		return fmt.Errorf("runtimeSocket must be set")
 	}
 	return nil
 }

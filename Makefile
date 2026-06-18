@@ -22,6 +22,11 @@ build: ## Build the binary into bin/ with version stamping
 	@mkdir -p $(BIN_DIR)
 	go build -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/$(BINARY) $(CMD)
 
+.PHONY: bench
+bench: ## Build the density/RAM benchmark harness into bin/mvz-bench
+	@mkdir -p $(BIN_DIR)
+	go build -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/mvz-bench ./cmd/mvz-bench
+
 .PHONY: test
 test: ## Run unit tests
 	go test ./...

@@ -128,7 +128,9 @@ func run(ctx context.Context, configPath, runtimeBinary string) error {
 		Labels:         cfg.Node.Labels,
 		Annotations:    cfg.Node.Annotations,
 		Taints:         taints,
-		KubeletPort:    cfg.Node.KubeletPort,
+	}
+	if cfg.Node.ServingTLSCertFile != "" && cfg.Node.ServingTLSKeyFile != "" {
+		nodeSpec.KubeletPort = cfg.Node.KubeletPort
 	}
 	node := p.BuildNode(ctx, nodeSpec)
 
@@ -230,7 +232,7 @@ func detectInternalIP() string {
 	if err != nil {
 		return ""
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	if addr, ok := conn.LocalAddr().(*net.UDPAddr); ok {
 		return addr.IP.String()
 	}

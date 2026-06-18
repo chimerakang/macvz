@@ -154,6 +154,14 @@ func TestTranslatePodUnsupported(t *testing.T) {
 			},
 			wantSub: "hostNetwork",
 		},
+		{
+			name: "restart policy always",
+			spec: corev1.PodSpec{
+				RestartPolicy: corev1.RestartPolicyAlways,
+				Containers:    []corev1.Container{{Name: "a", Image: "x"}},
+			},
+			wantSub: "restartPolicy",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

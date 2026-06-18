@@ -63,7 +63,7 @@ func TestGetContainerLogsStreams(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetContainerLogs: %v", err)
 	}
-	defer rc.Close()
+	defer func() { _ = rc.Close() }()
 	got, _ := io.ReadAll(rc)
 	if string(got) != "hello from alpine\n" {
 		t.Errorf("logs = %q, want greeting", string(got))

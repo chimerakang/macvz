@@ -141,3 +141,17 @@ func TestBuildNodeOmitsEmptyInternalIP(t *testing.T) {
 		}
 	}
 }
+
+func TestBuildNodeAdvertisesKubeletPortOnlyWhenConfigured(t *testing.T) {
+	spec := testSpec()
+	node := New("n", fakeRuntime{}).BuildNode(context.Background(), spec)
+	if node.Status.DaemonEndpoints.KubeletEndpoint.Port != 0 {
+		t.Errorf("kubelet endpoint port = %d, want unset", node.Status.DaemonEndpoints.KubeletEndpoint.Port)
+	}
+
+	spec.KubeletPort = 10250
+	node = New("n", fakeRuntime{}).BuildNode(context.Background(), spec)
+	if node.Status.DaemonEndpoints.KubeletEndpoint.Port != 10250 {
+		t.Errorf("kubelet endpoint port = %d, want 10250", node.Status.DaemonEndpoints.KubeletEndpoint.Port)
+	}
+}

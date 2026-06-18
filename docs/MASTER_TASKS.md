@@ -18,7 +18,7 @@ Source of truth for the phased roadmap. Phases map to GitHub **Milestones**; tas
 
 - **P0** — `go build ./...`, lint, and tests are green in CI.
 - **P1** — Go boots an Alpine micro-VM in seconds; `logs`/`exec` work; per-host concurrent-VM ceiling and per-VM RAM overhead are measured and recorded.
-- **P2** — `kubectl run alpine --image=alpine -- sleep 3600` lands a micro-VM on the Mac; `kubectl logs`/`exec` work; node shows in `kubectl get nodes`. Operator-facing run/verify/cleanup steps and expected output are documented in [docs/P2_SMOKE_TEST.md](P2_SMOKE_TEST.md); RBAC and manifests under [deployments/](../deployments/).
+- **P2** — `kubectl run alpine --image=alpine --restart=Never -- sleep 3600` lands a micro-VM on the Mac; `kubectl logs`/`exec` work; node shows in `kubectl get nodes`. Operator-facing run/verify/cleanup steps and expected output are documented in [docs/P2_SMOKE_TEST.md](P2_SMOKE_TEST.md); RBAC and manifests under [deployments/](../deployments/).
 - **P3** — A Service backed by Pods on two different Macs is reachable through normal Kubernetes networking.
 - **P4** — Multi-node e2e suite green; signed/notarized `macvz-kubelet` build; volumes + image-arch handling supported.
 

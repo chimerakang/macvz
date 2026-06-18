@@ -323,6 +323,8 @@ type inspectResult struct {
 	Status struct {
 		State       string `json:"state"`
 		StartedDate string `json:"startedDate"`
+		ExitCode    *int   `json:"exitCode"`
+		ExitStatus  *int   `json:"exitStatus"`
 		Networks    []struct {
 			IPv4Address string `json:"ipv4Address"`
 		} `json:"networks"`
@@ -340,7 +342,11 @@ func parseStatus(id string, out []byte) (runtime.Status, error) {
 	}
 	r := results[0]
 
-	st := runtime.Status{ID: r.ID, Phase: phaseFor(r.Status.State, r.Status.StartedDate)}
+	exitCode := firstInt(r.Status.ExitCode, r.Status.ExitStatus)
+	st := runtime.Status{ID: r.ID, Phase: phaseFor(r.Status.State, r.Status.StartedDate, exitCode)}
+	if exitCode != nil {
+		st.ExitCode = *exitCode
+	}
 	if r.Status.StartedDate != "" {
 		if t, err := time.Parse(time.RFC3339, r.Status.StartedDate); err == nil {
 			st.StartedAt = t
@@ -359,7 +365,7 @@ func parseStatus(id string, out []byte) (runtime.Status, error) {
 // phaseFor translates an apple/container state string into a runtime.Phase. A
 // freshly created, never-started workload reports "stopped" with no start time,
 // which we surface as PhaseCreated to distinguish it from a stopped run.
-func phaseFor(state, startedDate string) runtime.Phase {
+func phaseFor(state, startedDate string, exitCode *int) runtime.Phase {
 	switch strings.ToLower(state) {
 	case "running":
 		return runtime.PhaseRunning
@@ -367,10 +373,22 @@ func phaseFor(state, startedDate string) runtime.Phase {
 		if startedDate == "" {
 			return runtime.PhaseCreated
 		}
+		if exitCode != nil && *exitCode != 0 {
+			return runtime.PhaseFailed
+		}
 		return runtime.PhaseStopped
 	default:
 		return runtime.PhaseUnknown
 	}
+}
+
+func firstInt(values ...*int) *int {
+	for _, v := range values {
+		if v != nil {
+			return v
+		}
+	}
+	return nil
 }
 
 // mapErr translates a CLI failure into a typed runtime sentinel where the

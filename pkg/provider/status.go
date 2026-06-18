@@ -42,6 +42,14 @@ func (p *Provider) reconcileStatus(ctx context.Context, st *podState) corev1.Pod
 				statuses = append(statuses, terminatedStatus(c, w.id, 0, "Lost", "runtime workload not found"))
 				continue
 			}
+			// A transient inspect/runtime error should not regress an already
+			// running Pod back to Pending. Preserve the last observed state when
+			// available, and expose the runtime error through Pod conditions.
+			if prev, ok := previousContainerStatus(st.pod.Status, c.Name); ok {
+				statuses = append(statuses, prev)
+				status.Message = err.Error()
+				continue
+			}
 			statuses = append(statuses, waitingStatus(c, "RuntimeError", err.Error()))
 			continue
 		}
@@ -54,7 +62,19 @@ func (p *Provider) reconcileStatus(ctx context.Context, st *podState) corev1.Pod
 	status.ContainerStatuses = statuses
 	status.Phase = aggregatePhase(statuses)
 	status.Conditions = podConditions(status.Phase)
+	if status.Message != "" {
+		status.Conditions = podConditionsWithRuntimeError(status.Conditions, status.Message)
+	}
 	return status
+}
+
+func previousContainerStatus(status corev1.PodStatus, name string) (corev1.ContainerStatus, bool) {
+	for _, s := range status.ContainerStatuses {
+		if s.Name == name {
+			return *s.DeepCopy(), true
+		}
+	}
+	return corev1.ContainerStatus{}, false
 }
 
 // containerStatus maps a single runtime status to a Kubernetes container status.
@@ -169,6 +189,18 @@ func podConditions(phase corev1.PodPhase) []corev1.PodCondition {
 		cond(corev1.ContainersReady, ready),
 		cond(corev1.PodReady, ready),
 	}
+}
+
+func podConditionsWithRuntimeError(conditions []corev1.PodCondition, msg string) []corev1.PodCondition {
+	out := append([]corev1.PodCondition(nil), conditions...)
+	for i := range out {
+		if out[i].Type == corev1.PodReady || out[i].Type == corev1.ContainersReady {
+			out[i].Status = corev1.ConditionFalse
+			out[i].Reason = "RuntimeStatusError"
+			out[i].Message = msg
+		}
+	}
+	return out
 }
 
 func boolPtr(b bool) *bool { return &b }

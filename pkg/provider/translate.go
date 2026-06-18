@@ -50,6 +50,9 @@ func unsupportedReasons(pod *corev1.Pod) []string {
 	if n := len(pod.Spec.EphemeralContainers); n > 0 {
 		reasons = append(reasons, fmt.Sprintf("ephemeral containers are not supported yet (found %d)", n))
 	}
+	if pod.Spec.RestartPolicy != "" && pod.Spec.RestartPolicy != corev1.RestartPolicyNever {
+		reasons = append(reasons, fmt.Sprintf("restartPolicy %q is not supported yet (only Never is supported in the MVP)", pod.Spec.RestartPolicy))
+	}
 
 	for _, v := range pod.Spec.Volumes {
 		if isDefaultProjectedToken(v) {

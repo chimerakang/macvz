@@ -110,7 +110,7 @@ macvz/
 - 將 Mac 註冊為虛擬節點；回報 CPU/RAM 容量，讓標準調度器能派 Pod。
 - 將 Pod spec 翻譯成 `pkg/runtime` 呼叫（映像、command/args、env、資源限制）。
 - 打通 `kubectl logs` 與 `kubectl exec`。
-- **驗收：** `kubectl run alpine --image=alpine -- sleep 3600` 能在 Mac 上落地一個 micro-VM，且 `kubectl logs`／`exec` 正常。
+- **驗收：** `kubectl run alpine --image=alpine --restart=Never -- sleep 3600` 能在 Mac 上落地一個 micro-VM，且 `kubectl logs`／`exec` 正常。
 
 ### 階段三：跨主機網格網路
 

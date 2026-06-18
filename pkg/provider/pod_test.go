@@ -130,10 +130,10 @@ func (r *recordingRuntime) Exec(_ context.Context, _ string, cmd []string, sio r
 	r.lastExecCmd = cmd
 	r.mu.Unlock()
 	if sio.Stdout != nil && stdout != "" {
-		io.WriteString(sio.Stdout, stdout)
+		_, _ = io.WriteString(sio.Stdout, stdout)
 	}
 	if sio.Stderr != nil && stderr != "" {
-		io.WriteString(sio.Stderr, stderr)
+		_, _ = io.WriteString(sio.Stderr, stderr)
 	}
 	return execErr
 }
@@ -310,6 +310,38 @@ func TestGetPodStatusMapsLostWorkload(t *testing.T) {
 	term := st.ContainerStatuses[0].State.Terminated
 	if term == nil || term.Reason != "Lost" {
 		t.Errorf("lost workload should map to terminated/Lost, got %+v", st.ContainerStatuses[0].State)
+	}
+}
+
+func TestGetPodStatusPreservesPreviousStatusOnRuntimeError(t *testing.T) {
+	p, rt := newTestProvider()
+	ctx := context.Background()
+	if err := p.CreatePod(ctx, testPod("web")); err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+	st, err := p.GetPodStatus(ctx, "default", "p1")
+	if err != nil {
+		t.Fatalf("GetPodStatus: %v", err)
+	}
+	if st.Phase != corev1.PodRunning {
+		t.Fatalf("phase = %q, want Running before injected error", st.Phase)
+	}
+
+	rt.statusErr = runtime.ErrNotReady
+	st, err = p.GetPodStatus(ctx, "default", "p1")
+	if err != nil {
+		t.Fatalf("GetPodStatus with transient runtime error: %v", err)
+	}
+	if st.Phase != corev1.PodRunning {
+		t.Errorf("phase regressed to %q, want Running", st.Phase)
+	}
+	if st.Message == "" {
+		t.Error("expected runtime error message to be surfaced on Pod status")
+	}
+	for _, c := range st.Conditions {
+		if c.Type == corev1.PodReady && c.Reason != "RuntimeStatusError" {
+			t.Errorf("Ready condition reason = %q, want RuntimeStatusError", c.Reason)
+		}
 	}
 }
 

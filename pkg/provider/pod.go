@@ -115,8 +115,8 @@ func (p *Provider) UpdatePod(ctx context.Context, pod *corev1.Pod) error {
 	if !ok {
 		return errdefs.NotFoundf("pod %q is not known to this node", key)
 	}
-	st.pod.ObjectMeta.Labels = pod.ObjectMeta.Labels
-	st.pod.ObjectMeta.Annotations = pod.ObjectMeta.Annotations
+	st.pod.Labels = pod.Labels
+	st.pod.Annotations = pod.Annotations
 	klog.InfoS("updated Pod metadata", "pod", key)
 	return nil
 }

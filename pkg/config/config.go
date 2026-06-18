@@ -4,6 +4,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"time"
 
@@ -39,6 +40,14 @@ type Config struct {
 	// Node describes the shape this Mac advertises as a Kubernetes node:
 	// capacity, addresses, labels, and scheduling taints.
 	Node NodeConfig `yaml:"node"`
+
+	// Mesh configures the cross-host WireGuard mesh (P3). Disabled by default so
+	// single-host development needs no networking setup.
+	Mesh MeshConfig `yaml:"mesh"`
+
+	// PodNetwork configures the host path that makes each micro-VM reachable at
+	// its assigned Pod IP across the mesh (P3, #22). Disabled by default.
+	PodNetwork PodNetworkConfig `yaml:"podNetwork"`
 }
 
 // NodeConfig is the configurable shape of the virtual node registered with
@@ -62,6 +71,12 @@ type NodeConfig struct {
 	// InternalIP is the node's reachable address. When empty, the kubelet
 	// detects the host's primary outbound IPv4 at startup.
 	InternalIP string `yaml:"internalIP"`
+
+	// PodCIDR overrides the address range used for coordinated Pod IPAM. When
+	// empty, the kubelet uses the Pod CIDR that Kubernetes assigns to this node
+	// (Node.Spec.PodCIDR). Set it only on clusters that do not allocate node
+	// CIDRs, where each node must be given a disjoint range manually.
+	PodCIDR string `yaml:"podCIDR"`
 
 	// Labels and Annotations are merged onto the built-in node metadata. User
 	// entries override built-ins on key collision.
@@ -293,6 +308,17 @@ func (c Config) Validate() error {
 	}
 	if (c.Node.ServingTLSCertFile == "") != (c.Node.ServingTLSKeyFile == "") {
 		return fmt.Errorf("node.servingTLSCertFile and node.servingTLSKeyFile must be set together")
+	}
+	if c.Node.PodCIDR != "" {
+		if _, _, err := net.ParseCIDR(c.Node.PodCIDR); err != nil {
+			return fmt.Errorf("node.podCIDR %q is not a valid CIDR: %w", c.Node.PodCIDR, err)
+		}
+	}
+	if err := c.validateMesh(); err != nil {
+		return err
+	}
+	if err := c.validatePodNetwork(); err != nil {
+		return err
 	}
 	return nil
 }

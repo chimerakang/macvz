@@ -1,0 +1,502 @@
+# MacVz Networking
+
+This document describes MacVz cross-host networking (P3):
+
+- [Pod IPAM (MVP)](#pod-ipam-mvp) — issue #20.
+- [WireGuard mesh (MVP)](#wireguard-mesh-mvp) — issue #21.
+- [Micro-VM network attach (MVP)](#micro-vm-network-attach-mvp) — issue #22.
+- [Pod status & Service resolution (MVP)](#pod-status--service-resolution-mvp) — issue #23.
+- [Port-forward (MVP)](#port-forward-mvp) — issue #24.
+- [End-to-end: a Service across two Macs](#end-to-end-a-service-across-two-macs).
+
+Together these give a Pod on one Mac an L3 path to a Pod hosted on another Mac:
+IPAM assigns the address, the mesh routes the CIDR between hosts, the network
+attach connects each micro-VM to that path, and the status reporting publishes
+the address and readiness so Kubernetes Services resolve normally.
+
+## Pod IPAM (MVP)
+
+This section describes the MVP Pod IP address management (IPAM) behavior for
+MacVz, delivered in issue #20.
+
+## Allocation model
+
+MacVz does **not** invent a new cluster-wide IPAM coordinator. It reuses state
+Kubernetes already owns:
+
+- When `kube-controller-manager` runs with `--allocate-node-cidrs=true` and a
+  `--cluster-cidr`, Kubernetes assigns every node a **disjoint** `Spec.PodCIDR`
+  (e.g. `10.244.1.0/24` on one Mac, `10.244.2.0/24` on another).
+- Each `macvz-kubelet` allocates Pod IPs **only** from its own node's PodCIDR.
+
+Because the per-node CIDRs are disjoint and Kubernetes-owned, two MacVz nodes can
+never produce the same Pod IP for different Pods. Collision avoidance is a
+property of the CIDR partitioning, not of any peer-to-peer negotiation.
+
+### Within a node
+
+`pkg/network.PodIPAM` hands out host addresses from the node's CIDR in order:
+
+- The **network address** (offset 0) is reserved.
+- The **first host address** (offset 1) is reserved as the gateway, matching
+  typical CNI bridge conventions; the data path using it is wired in #22.
+- For IPv4, the **broadcast address** (last) is reserved.
+- Remaining addresses are allocated to Pods. IPv6 CIDRs are supported.
+
+Allocation is keyed by `namespace/name` and is **idempotent**: Virtual Kubelet
+may re-issue `CreatePod`, and the same Pod always gets the same IP. Released
+addresses return to the pool and are reused.
+
+## Lifecycle
+
+- **Create** — `Provider.CreatePod` allocates an IP and records it as the Pod's
+  `status.PodIP`. If the Pod fails to start (or is a terminal failure such as an
+  architecture mismatch), the IP is released so it is not leaked.
+- **Delete** — `Provider.DeletePod` releases the IP back to the pool.
+- **Restart recovery** — on startup, `macvz-kubelet` lists the Pods assigned to
+  this node and calls `Provider.RecoverAllocations`, which **reserves** the
+  `status.PodIP` already recorded in Kubernetes. A restarted provider therefore
+  neither leaks addresses nor reassigns a live Pod's IP. Kubernetes is the
+  durable record; the in-memory allocator is rebuilt from it.
+
+## Configuration
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `node.podCIDR` | _(empty)_ | Override for the Pod CIDR. When empty, MacVz waits for and uses the Kubernetes-assigned `Node.Spec.PodCIDR`. |
+
+Set `node.podCIDR` only on clusters that do **not** allocate node CIDRs; you must
+then give each node a disjoint range manually to preserve collision avoidance.
+
+### Graceful degradation
+
+If no Pod CIDR is available (node-CIDR allocation is off and no override is set),
+coordinated IPAM is disabled with a log message and Pods still run — the
+`status.PodIP` is then derived from the runtime-reported address. This keeps
+single-host development working without cluster-wide IPAM.
+
+### Pod IPAM tests
+
+- `pkg/network/ipam_test.go` — allocation, release/reuse, idempotency, reserve
+  (restart recovery), exhaustion, out-of-range rejection, IPv6, concurrency, and
+  the cross-node collision-avoidance property.
+- `pkg/provider/ipam_test.go` — Pod IP assignment on create, release on delete,
+  release on failure, recovery from existing Kubernetes Pods, and the no-IPAM
+  fallback to the runtime-reported address.
+
+## WireGuard mesh (MVP)
+
+This section describes the encrypted host-to-host mesh that carries Pod traffic
+between Macs, delivered in issue #21 (`pkg/network/wireguard`).
+
+### Model
+
+Each Mac runs **one WireGuard interface**. Every other MacVz node is a *peer*,
+and a peer's `AllowedIPs` is its **Pod CIDR** (from [Pod IPAM](#pod-ipam-mvp))
+plus its mesh address. Traffic for a remote Pod is therefore encrypted and
+tunnelled to the Mac that hosts it, and a **host route** for that CIDR is
+installed through the interface so the kernel forwards Pod-bound packets into the
+tunnel.
+
+macOS has no in-kernel WireGuard, so MacVz drives the userspace toolchain from
+Homebrew's `wireguard-tools` (`wg`, `wireguard-go`) plus the system `route` and
+`ifconfig`. Bring-up runs, in order:
+
+1. `wireguard-go <iface>` — create the userspace `utun` interface.
+2. `wg setconf <iface> /dev/stdin` — apply keys and peers (config via stdin, no
+   file on disk).
+3. `ifconfig <iface> inet <addr> <addr> alias` + `ifconfig <iface> up` — assign
+   the mesh address and bring the link up.
+4. `route -q -n add -inet <cidr> -interface <iface>` — one route per peer CIDR.
+
+Interface creation and route installation tolerate "already exists" / "File
+exists", so bring-up is **idempotent** and safe to re-run.
+
+### Reconcile without restart
+
+When nodes join or leave, `Mesh.Sync` re-applies the peer set with
+`wg syncconf` (which adds/removes peers atomically) and adds/removes only the
+affected host routes — the interface is never torn down, so unrelated peers keep
+their tunnels. `Mesh.Down` removes routes and destroys the interface on shutdown
+(best-effort).
+
+### Peer identity & keys
+
+Each node's private key lives in `mesh.privateKeyFile`, generated (mode 0600) on
+first start if absent, giving the node a **stable identity across restarts**
+without keys ever appearing in config or git. Share each node's **public key**
+(logged at startup, or `wg pubkey < key`) with its peers.
+
+### Prerequisites
+
+```sh
+brew install wireguard-tools   # provides wg, wg-quick, wireguard-go
+```
+
+`wireguard-go`, `ifconfig`, and `route` require elevated privileges to create
+interfaces and edit the routing table; run `macvz-kubelet` accordingly.
+
+### Configuration
+
+Add a `mesh` stanza to each node's config. The mesh is **disabled by default**
+so single-host development needs no setup.
+
+| Field | Meaning |
+| --- | --- |
+| `mesh.enabled` | Turn the mesh on. |
+| `mesh.interface` | Interface name to manage (e.g. `utun7`). |
+| `mesh.privateKeyFile` | Path to this node's private key (auto-generated if absent). |
+| `mesh.address` | This node's mesh address, CIDR (e.g. `10.99.0.1/32`). |
+| `mesh.listenPort` | WireGuard UDP port (default `51820`). |
+| `mesh.mtu` | Optional interface MTU. |
+| `mesh.peers[]` | `name`, `publicKey`, `endpoint` (host:port), `podCIDR`, `address`, `persistentKeepalive`. |
+
+### Two-node example
+
+**mac-01** (`10.99.0.1`, Pod CIDR `10.244.1.0/24`):
+
+```yaml
+mesh:
+  enabled: true
+  interface: utun7
+  privateKeyFile: /var/lib/macvz/wg.key
+  address: 10.99.0.1/32
+  listenPort: 51820
+  peers:
+    - name: mac-02
+      publicKey: <mac-02 public key>
+      endpoint: 192.168.1.20:51820
+      podCIDR: 10.244.2.0/24
+      address: 10.99.0.2/32
+      persistentKeepalive: 25
+```
+
+**mac-02** (`10.99.0.2`, Pod CIDR `10.244.2.0/24`):
+
+```yaml
+mesh:
+  enabled: true
+  interface: utun7
+  privateKeyFile: /var/lib/macvz/wg.key
+  address: 10.99.0.2/32
+  listenPort: 51820
+  peers:
+    - name: mac-01
+      publicKey: <mac-01 public key>
+      endpoint: 192.168.1.10:51820
+      podCIDR: 10.244.1.0/24
+      address: 10.99.0.1/32
+      persistentKeepalive: 25
+```
+
+### Verifying
+
+```sh
+wg show utun7                       # handshake established with the peer
+netstat -rn -f inet | grep utun7   # routes for remote Pod CIDRs are present
+ping 10.99.0.2                      # reach the peer across the tunnel
+```
+
+### Mesh tests
+
+- `pkg/network/wireguard/key_test.go` — key generation/clamping, base64 round
+  trip, public-key derivation, and persistent load-or-create.
+- `pkg/network/wireguard/config_test.go` — config validation, `wg-quick` vs `wg`
+  rendering, deterministic output, and route-target de-duplication.
+- `pkg/network/wireguard/mesh_test.go` — bring-up command sequence, idempotent
+  tolerance of benign errors, fatal-error propagation, peer/route reconcile via
+  `Sync`, and best-effort `Down`.
+- `pkg/config/mesh_test.go` — mesh config validation and translation into the
+  `wireguard` package's interface config.
+
+## Micro-VM network attach (MVP)
+
+This section describes how each `apple/container` micro-VM is connected to the
+Pod network path, delivered in issue #22 (`pkg/network/podnet`). It is the piece
+that makes a Pod reachable at its [assigned Pod IP](#pod-ipam-mvp) and routable
+across the [mesh](#wireguard-mesh-mvp).
+
+### The apple/container constraint
+
+`apple/container` attaches each micro-VM to a **vmnet-backed** network and gives
+it a **host-only address** (e.g. `192.168.64.x`) over DHCP. The CLI does **not**
+let MacVz push an arbitrary guest IP, so a micro-VM cannot natively own its
+Kubernetes Pod IP. MacVz bridges this gap on the host rather than inside the
+guest.
+
+### Chosen path: host-side 1:1 NAT (pf `binat`)
+
+For each Pod, MacVz programs a packet-filter `binat` (bidirectional NAT) rule in
+a dedicated anchor (`macvz/pods`) that maps the Pod's assigned Pod IP to the
+micro-VM's host-only address:
+
+```
+binat on <vmnet-iface> from <vmIP> to any -> <podIP>
+```
+
+- **Inbound** — packets the mesh delivers for the Pod IP (the node's Pod CIDR is
+  routed here, see the mesh section) are DNAT'd to the VM address and forwarded
+  onto the vmnet interface.
+- **Outbound** — packets the VM sends are SNAT'd to appear to originate from the
+  Pod IP; the route for a remote Pod CIDR (installed by the mesh) carries them
+  into the WireGuard tunnel.
+
+IPv4 forwarding is enabled so the host routes between the mesh interface and the
+vmnet interface. The result satisfies the acceptance criteria: each Pod is
+addressed by its **MacVz Pod IP** (not an opaque host-only address), and a Pod
+on one Mac reaches a Pod hosted on another Mac at **L3**.
+
+The provider observes the VM's host-only address from the runtime once the guest
+has acquired DHCP, then attaches the mapping; it detaches on Pod deletion. The
+anchor ruleset is regenerated wholesale and loaded atomically (`pfctl -a
+macvz/pods -f -`) on every change.
+
+### Alternative considered: gvisor-tap-vsock
+
+A fully userspace path — attaching the guest over `vsock`/a file handle and
+terminating its traffic in a userspace network stack (gvisor-tap-vsock style) —
+would let the Pod own its IP directly and avoid `pf`/root. It requires a guest
+agent and a userspace gateway process, so it is **deferred past the MVP**; the
+host-NAT path above needs no guest changes and works with stock
+`apple/container` images.
+
+### Prerequisites
+
+`pf` must evaluate the MacVz anchor. Reference it from `/etc/pf.conf` once:
+
+```
+nat-anchor "macvz/pods/*"
+rdr-anchor "macvz/pods/*"
+binat-anchor "macvz/pods/*"
+anchor "macvz/pods/*"
+```
+
+`pfctl` and `sysctl` require elevated privileges. Identify the vmnet interface
+backing the micro-VMs (commonly `bridge100`) with `ifconfig` and set it as
+`podNetwork.interface`.
+
+### Configuration
+
+| Field | Meaning |
+| --- | --- |
+| `podNetwork.enabled` | Turn the host Pod network path on. |
+| `podNetwork.interface` | vmnet interface the micro-VMs attach to (e.g. `bridge100`). |
+| `podNetwork.anchor` | pf anchor to manage (default `macvz/pods`). |
+| `podNetwork.enableForwarding` | Enable IPv4 forwarding (default `true`). |
+
+```yaml
+podNetwork:
+  enabled: true
+  interface: bridge100
+```
+
+### Verifying
+
+```sh
+sudo pfctl -a macvz/pods -s nat        # binat rules, one per Pod
+sysctl net.inet.ip.forwarding          # = 1
+# From a Pod on mac-01, reach a Pod hosted on mac-02 by its Pod IP:
+kubectl exec <pod-on-mac01> -- ping -c1 <pod-ip-on-mac02>
+```
+
+### Failure modes
+
+- **No binat rules appear** — the anchor is not referenced from `pf.conf`, or pf
+  is disabled. Add the anchor hooks above and confirm `pfctl -s info` shows
+  `Status: Enabled`.
+- **`CreatePod` retries with "micro-VM address not available yet"** — the guest
+  has not finished DHCP. The provider polls briefly and the next reconcile
+  succeeds once the VM reports an address; persistent failure points at vmnet/DHCP
+  on the host.
+- **Inbound works, outbound does not (or vice-versa)** — IP forwarding is off
+  (`sysctl net.inet.ip.forwarding` should be `1`) or the remote Pod CIDR has no
+  mesh route (`netstat -rn` should list it via the WireGuard interface).
+- **Pod IP unreachable from another Mac** — verify the mesh tunnel first
+  (`wg show`), then that the destination node's Pod CIDR routes to it.
+
+### Pod network tests
+
+- `pkg/network/podnet/router_test.go` — Start (forwarding + pf enable, tolerating
+  "already enabled"), `binat` rule rendering, attach/detach anchor reloads,
+  endpoint validation, deterministic rendering, and anchor flush on Stop.
+- `pkg/provider/podnet_test.go` — attach on create, detach on delete, rollback +
+  IP release when attach fails, failure when the VM IP never appears, and the
+  disabled-path no-op.
+
+## Pod status & Service resolution (MVP)
+
+This section describes how MacVz reports Pod status to Kubernetes so Endpoints /
+EndpointSlices and Services work normally, delivered in issue #23
+(`pkg/provider`).
+
+### What the provider publishes
+
+`Provider.reconcileStatus` builds the `PodStatus` that Virtual Kubelet pushes to
+the API server:
+
+- **`status.podIP` and `status.podIPs`** — both are set from the
+  [assigned Pod IP](#pod-ipam-mvp). The EndpointSlice controller reads
+  `podIPs`, so populating it is what makes a MacVz-backed Pod appear as a usable
+  Service endpoint. (Without an IPAM allocation, the runtime-reported address is
+  used as a fallback.)
+- **`status.hostIP` / `status.hostIPs`** — the node's reachable address, so
+  `kubectl get pod -o wide` and topology-aware routing resolve the hosting Mac.
+- **Conditions** — `Initialized`, `ContainersReady`, and `Ready`.
+
+### Readiness gates endpoint membership
+
+A Pod is reported `Ready` only when it is **both running and addressable** — the
+phase is `Running` *and* a Pod IP is present. A running Pod without an address is
+held `Ready=False` with reason `PodNetworkNotReady`, and a transient runtime
+error yields `Ready=False` with reason `RuntimeStatusError`. This guarantees the
+EndpointSlice controller never adds an unreachable Pod to a Service, so traffic
+is only sent to Pods that can actually receive it.
+
+### DNS / service discovery
+
+No MacVz-specific work is needed: once Pods report correct `podIPs` and `Ready`
+conditions, the in-cluster EndpointSlice controller, kube-proxy, and CoreDNS
+treat MacVz-backed Pods like any other. A `ClusterIP` Service's DNS name resolves
+to the Service IP, and kube-proxy load-balances to the ready Pod IPs — which the
+[mesh](#wireguard-mesh-mvp) and [network attach](#micro-vm-network-attach-mvp)
+make reachable across Macs.
+
+### Status tests
+
+- `pkg/provider/status_test.go` — `podIP`/`podIPs`/`hostIP` population, readiness
+  True when running with an IP, `Ready=False`/`PodNetworkNotReady` when running
+  without an IP, and `Ready=False`/`RuntimeStatusError` on a runtime error.
+
+## Port-forward (MVP)
+
+This section describes `kubectl port-forward` for MacVz-backed Pods, delivered in
+issue #24 (`pkg/provider`).
+
+### How it works
+
+`kubectl port-forward` opens a stream to the node's kubelet API server (the same
+HTTPS endpoint that serves `logs`/`exec`), which Virtual Kubelet routes to
+`Provider.PortForward`. Because the kubelet runs on the **same Mac** as the Pod's
+micro-VM, it dials the VM's address directly — the host can always reach the
+guest's vmnet address, so port-forward works **with or without** the cross-host
+[Pod network path](#micro-vm-network-attach-mvp) or [mesh](#wireguard-mesh-mvp).
+Bytes are copied bidirectionally between the Kubernetes stream and the TCP
+connection until either side closes or the request is cancelled; both copy
+goroutines and the connection are always reaped, so closing the forward leaks
+nothing.
+
+The target address is the live runtime-reported micro-VM address, falling back
+to the address observed when the Pod was attached to the network path.
+
+### Error behavior
+
+- **Unknown Pod** → `NotFound` (kubectl reports the Pod does not exist).
+- **Non-running Pod** → a clear "container is not running" error, not `NotFound`.
+- **Nothing listening on the port** → the dial is refused and the error surfaces
+  to kubectl, matching normal Kubernetes behavior.
+- **Out-of-range port** → rejected before dialing.
+
+### Requirements
+
+Port-forward uses the kubelet API server, so it needs the serving TLS cert/key
+(`node.servingTLSCertFile`/`servingTLSKeyFile`) just like `logs`/`exec`; without
+them the server is not started and these subcommands are unavailable.
+
+### Smoke test
+
+```sh
+# A Pod with a process listening on 8080 inside the micro-VM:
+kubectl port-forward pod/<name> 18080:8080 &
+curl -s localhost:18080            # reaches the in-Pod process
+kill %1                            # closing the forward cleans up cleanly
+```
+
+### Port-forward tests
+
+- `pkg/provider/portforward_test.go` — byte proxying through a loopback target,
+  clean return on stream close and on context cancellation (no goroutine leak),
+  and the unknown-Pod / non-running / bad-port / nothing-listening error paths.
+
+## End-to-end: a Service across two Macs
+
+A smoke test that exercises #20–#23 together: a Service backed by Pods on two
+different Macs, reached from a client Pod.
+
+### Prerequisites
+
+- Two `macvz-kubelet` nodes registered and `Ready` (`kubectl get nodes`), each
+  with a Kubernetes-assigned `Spec.PodCIDR`.
+- The [WireGuard mesh](#wireguard-mesh-mvp) up between them (`wg show` shows a
+  handshake), and the [Pod network path](#micro-vm-network-attach-mvp) enabled on
+  both (`podNetwork.enabled: true`).
+
+### 1. Deploy Pods on both Macs
+
+Schedule one replica to each node (the example pins by hostname; adjust to your
+node names). MacVz Pods must tolerate the provider taint.
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: hello }
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: hello } }
+  template:
+    metadata: { labels: { app: hello } }
+    spec:
+      tolerations:
+        - key: virtual-kubelet.io/provider
+          operator: Exists
+          effect: NoSchedule
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector: { matchLabels: { app: hello } }
+      containers:
+        - name: hello
+          image: <arm64 http server image>
+          ports: [{ containerPort: 8080 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: hello }
+spec:
+  selector: { app: hello }
+  ports: [{ port: 80, targetPort: 8080 }]
+```
+
+### 2. Verify Pod IPs and endpoints
+
+```sh
+# (#20/#23) Pods show MacVz-assigned Pod IPs from each node's CIDR, on both Macs:
+kubectl get pods -l app=hello -o wide
+
+# (#23) The Service has an EndpointSlice listing both ready Pod IPs:
+kubectl get endpointslices -l kubernetes.io/service-name=hello -o wide
+```
+
+Expect two `Ready` endpoints, one Pod IP from each node's Pod CIDR.
+
+### 3. Reach the Service across the mesh
+
+```sh
+# From a client Pod (on either Mac), the Service resolves and load-balances to
+# both backends — including the one hosted on the *other* Mac (traffic crosses
+# the WireGuard tunnel, #21/#22):
+kubectl run client --rm -it --restart=Never \
+  --overrides='{"spec":{"tolerations":[{"key":"virtual-kubelet.io/provider","operator":"Exists"}]}}' \
+  --image=<arm64 curl image> -- sh -c 'for i in $(seq 10); do curl -s hello; done'
+```
+
+Hitting the Service repeatedly should reach Pods on both Macs.
+
+### Troubleshooting
+
+- **An endpoint is missing / `NotReady`** — check the Pod's conditions
+  (`kubectl describe pod`): `PodNetworkNotReady` means no Pod IP yet (IPAM/
+  network attach), `RuntimeStatusError` means the runtime probe failed.
+- **Endpoint present but unreachable cross-host** — this is a data-path issue,
+  not status: verify the [mesh](#wireguard-mesh-mvp) tunnel and the
+  [network attach](#micro-vm-network-attach-mvp) failure modes.

@@ -33,6 +33,10 @@ type recordingRuntime struct {
 
 	pullErr, createErr, startErr, stopErr, destroyErr, statusErr error
 
+	// runningIP, when set, is reported as the workload's host-only address once
+	// it is started, so tests can exercise the Pod network attach path.
+	runningIP string
+
 	// log/exec behavior
 	logData     string
 	lastLogOpts runtime.LogOptions
@@ -78,7 +82,7 @@ func (r *recordingRuntime) Start(_ context.Context, id string) error {
 		return r.startErr
 	}
 	r.startedIDs = append(r.startedIDs, id)
-	r.statuses[id] = runtime.Status{ID: id, Phase: runtime.PhaseRunning, StartedAt: time.Now()}
+	r.statuses[id] = runtime.Status{ID: id, Phase: runtime.PhaseRunning, StartedAt: time.Now(), IP: r.runningIP}
 	return nil
 }
 
@@ -221,6 +225,32 @@ func TestCreatePodIdempotent(t *testing.T) {
 	_, creates, _, _, _ := rt.counts()
 	if creates != 1 {
 		t.Errorf("duplicate CreatePod created %d workloads, want 1", creates)
+	}
+}
+
+func TestCreatePodConcurrentIdempotent(t *testing.T) {
+	p, rt := newTestProvider()
+	ctx := context.Background()
+	const attempts = 10
+	errs := make(chan error, attempts)
+	var wg sync.WaitGroup
+	for i := 0; i < attempts; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- p.CreatePod(ctx, testPod("web"))
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("CreatePod: %v", err)
+		}
+	}
+	_, creates, _, _, _ := rt.counts()
+	if creates != 1 {
+		t.Errorf("concurrent CreatePod created %d workloads, want 1", creates)
 	}
 }
 

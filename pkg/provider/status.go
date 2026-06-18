@@ -61,9 +61,30 @@ func (p *Provider) reconcileStatus(ctx context.Context, st *podState) corev1.Pod
 
 	status.ContainerStatuses = statuses
 	status.Phase = aggregatePhase(statuses)
-	status.Conditions = podConditions(status.Phase)
-	if status.Message != "" {
-		status.Conditions = podConditionsWithRuntimeError(status.Conditions, status.Message)
+
+	// Publish the Pod's address in both the singular and plural fields. The
+	// EndpointSlice controller reads PodIPs, so populating it is what makes a
+	// MacVz-backed Pod show up as a usable Service endpoint.
+	if status.PodIP != "" {
+		status.PodIPs = []corev1.PodIP{{IP: status.PodIP}}
+	}
+	// HostIP lets `kubectl get pod -o wide` and topology-aware routing resolve the
+	// node hosting the Pod.
+	if p.hostIP != "" {
+		status.HostIP = p.hostIP
+		status.HostIPs = []corev1.HostIP{{IP: p.hostIP}}
+	}
+
+	// Readiness drives EndpointSlice membership: a Pod is Ready only when it is
+	// running AND has an address, so endpoints never point at an unreachable Pod.
+	ready := status.Phase == corev1.PodRunning && status.PodIP != ""
+	status.Conditions = podConditions(status.Phase, ready)
+	switch {
+	case status.Message != "":
+		status.Conditions = withConditionReason(status.Conditions, "RuntimeStatusError", status.Message)
+	case status.Phase == corev1.PodRunning && status.PodIP == "":
+		status.Conditions = withConditionReason(status.Conditions, "PodNetworkNotReady",
+			"waiting for Pod IP allocation and network attach")
 	}
 	return status
 }
@@ -171,9 +192,10 @@ func aggregatePhase(statuses []corev1.ContainerStatus) corev1.PodPhase {
 	}
 }
 
-// podConditions returns the standard Pod conditions for a phase.
-func podConditions(phase corev1.PodPhase) []corev1.PodCondition {
-	ready := phase == corev1.PodRunning
+// podConditions returns the standard Pod conditions for a phase. Readiness is
+// passed in explicitly because a Pod is only Ready when it is both running and
+// addressable (see reconcileStatus), not merely running.
+func podConditions(phase corev1.PodPhase, ready bool) []corev1.PodCondition {
 	cond := func(t corev1.PodConditionType, status bool) corev1.PodCondition {
 		s := corev1.ConditionFalse
 		if status {
@@ -182,7 +204,7 @@ func podConditions(phase corev1.PodPhase) []corev1.PodCondition {
 		return corev1.PodCondition{Type: t, Status: s}
 	}
 	// Initialized stays true once the Pod has been started; ContainersReady and
-	// Ready track the running state.
+	// Ready track the live ready state.
 	initialized := phase != corev1.PodPending
 	return []corev1.PodCondition{
 		cond(corev1.PodInitialized, initialized),
@@ -191,12 +213,15 @@ func podConditions(phase corev1.PodPhase) []corev1.PodCondition {
 	}
 }
 
-func podConditionsWithRuntimeError(conditions []corev1.PodCondition, msg string) []corev1.PodCondition {
+// withConditionReason forces the readiness conditions False and annotates them
+// with a reason/message, used when a running Pod is not yet a valid endpoint
+// (transient runtime error, or no Pod IP yet).
+func withConditionReason(conditions []corev1.PodCondition, reason, msg string) []corev1.PodCondition {
 	out := append([]corev1.PodCondition(nil), conditions...)
 	for i := range out {
 		if out[i].Type == corev1.PodReady || out[i].Type == corev1.ContainersReady {
 			out[i].Status = corev1.ConditionFalse
-			out[i].Reason = "RuntimeStatusError"
+			out[i].Reason = reason
 			out[i].Message = msg
 		}
 	}

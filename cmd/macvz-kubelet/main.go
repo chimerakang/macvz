@@ -102,9 +102,14 @@ func run(ctx context.Context, configPath, runtimeBinary string) error {
 		return fmt.Errorf("build kubernetes client: %w", err)
 	}
 
-	// Construct the provider over the runtime driver. Pod lifecycle methods are
-	// stubbed until #16; this issue only wires the node controller loop.
-	p := provider.New(cfg.NodeName, driver)
+	internalIP := cfg.Node.InternalIP
+	if internalIP == "" {
+		internalIP = detectInternalIP()
+	}
+
+	// Construct the provider over the runtime driver. The node's reachable
+	// address is reported as each Pod's HostIP so Services/`-o wide` resolve it.
+	p := provider.New(cfg.NodeName, driver, provider.WithHostIP(internalIP))
 
 	// Resolve the configured node shape (capacity/taints validated at load).
 	capacity, err := cfg.Capacity()
@@ -114,10 +119,6 @@ func run(ctx context.Context, configPath, runtimeBinary string) error {
 	taints, err := cfg.Taints()
 	if err != nil {
 		return fmt.Errorf("node taints: %w", err)
-	}
-	internalIP := cfg.Node.InternalIP
-	if internalIP == "" {
-		internalIP = detectInternalIP()
 	}
 	nodeSpec := provider.NodeSpec{
 		KubeletVersion: version.Version,
@@ -196,6 +197,28 @@ func run(ctx context.Context, configPath, runtimeBinary string) error {
 		klog.InfoS("shutdown requested before node became ready")
 		return nil
 	}
+
+	// Enable coordinated Pod IPAM now that Kubernetes has assigned this node a
+	// Pod CIDR, recovering any existing allocations before Pods are reconciled.
+	if err := setupIPAM(ctx, cfg, clientset, p); err != nil {
+		return fmt.Errorf("setup pod IPAM: %w", err)
+	}
+
+	// Bring up the cross-host WireGuard mesh (if enabled) so remote Pod CIDRs are
+	// routed through encrypted tunnels before Pods start landing on this node.
+	stopMesh, err := setupMesh(ctx, cfg)
+	if err != nil {
+		return fmt.Errorf("setup mesh: %w", err)
+	}
+	defer stopMesh()
+
+	// Start the host Pod network path so each micro-VM is reachable at its Pod IP
+	// across the mesh, and attach it to the provider before Pods are reconciled.
+	stopPodNet, err := setupPodNetwork(ctx, cfg, p)
+	if err != nil {
+		return fmt.Errorf("setup pod network: %w", err)
+	}
+	defer stopPodNet()
 
 	// Start the Pod lifecycle controller so scheduled Pods become micro-VMs.
 	stopPods, err := startPodController(ctx, cfg, clientset, p, runtime.NumCPU())

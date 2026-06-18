@@ -35,6 +35,11 @@ node:
   # Node InternalIP. Leave empty to auto-detect the host's primary outbound IPv4.
   internalIP: ""
 
+  # Pod CIDR override for coordinated Pod IPAM. Leave empty to use the
+  # Kubernetes-assigned Node.Spec.PodCIDR. Only set this on clusters that do not
+  # allocate node CIDRs automatically, and give every MacVz node a disjoint CIDR.
+  podCIDR: ""
+
   # Extra labels/annotations merged onto the node (override built-ins on clash).
   labels: {}
   annotations: {}
@@ -61,3 +66,28 @@ node:
   kubeletPort: 10250
   servingTLSCertFile: ""     # e.g. /etc/macvz/pki/kubelet.crt
   servingTLSKeyFile: ""      # e.g. /etc/macvz/pki/kubelet.key
+
+# Cross-host WireGuard mesh. Disabled by default; see docs/NETWORKING.md for a
+# complete two-node setup and pf anchor requirements.
+mesh:
+  enabled: false
+  interface: utun7
+  privateKeyFile: /etc/macvz/wireguard.key
+  address: 10.99.0.1/32
+  listenPort: 51820
+  mtu: 0
+  peers:
+    - name: mac-mini-02
+      publicKey: ""
+      endpoint: 192.168.1.20:51820
+      podCIDR: 10.244.2.0/24
+      address: 10.99.0.2/32
+      persistentKeepalive: 25
+
+# Host Pod network path. Disabled by default; enable with mesh once the
+# apple/container vmnet interface is known on the host.
+podNetwork:
+  enabled: false
+  interface: bridge100
+  anchor: macvz/pods
+  enableForwarding: true

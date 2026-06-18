@@ -23,6 +23,11 @@ go.work.sum
 *.pem
 *.key
 
+# Claude Code (local dev guide / memory — not published)
+CLAUDE.md
+CLAUDE.local.md
+.claude/
+
 # Editor / OS
 .DS_Store
 .idea/

@@ -47,9 +47,18 @@ fmt: ## Format all Go source
 tidy: ## Tidy module dependencies
 	go mod tidy
 
+.PHONY: release
+release: ## Build, sign, and package a darwin/arm64 release into dist/ (see docs/RELEASE.md)
+	VERSION=$(VERSION) COMMIT=$(COMMIT) DATE=$(DATE) ./scripts/macos-release.sh
+
+.PHONY: sign
+sign: build ## Ad-hoc codesign bin/$(BINARY) for local development
+	codesign --force --sign - $(BIN_DIR)/$(BINARY)
+	codesign --verify --strict --verbose=2 $(BIN_DIR)/$(BINARY)
+
 .PHONY: clean
 clean: ## Remove build artifacts
-	rm -rf $(BIN_DIR)
+	rm -rf $(BIN_DIR) dist
 
 .PHONY: help
 help: ## Show this help

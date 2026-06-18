@@ -1,0 +1,30 @@
+# Binaries
+/bin/
+/dist/
+macvz-kubelet
+*.exe
+*.test
+*.out
+
+# Go
+vendor/
+*.prof
+go.work
+go.work.sum
+
+# Build / VM artifacts
+*.img
+*.raw
+*.qcow2
+*.log
+
+# Env & secrets
+.env
+*.pem
+*.key
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp

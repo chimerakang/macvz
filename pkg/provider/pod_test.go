@@ -137,14 +137,14 @@ func newTestProvider() (*Provider, *recordingRuntime) {
 	return New("mac-01", rt), rt
 }
 
-func TestCreatePodLaunchesEachContainer(t *testing.T) {
+func TestCreatePodLaunchesContainer(t *testing.T) {
 	p, rt := newTestProvider()
-	if err := p.CreatePod(context.Background(), testPod("web", "side")); err != nil {
+	if err := p.CreatePod(context.Background(), testPod("web")); err != nil {
 		t.Fatalf("CreatePod: %v", err)
 	}
 	pulls, creates, starts, _, _ := rt.counts()
-	if pulls != 2 || creates != 2 || starts != 2 {
-		t.Errorf("pulls=%d creates=%d starts=%d, want 2/2/2", pulls, creates, starts)
+	if pulls != 1 || creates != 1 || starts != 1 {
+		t.Errorf("pulls=%d creates=%d starts=%d, want 1/1/1", pulls, creates, starts)
 	}
 	got, err := p.GetPod(context.Background(), "default", "p1")
 	if err != nil {
@@ -153,8 +153,30 @@ func TestCreatePodLaunchesEachContainer(t *testing.T) {
 	if got.Status.Phase != corev1.PodRunning {
 		t.Errorf("phase = %q, want Running", got.Status.Phase)
 	}
-	if len(got.Status.ContainerStatuses) != 2 {
-		t.Errorf("container statuses = %d, want 2", len(got.Status.ContainerStatuses))
+	if len(got.Status.ContainerStatuses) != 1 {
+		t.Errorf("container statuses = %d, want 1", len(got.Status.ContainerStatuses))
+	}
+}
+
+func TestCreatePodMarksUnsupportedShapeFailed(t *testing.T) {
+	p, rt := newTestProvider()
+	// A multi-container Pod is unsupported in the MVP.
+	if err := p.CreatePod(context.Background(), testPod("web", "side")); err != nil {
+		t.Fatalf("CreatePod should record a terminal failure, not return an error: %v", err)
+	}
+	pulls, creates, _, _, _ := rt.counts()
+	if pulls != 0 || creates != 0 {
+		t.Errorf("unsupported Pod should not touch the runtime, got pulls=%d creates=%d", pulls, creates)
+	}
+	st, err := p.GetPodStatus(context.Background(), "default", "p1")
+	if err != nil {
+		t.Fatalf("GetPodStatus: %v", err)
+	}
+	if st.Phase != corev1.PodFailed {
+		t.Errorf("phase = %q, want Failed", st.Phase)
+	}
+	if st.Reason != "UnsupportedPodSpec" || st.Message == "" {
+		t.Errorf("expected a clear UnsupportedPodSpec reason/message, got reason=%q msg=%q", st.Reason, st.Message)
 	}
 }
 

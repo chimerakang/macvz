@@ -35,6 +35,11 @@ type podState struct {
 	pod *corev1.Pod
 	// workloads maps each container to its runtime workload ID, in spec order.
 	workloads []workload
+	// terminalStatus, when set, is a sticky status that overrides live
+	// reconciliation. It is used for Pods that can never run on this node (an
+	// unsupported spec, or an image with no arm64 variant), so they surface a
+	// clear, stable Failed status instead of being re-derived as Pending.
+	terminalStatus *corev1.PodStatus
 }
 
 // workload binds a Pod container to a runtime workload ID.

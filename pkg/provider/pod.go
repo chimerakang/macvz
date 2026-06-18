@@ -29,33 +29,69 @@ func (p *Provider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 		return nil
 	}
 
+	// Translate the Pod into a single workload spec. An unsupported shape is
+	// terminal: record a clear Failed status instead of retrying forever.
+	spec, err := translatePod(pod)
+	if err != nil {
+		return p.markTerminalFailure(key, pod, "UnsupportedPodSpec", err)
+	}
+	c := pod.Spec.Containers[0]
+
 	st := &podState{pod: pod.DeepCopy()}
 	now := metav1.Now()
 	st.pod.Status.StartTime = &now
 
-	for _, c := range pod.Spec.Containers {
-		spec := translateContainer(pod, c)
-		if err := p.rt.Pull(ctx, spec.Image); err != nil {
-			p.rollback(ctx, st)
-			return fmt.Errorf("pull image %q for container %q: %w", spec.Image, c.Name, err)
+	if err := p.rt.Pull(ctx, spec.Image); err != nil {
+		// An image with no arm64 variant can never run here (P1 surfaces this
+		// signal); make it a terminal Failed status. Other pull errors (e.g.
+		// runtime not ready) are transient and worth retrying.
+		if errors.Is(err, runtime.ErrIncompatibleArch) {
+			return p.markTerminalFailure(key, pod, "ImageArchitectureMismatch",
+				fmt.Errorf("pull image %q for container %q: %w", spec.Image, c.Name, err))
 		}
-		id, err := p.rt.Create(ctx, spec)
-		if err != nil {
-			p.rollback(ctx, st)
-			return fmt.Errorf("create container %q: %w", c.Name, err)
-		}
-		st.workloads = append(st.workloads, workload{container: c.Name, id: id})
-		if err := p.rt.Start(ctx, id); err != nil {
-			p.rollback(ctx, st)
-			return fmt.Errorf("start container %q: %w", c.Name, err)
-		}
+		return fmt.Errorf("pull image %q for container %q: %w", spec.Image, c.Name, err)
+	}
+	id, err := p.rt.Create(ctx, spec)
+	if err != nil {
+		p.rollback(ctx, st)
+		return fmt.Errorf("create container %q: %w", c.Name, err)
+	}
+	st.workloads = append(st.workloads, workload{container: c.Name, id: id})
+	if err := p.rt.Start(ctx, id); err != nil {
+		p.rollback(ctx, st)
+		return fmt.Errorf("start container %q: %w", c.Name, err)
 	}
 
 	st.pod.Status = p.reconcileStatus(ctx, st)
 	p.mu.Lock()
 	p.pods[key] = st
 	p.mu.Unlock()
-	klog.InfoS("created Pod", "pod", key, "containers", len(st.workloads))
+	klog.InfoS("created Pod", "pod", key, "workloadID", spec.Name)
+	return nil
+}
+
+// markTerminalFailure records a sticky Failed status for a Pod that can never
+// run on this node, then returns nil so Virtual Kubelet stops retrying and
+// surfaces the status/message to Kubernetes (no silent partial behavior).
+func (p *Provider) markTerminalFailure(key string, pod *corev1.Pod, reason string, cause error) error {
+	now := metav1.Now()
+	status := corev1.PodStatus{
+		Phase:     corev1.PodFailed,
+		Reason:    reason,
+		Message:   cause.Error(),
+		StartTime: &now,
+		Conditions: []corev1.PodCondition{
+			{Type: corev1.PodInitialized, Status: corev1.ConditionFalse, Reason: reason},
+			{Type: corev1.PodReady, Status: corev1.ConditionFalse, Reason: reason},
+			{Type: corev1.ContainersReady, Status: corev1.ConditionFalse, Reason: reason},
+		},
+	}
+	st := &podState{pod: pod.DeepCopy(), terminalStatus: &status}
+	st.pod.Status = status
+	p.mu.Lock()
+	p.pods[key] = st
+	p.mu.Unlock()
+	klog.ErrorS(cause, "Pod cannot run on this node", "pod", key, "reason", reason)
 	return nil
 }
 

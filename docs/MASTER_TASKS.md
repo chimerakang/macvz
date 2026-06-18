@@ -41,7 +41,7 @@ Source of truth for the phased roadmap. Phases map to GitHub **Milestones**; tas
 | #14 | Register virtual node with capacity, addresses, taints, and conditions | P2 | in progress |
 | #15 | Implement node heartbeat and lease updates | P2 | in progress |
 | #16 | Implement Provider PodLifecycleHandler state and CRUD methods | P2 | in progress |
-| #17 | Translate Kubernetes Pod specs into runtime workload specs | P2 | open |
+| #17 | Translate Kubernetes Pod specs into runtime workload specs | P2 | in progress |
 | #18 | Wire kubectl logs and exec through the runtime | P2 | open |
 | #19 | Add RBAC, manifests, and P2 MVP smoke test docs | P2 | open |
 | #20 | Implement Kubernetes-coordinated Pod IPAM | P3 | open |

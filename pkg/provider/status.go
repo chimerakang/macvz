@@ -13,6 +13,11 @@ import (
 // preserves the original StartTime and PodIP, queries each backing workload,
 // maps runtime phases to container statuses, and aggregates the Pod phase.
 func (p *Provider) reconcileStatus(ctx context.Context, st *podState) corev1.PodStatus {
+	// A Pod that can never run keeps its sticky Failed status.
+	if st.terminalStatus != nil {
+		return *st.terminalStatus
+	}
+
 	status := corev1.PodStatus{
 		StartTime: st.pod.Status.StartTime,
 		PodIP:     st.pod.Status.PodIP,

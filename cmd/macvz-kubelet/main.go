@@ -235,7 +235,7 @@ func run(ctx context.Context, configPath, runtimeBinary string) error {
 	defer stopPods()
 
 	// Start the kubelet API server for kubectl logs/exec (no-op without certs).
-	stopServer, err := startKubeletServer(ctx, cfg, p)
+	stopServer, err := startKubeletServer(ctx, cfg, p, internalIP)
 	if err != nil {
 		return fmt.Errorf("start kubelet server: %w", err)
 	}

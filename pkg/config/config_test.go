@@ -78,6 +78,21 @@ func TestValidateVolumes(t *testing.T) {
 	}
 }
 
+func TestValidateServingClientCARequiresServingTLS(t *testing.T) {
+	c := Default()
+	c.Node.ServingClientCAFile = "/etc/macvz/client-ca.pem"
+	// No serving cert/key set: client auth has no endpoint to guard.
+	if err := c.Validate(); err == nil {
+		t.Error("servingClientCAFile without servingTLSCertFile/KeyFile should fail validation")
+	}
+
+	c.Node.ServingTLSCertFile = "/etc/macvz/tls.crt"
+	c.Node.ServingTLSKeyFile = "/etc/macvz/tls.key"
+	if err := c.Validate(); err != nil {
+		t.Errorf("servingClientCAFile with serving TLS should validate: %v", err)
+	}
+}
+
 func TestRosettaDefaultsOff(t *testing.T) {
 	if Default().RuntimeRosetta {
 		t.Error("Rosetta must be disabled by default (amd64 images rejected unless opted in)")

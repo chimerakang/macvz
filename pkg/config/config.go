@@ -126,6 +126,14 @@ type NodeConfig struct {
 	ServingTLSCertFile string `yaml:"servingTLSCertFile"`
 	ServingTLSKeyFile  string `yaml:"servingTLSKeyFile"`
 
+	// ServingClientCAFile, when set, makes the kubelet HTTPS server require and
+	// verify a client certificate signed by this CA (mutual TLS) for every
+	// logs/exec/portforward/stats request (#28). Point it at the cluster's API
+	// server client CA so only the API server can reach these endpoints. When
+	// empty, the endpoint is unauthenticated and must be restricted by network
+	// (bind address + firewall); macvz-kubelet logs a warning in that case.
+	ServingClientCAFile string `yaml:"servingClientCAFile"`
+
 	// Volumes configures Pod volume support (#26).
 	Volumes VolumesConfig `yaml:"volumes"`
 }
@@ -338,6 +346,9 @@ func (c Config) Validate() error {
 	}
 	if (c.Node.ServingTLSCertFile == "") != (c.Node.ServingTLSKeyFile == "") {
 		return fmt.Errorf("node.servingTLSCertFile and node.servingTLSKeyFile must be set together")
+	}
+	if c.Node.ServingClientCAFile != "" && c.Node.ServingTLSCertFile == "" {
+		return fmt.Errorf("node.servingClientCAFile requires node.servingTLSCertFile/servingTLSKeyFile (client auth needs the serving TLS endpoint)")
 	}
 	if c.Node.PodCIDR != "" {
 		if _, _, err := net.ParseCIDR(c.Node.PodCIDR); err != nil {

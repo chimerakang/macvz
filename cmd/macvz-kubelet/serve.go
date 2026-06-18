@@ -3,8 +3,11 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"fmt"
+	"net"
 	"net/http"
+	"os"
 	"path"
 	"time"
 
@@ -209,11 +212,43 @@ func setupPodNetwork(ctx context.Context, cfg config.Config, p *provider.Provide
 	}, nil
 }
 
+// buildServingTLSConfig assembles the TLS config for the kubelet HTTPS server.
+// When clientCAFile is set, the server requires and verifies a client
+// certificate signed by that CA (mutual TLS), so only holders of an
+// API-server-issued client cert can reach logs/exec/portforward/stats.
+// Otherwise it accepts any TLS client and relies on network restriction.
+func buildServingTLSConfig(cert tls.Certificate, clientCAFile string) (*tls.Config, error) {
+	cfg := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
+	}
+	if clientCAFile == "" {
+		return cfg, nil
+	}
+	pem, err := os.ReadFile(clientCAFile)
+	if err != nil {
+		return nil, fmt.Errorf("read kubelet client CA %q: %w", clientCAFile, err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pem) {
+		return nil, fmt.Errorf("kubelet client CA %q contains no usable certificates", clientCAFile)
+	}
+	cfg.ClientCAs = pool
+	cfg.ClientAuth = tls.RequireAndVerifyClientCert
+	return cfg, nil
+}
+
 // startKubeletServer starts the HTTPS kubelet API used by `kubectl logs`/`exec`,
 // routing to the provider. It is a no-op (returning a no-op cleanup) when no
 // serving certificate is configured, mirroring upstream Virtual Kubelet: Pods
 // still run, but logs/exec are unavailable until certs are provided.
-func startKubeletServer(ctx context.Context, cfg config.Config, p *provider.Provider) (func(), error) {
+//
+// The endpoint exposes logs/exec/portforward/stats, so it is hardened (#28):
+// when a client CA is configured it requires mutual TLS (only the API server
+// can reach it); it binds to the node's reachable address rather than all
+// interfaces when listenIP is known; and it warns loudly when left
+// unauthenticated so that exposure is a deliberate, network-restricted choice.
+func startKubeletServer(ctx context.Context, cfg config.Config, p *provider.Provider, listenIP string) (func(), error) {
 	if cfg.Node.ServingTLSCertFile == "" || cfg.Node.ServingTLSKeyFile == "" {
 		klog.InfoS("kubelet TLS serving disabled (no servingTLSCertFile/KeyFile); kubectl logs/exec will be unavailable")
 		return func() {}, nil
@@ -222,6 +257,16 @@ func startKubeletServer(ctx context.Context, cfg config.Config, p *provider.Prov
 	cert, err := tls.LoadX509KeyPair(cfg.Node.ServingTLSCertFile, cfg.Node.ServingTLSKeyFile)
 	if err != nil {
 		return nil, fmt.Errorf("load serving TLS keypair: %w", err)
+	}
+
+	tlsCfg, err := buildServingTLSConfig(cert, cfg.Node.ServingClientCAFile)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.Node.ServingClientCAFile == "" {
+		klog.InfoS("WARNING: kubelet endpoint has no client authentication (node.servingClientCAFile unset); " +
+			"logs/exec/portforward/stats are reachable by anyone who can connect. Restrict it by network (bind address + firewall) " +
+			"or set servingClientCAFile to require API-server mutual TLS.")
 	}
 
 	handler := vkapi.PodHandler(vkapi.PodHandlerConfig{
@@ -234,11 +279,16 @@ func startKubeletServer(ctx context.Context, cfg config.Config, p *provider.Prov
 		GetMetricsResource:    p.MetricsResource,
 	}, false)
 
-	addr := fmt.Sprintf(":%d", cfg.Node.KubeletPort)
-	listener, err := tls.Listen("tcp", addr, &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS12,
-	})
+	// Bind to the node's reachable address when known, rather than all
+	// interfaces, to minimize the endpoint's exposure.
+	port := fmt.Sprintf("%d", cfg.Node.KubeletPort)
+	addr := net.JoinHostPort("", port)
+	if listenIP != "" {
+		addr = net.JoinHostPort(listenIP, port)
+	} else {
+		klog.InfoS("kubelet endpoint binding to all interfaces (no internal IP resolved); consider setting node.internalIP", "port", port)
+	}
+	listener, err := tls.Listen("tcp", addr, tlsCfg)
 	if err != nil {
 		return nil, fmt.Errorf("listen on %s: %w", addr, err)
 	}
@@ -249,7 +299,7 @@ func startKubeletServer(ctx context.Context, cfg config.Config, p *provider.Prov
 			klog.ErrorS(err, "kubelet API server stopped unexpectedly")
 		}
 	}()
-	klog.InfoS("kubelet API server listening", "addr", addr)
+	klog.InfoS("kubelet API server listening", "addr", addr, "clientAuth", cfg.Node.ServingClientCAFile != "")
 
 	return func() {
 		_ = srv.Close()

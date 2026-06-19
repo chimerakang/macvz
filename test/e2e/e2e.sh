@@ -226,8 +226,8 @@ spec:
       image: $IMAGE
       command: ["sh", "-c", "$cmd"]
       resources:
-        requests: { cpu: "250m", memory: 64Mi }
-        limits:   { cpu: "500m", memory: 128Mi }
+        requests: { cpu: "250m", memory: 256Mi }
+        limits:   { cpu: "500m", memory: 256Mi }
 EOF
 }
 
@@ -250,8 +250,8 @@ spec:
       command: ["sh", "-c", "mkdir -p /w && echo $marker > /w/index.html && httpd -f -p 8080 -h /w"]
       ports: [ { containerPort: 8080 } ]
       resources:
-        requests: { cpu: "250m", memory: 64Mi }
-        limits:   { cpu: "500m", memory: 128Mi }
+        requests: { cpu: "250m", memory: 256Mi }
+        limits:   { cpu: "500m", memory: 256Mi }
 EOF
 }
 

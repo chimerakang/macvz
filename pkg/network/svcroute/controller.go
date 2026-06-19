@@ -171,12 +171,12 @@ func New(router Router, factory informers.SharedInformerFactory) *Controller {
 		sliceInformer.Informer().HasSynced,
 	)
 
-	svcInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+	_, _ = svcInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    func(obj any) { c.enqueueService(obj) },
 		UpdateFunc: func(_, obj any) { c.enqueueService(obj) },
 		DeleteFunc: func(obj any) { c.enqueueService(obj) },
 	})
-	sliceInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+	_, _ = sliceInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    func(obj any) { c.enqueueSlice(obj) },
 		UpdateFunc: func(_, obj any) { c.enqueueSlice(obj) },
 		DeleteFunc: func(obj any) { c.enqueueSlice(obj) },

@@ -241,13 +241,21 @@ MacVz logic bug**:
    API is remote. Bringing the data plane up *before* node registration helps but
    is not sufficient; the kubelet's API transport should tolerate a transient
    routing change after mesh up (e.g. force-reconnect / health-check the API
-   client when the data plane comes up).
+   client when the data plane comes up). **Addressed after this run:**
+   `macvz-kubelet` now resolves the REST config early but constructs the
+   clientset only after mesh and podNetwork setup, then probes the API server
+   before starting Virtual Kubelet controllers.
 3. **`wireguard-go` interfaces cannot be torn down with `ifconfig <if> destroy`**
    (`SIOCIFDESTROY: Invalid argument`); `Mesh.Down` must kill the `wireguard-go`
-   process to remove the interface.
+   process to remove the interface. **Addressed after this run:** `Mesh.Down`
+   now stops the matching `wireguard-go <iface>` process before the best-effort
+   destroy step, and helper policy only permits the exact managed-interface
+   `pkill -f` pattern.
 4. **Restart port-bind race**: a fast kubelet restart can hit
    `bind: 10250: address already in use` if the prior process has not fully
-   exited; restart tooling must wait for the port to free.
+   exited; restart tooling must wait for the port to free. **Addressed after
+   this run:** kubelet HTTPS startup now retries `EADDRINUSE` for a bounded
+   window before failing, covering fast restarts while the old listener closes.
 
 ### Net assessment
 

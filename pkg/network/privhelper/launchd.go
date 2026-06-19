@@ -361,7 +361,7 @@ func copyExecutable(src, dst string) error {
 	if err != nil {
 		return fmt.Errorf("open source binary %q: %w", absSrc, err)
 	}
-	defer in.Close()
+	defer func() { _ = in.Close() }()
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return fmt.Errorf("create bin dir: %w", err)
 	}
@@ -371,9 +371,9 @@ func copyExecutable(src, dst string) error {
 		return fmt.Errorf("create temp binary: %w", err)
 	}
 	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
+	defer func() { _ = os.Remove(tmpName) }()
 	if _, err := io.Copy(tmp, in); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return fmt.Errorf("copy binary: %w", err)
 	}
 	if err := tmp.Close(); err != nil {

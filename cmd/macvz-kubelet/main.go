@@ -94,14 +94,12 @@ func run(ctx context.Context, configPath, runtimeBinary string) error {
 		klog.InfoS("apple/container runtime is ready")
 	}
 
-	// Build the Kubernetes client from kubeconfig / in-cluster config.
+	// Resolve Kubernetes client config now, but delay constructing the clientset
+	// until after the data plane has mutated host routes. That avoids carrying a
+	// client-go transport across WireGuard/vmnet route changes on remote-API nodes.
 	restCfg, err := cfg.RestConfig()
 	if err != nil {
 		return fmt.Errorf("kubernetes client config: %w", err)
-	}
-	clientset, err := kubernetes.NewForConfig(restCfg)
-	if err != nil {
-		return fmt.Errorf("build kubernetes client: %w", err)
 	}
 
 	internalIP := cfg.Node.InternalIP
@@ -176,13 +174,6 @@ func run(ctx context.Context, configPath, runtimeBinary string) error {
 		vknode.WithNodeStatusUpdateInterval(statusInterval),
 		vknode.WithNodeStatusUpdateErrorHandler(statusErrHandler),
 	}
-	if cfg.Node.EnableLease {
-		// The Lease in kube-node-lease is the modern node heartbeat; Kubernetes
-		// marks the node NotReady if it is not renewed within the lease duration.
-		leaseClient := clientset.CoordinationV1().Leases(corev1.NamespaceNodeLease)
-		opts = append(opts, vknode.WithNodeEnableLeaseV1(leaseClient, cfg.Node.LeaseDurationSeconds))
-	}
-
 	// Bring the host data plane up BEFORE the node controller connects to the API
 	// server. The mesh/route changes perturb host routing, and doing them after the
 	// long-lived API (HTTP/2) connection is established severs it on a node whose
@@ -219,6 +210,21 @@ func run(ctx context.Context, configPath, runtimeBinary string) error {
 		return fmt.Errorf("setup pod network: %w", err)
 	}
 	defer stopPodNet()
+
+	clientset, err := kubernetes.NewForConfig(restCfg)
+	if err != nil {
+		return fmt.Errorf("build kubernetes client after data-plane setup: %w", err)
+	}
+	if err := waitForAPIServer(ctx, clientset); err != nil {
+		return fmt.Errorf("kubernetes API not reachable after data-plane setup: %w", err)
+	}
+
+	if cfg.Node.EnableLease {
+		// The Lease in kube-node-lease is the modern node heartbeat; Kubernetes
+		// marks the node NotReady if it is not renewed within the lease duration.
+		leaseClient := clientset.CoordinationV1().Leases(corev1.NamespaceNodeLease)
+		opts = append(opts, vknode.WithNodeEnableLeaseV1(leaseClient, cfg.Node.LeaseDurationSeconds))
+	}
 
 	nc, err := vknode.NewNodeController(
 		nodeProvider,

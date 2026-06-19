@@ -180,7 +180,9 @@ func TestRenderServiceRulesDeterministic(t *testing.T) {
 		"default/b": {{ServiceKey: "default/b", ClusterIP: "10.96.0.2", Protocol: "tcp", Port: 80, TargetPort: 8080, Backends: []string{"10.244.1.3"}}},
 	}
 	vmip := map[string]string{}
-	if renderServiceRules("bridge100", services, vmip) != renderServiceRules("bridge100", services, vmip) {
+	first := renderServiceRules("bridge100", services, vmip)
+	second := renderServiceRules("bridge100", services, vmip)
+	if first != second {
 		t.Error("renderServiceRules is not deterministic")
 	}
 }

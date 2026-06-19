@@ -1,7 +1,7 @@
 // Command macvz-netd is the MacVz privileged network helper daemon (#38, #40).
 //
 // It runs as root and executes a fixed allowlist of network commands (pfctl,
-// sysctl, route, ifconfig, wg, wireguard-go) on behalf of the user-run
+// sysctl, route, ifconfig, wg, wireguard-go, pkill) on behalf of the user-run
 // macvz-kubelet, which connects over a unix socket. This keeps the kubelet
 // itself running as the operator's user — required because apple/container is a
 // per-user service and refuses to run as root — while confining root to exactly
@@ -184,7 +184,7 @@ func runServe(args []string) error {
 	if err := srv.Listen(uid, gid); err != nil {
 		return fmt.Errorf("create helper socket %q: %w", f.socket, err)
 	}
-	defer srv.Close()
+	defer func() { _ = srv.Close() }()
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

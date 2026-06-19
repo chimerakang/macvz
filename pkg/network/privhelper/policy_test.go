@@ -67,6 +67,7 @@ func TestPolicyAllowsConfiguredCommands(t *testing.T) {
 		{"wg", "setconf managed iface", Request{Name: "wg", Args: []string{"setconf", "utun7", "/dev/stdin"}, Stdin: validWGConfig}},
 		{"wg", "syncconf managed iface", Request{Name: "wg", Args: []string{"syncconf", "utun7", "/dev/stdin"}, Stdin: validWGConfig}},
 		{"wireguard-go", "create managed iface", Request{Name: "wireguard-go", Args: []string{"utun7"}}},
+		{"pkill", "stop managed wireguard-go", Request{Name: "pkill", Args: []string{"-f", "wireguard-go utun7"}}},
 	}
 	for _, tc := range allowed {
 		if err := p.Validate(tc.req); err != nil {
@@ -118,6 +119,11 @@ func TestPolicyRefusesOutOfScopeCommands(t *testing.T) {
 
 		// wireguard-go: only the managed interface.
 		{"wireguard-go foreign iface", Request{Name: "wireguard-go", Args: []string{"en0"}}},
+
+		// pkill: only the managed wireguard-go process pattern.
+		{"pkill foreign wireguard-go iface", Request{Name: "pkill", Args: []string{"-f", "wireguard-go en0"}}},
+		{"pkill arbitrary process", Request{Name: "pkill", Args: []string{"-f", "ssh"}}},
+		{"pkill without -f", Request{Name: "pkill", Args: []string{"wireguard-go utun7"}}},
 
 		// arity / shell-injection-shaped extras.
 		{"pfctl extra arg", Request{Name: "pfctl", Args: []string{"-e", "-x"}}},
@@ -175,8 +181,8 @@ func TestServerEnforcesPolicy(t *testing.T) {
 		t.Fatalf("Listen: %v", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	go srv.Serve(ctx)
-	t.Cleanup(func() { cancel(); srv.Close() })
+	go func() { _ = srv.Serve(ctx) }()
+	t.Cleanup(func() { cancel(); _ = srv.Close() })
 	c := NewClient(sock)
 
 	// Out-of-scope: refused before exec.
@@ -206,7 +212,7 @@ func shortSocket(t *testing.T) string {
 	if err != nil {
 		t.Fatalf("temp socket dir: %v", err)
 	}
-	t.Cleanup(func() { os.RemoveAll(dir) })
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	return filepath.Join(dir, "s")
 }
 

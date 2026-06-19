@@ -4,11 +4,13 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"os"
 	"path"
+	"syscall"
 	"time"
 
 	"github.com/chimerakang/macvz/pkg/config"
@@ -37,6 +39,62 @@ const informerResync = time.Minute
 // podCIDRWaitTimeout bounds how long startup waits for Kubernetes to assign this
 // node a Pod CIDR before continuing without coordinated IPAM.
 const podCIDRWaitTimeout = 30 * time.Second
+
+const (
+	apiReachabilityTimeout = 30 * time.Second
+	apiReachabilityProbe   = 5 * time.Second
+	apiReachabilityRetry   = time.Second
+	kubeletListenTimeout   = 10 * time.Second
+	kubeletListenRetry     = 250 * time.Millisecond
+)
+
+// waitForAPIServer verifies the Kubernetes API is reachable after the host data
+// plane has finished mutating routes. This keeps route churn failures in the
+// startup path, before Virtual Kubelet starts its long-lived controllers.
+func waitForAPIServer(ctx context.Context, clientset kubernetes.Interface) error {
+	return waitForAPIServerWithTimeout(ctx, clientset, apiReachabilityTimeout, apiReachabilityProbe, apiReachabilityRetry)
+}
+
+func waitForAPIServerWithTimeout(ctx context.Context, clientset kubernetes.Interface, totalTimeout, probeTimeout, retryDelay time.Duration) error {
+	deadlineCtx, cancel := context.WithTimeout(ctx, totalTimeout)
+	defer cancel()
+
+	var lastErr error
+	for {
+		errCh := make(chan error, 1)
+		go func() {
+			_, err := clientset.Discovery().ServerVersion()
+			errCh <- err
+		}()
+
+		select {
+		case err := <-errCh:
+			if err == nil {
+				klog.InfoS("Kubernetes API reachable after data-plane setup")
+				return nil
+			}
+			lastErr = err
+			klog.ErrorS(err, "Kubernetes API reachability probe failed; retrying")
+		case <-time.After(probeTimeout):
+			lastErr = fmt.Errorf("API probe timed out after %s", probeTimeout)
+			klog.ErrorS(lastErr, "Kubernetes API reachability probe failed; retrying")
+		case <-deadlineCtx.Done():
+			if lastErr == nil {
+				lastErr = deadlineCtx.Err()
+			}
+			return fmt.Errorf("API did not answer within %s: %w", totalTimeout, lastErr)
+		}
+
+		select {
+		case <-deadlineCtx.Done():
+			if lastErr == nil {
+				lastErr = deadlineCtx.Err()
+			}
+			return fmt.Errorf("API did not answer within %s: %w", totalTimeout, lastErr)
+		case <-time.After(retryDelay):
+		}
+	}
+}
 
 // setupIPAM enables coordinated Pod IPAM for this node. The address range is the
 // node's Kubernetes-assigned Spec.PodCIDR (or cfg.Node.PodCIDR when set as an
@@ -343,7 +401,7 @@ func startKubeletServer(ctx context.Context, cfg config.Config, p *provider.Prov
 	} else {
 		klog.InfoS("kubelet endpoint binding to all interfaces (no internal IP resolved); consider setting node.internalIP", "port", port)
 	}
-	listener, err := tls.Listen("tcp", addr, tlsCfg)
+	listener, err := listenKubeletTLS(ctx, addr, tlsCfg)
 	if err != nil {
 		return nil, fmt.Errorf("listen on %s: %w", addr, err)
 	}
@@ -360,4 +418,36 @@ func startKubeletServer(ctx context.Context, cfg config.Config, p *provider.Prov
 		_ = srv.Close()
 		_ = listener.Close()
 	}, nil
+}
+
+func listenKubeletTLS(ctx context.Context, addr string, tlsCfg *tls.Config) (net.Listener, error) {
+	return listenKubeletTLSWithRetry(ctx, addr, tlsCfg, kubeletListenTimeout, kubeletListenRetry)
+}
+
+func listenKubeletTLSWithRetry(ctx context.Context, addr string, tlsCfg *tls.Config, totalTimeout, retryDelay time.Duration) (net.Listener, error) {
+	deadlineCtx, cancel := context.WithTimeout(ctx, totalTimeout)
+	defer cancel()
+
+	var lastErr error
+	for {
+		ln, err := tls.Listen("tcp", addr, tlsCfg)
+		if err == nil {
+			return ln, nil
+		}
+		if !isAddrInUse(err) {
+			return nil, err
+		}
+		lastErr = err
+		klog.ErrorS(err, "kubelet API port still in use; retrying", "addr", addr)
+
+		select {
+		case <-deadlineCtx.Done():
+			return nil, fmt.Errorf("address still in use after %s: %w", totalTimeout, lastErr)
+		case <-time.After(retryDelay):
+		}
+	}
+}
+
+func isAddrInUse(err error) bool {
+	return errors.Is(err, syscall.EADDRINUSE)
 }

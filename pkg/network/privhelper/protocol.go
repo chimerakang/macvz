@@ -3,7 +3,7 @@
 // apple/container is a per-user service and refuses to run as root, so the
 // macvz-kubelet process must run as the operator's user. But the cross-host data
 // plane needs privileged tools — pfctl, sysctl, route, ifconfig, wg,
-// wireguard-go — which need root. This package bridges the two: a small daemon
+// wireguard-go, pkill — which need root. This package bridges the two: a small daemon
 // (cmd/macvz-netd) runs as root and executes a fixed allowlist of network
 // commands on behalf of the user-run kubelet, which talks to it over a unix
 // socket. The kubelet never needs sudo, and root is confined to the allowlisted
@@ -125,6 +125,7 @@ var allowedCommands = map[string]bool{
 	"ifconfig":     true,
 	"wg":           true,
 	"wireguard-go": true,
+	"pkill":        true,
 }
 
 // IsAllowed reports whether name is an allowlisted command.

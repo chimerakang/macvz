@@ -31,7 +31,7 @@ and failure recovery.
 ## The sudo / helper model
 
 The cross-host data plane needs **root** tools — `pfctl`, `route`, `sysctl`,
-`ifconfig`, `wg`, `wireguard-go`. But `macvz-kubelet` must run as the operator's
+`ifconfig`, `wg`, `wireguard-go`, `pkill`. But `macvz-kubelet` must run as the operator's
 **user**, because `apple/container` is a per-user service that refuses to run as
 root. These two facts are in direct tension, so MacVz offers two models:
 
@@ -396,7 +396,8 @@ sudo route -n delete -inet 10.244.199.0/24 -interface utun7
 # 4. If the utun interface itself is wedged (wrong number, half-torn-down),
 #    destroy it and let the kubelet recreate on next start:
 sudo ifconfig utun7 down
-sudo ifconfig utun7 destroy        # bring-up is idempotent; restart re-creates it
+sudo pkill -f 'wireguard-go utun7' # wireguard-go owns the utun lifecycle
+sudo ifconfig utun7 destroy        # best-effort; may report Invalid argument
 ```
 
 Because bring-up tolerates "already exists" and `Mesh.Sync` reconciles
@@ -479,7 +480,8 @@ Privileged state does not revert on its own. To leave a host clean:
 
 sudo pfctl -a macvz/pods -F all            # belt-and-suspenders anchor flush
 sudo route -n flush -inet                  # only if you must clear stale routes
-sudo ifconfig utun7 destroy 2>/dev/null    # remove the mesh interface
+sudo pkill -f 'wireguard-go utun7' 2>/dev/null
+sudo ifconfig utun7 destroy 2>/dev/null    # best-effort mesh interface cleanup
 sudo sysctl -w net.inet.ip.forwarding=0    # revert forwarding, if desired
 
 # Remove the helper entirely (plist, binary, socket):

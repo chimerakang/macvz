@@ -21,13 +21,13 @@ func startControlServer(t *testing.T, srv *Server) *Client {
 	if err != nil {
 		t.Fatalf("MkdirTemp: %v", err)
 	}
-	t.Cleanup(func() { os.RemoveAll(dir) })
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	if err := srv.Listen(-1, -1); err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	go srv.Serve(ctx)
-	t.Cleanup(func() { cancel(); srv.Close() })
+	go func() { _ = srv.Serve(ctx) }()
+	t.Cleanup(func() { cancel(); _ = srv.Close() })
 	return NewClient(srv.socketPath)
 }
 
@@ -37,7 +37,7 @@ func tmpSock(t *testing.T) string {
 	if err != nil {
 		t.Fatalf("MkdirTemp: %v", err)
 	}
-	t.Cleanup(func() { os.RemoveAll(dir) })
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	return filepath.Join(dir, "s")
 }
 
@@ -210,7 +210,7 @@ func TestMalformedRequestRejected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	if _, err := conn.Write([]byte("this is not json\n")); err != nil {
 		t.Fatalf("write: %v", err)
 	}
@@ -233,7 +233,7 @@ func TestOversizedRequestRejected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	// A valid JSON envelope with an enormous Stdin, exceeding maxRequestBytes.
 	huge := strings.Repeat("A", maxRequestBytes+1024)
 	if err := json.NewEncoder(conn).Encode(Request{Protocol: Protocol, Name: "pfctl", Stdin: huge}); err != nil {

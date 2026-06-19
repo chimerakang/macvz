@@ -27,7 +27,7 @@ func TestRouterRoutesThroughHelper(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer os.RemoveAll(dir)
+	defer func() { _ = os.RemoveAll(dir) }()
 	sock := filepath.Join(dir, "s")
 	srv := privhelper.NewServerWithExec(sock, fake)
 	if err := srv.Listen(-1, -1); err != nil {
@@ -35,8 +35,8 @@ func TestRouterRoutesThroughHelper(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go srv.Serve(ctx)
-	defer srv.Close()
+	go func() { _ = srv.Serve(ctx) }()
+	defer func() { _ = srv.Close() }()
 
 	rt := New(Config{Interface: "bridge100", EnableForwarding: true}, WithHelperSocket(sock))
 	if err := rt.Start(ctx); err != nil {

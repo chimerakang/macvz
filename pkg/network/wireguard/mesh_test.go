@@ -272,6 +272,9 @@ func TestDownRemovesRoutesAndInterface(t *testing.T) {
 	if !contains(cmds, "ifconfig utun7 destroy") {
 		t.Errorf("Down did not destroy the interface\nran: %v", cmds)
 	}
+	if !contains(cmds, "pkill -f wireguard-go utun7") {
+		t.Errorf("Down did not stop wireguard-go\nran: %v", cmds)
+	}
 	if got := m.InstalledRoutes(); len(got) != 0 {
 		t.Errorf("routes remain after Down: %v", got)
 	}
@@ -286,6 +289,7 @@ func TestDownIsBestEffort(t *testing.T) {
 	}
 	// Even if teardown commands fail, Down must not error (cleanup is best-effort).
 	fr.failOn["ifconfig utun7 destroy"] = "some unexpected failure"
+	fr.failOn["pkill -f wireguard-go utun7"] = "pkill: no matching processes were found"
 	if err := m.Down(ctx); err != nil {
 		t.Fatalf("Down should be best-effort, got: %v", err)
 	}

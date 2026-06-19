@@ -66,6 +66,8 @@ func (p Policy) Validate(req Request) error {
 		return p.validateWG(req)
 	case "wireguard-go":
 		return p.validateWireGuardGo(req)
+	case "pkill":
+		return p.validatePkill(req)
 	default:
 		// Allowlisted but ungrammared: refuse rather than pass through unchecked.
 		return fmt.Errorf("no validation grammar for command %q", req.Name)
@@ -220,7 +222,7 @@ func (p Policy) lintRDRRule(fields []string) error {
 	if _, err := strconv.Atoi(fields[portIdx+1]); err != nil {
 		return fmt.Errorf("target port %q is not numeric", fields[portIdx+1])
 	}
-	if len(fields) != portIdx+2 && !(len(fields) == portIdx+3 && fields[portIdx+2] == "round-robin") {
+	if len(fields) != portIdx+2 && (len(fields) != portIdx+3 || fields[portIdx+2] != "round-robin") {
 		return fmt.Errorf("unexpected trailing rdr tokens %v", fields[portIdx+2:])
 	}
 
@@ -417,6 +419,20 @@ func (p Policy) validateWireGuardGo(req Request) error {
 		return fmt.Errorf("wireguard-go args %v not permitted", req.Args)
 	}
 	return p.checkMeshInterface(req.Args[0])
+}
+
+func (p Policy) validatePkill(req Request) error {
+	if req.Stdin != "" {
+		return fmt.Errorf("pkill takes no stdin")
+	}
+	if len(req.Args) != 2 || req.Args[0] != "-f" {
+		return fmt.Errorf("pkill args %v not permitted", req.Args)
+	}
+	want := "wireguard-go " + p.MeshInterface
+	if req.Args[1] != want {
+		return fmt.Errorf("pkill pattern %q is not the managed wireguard-go pattern %q", req.Args[1], want)
+	}
+	return p.checkMeshInterface(strings.TrimPrefix(req.Args[1], "wireguard-go "))
 }
 
 func (p Policy) checkMeshInterface(iface string) error {

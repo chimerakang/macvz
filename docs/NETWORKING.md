@@ -106,8 +106,8 @@ installed through the interface so the kernel forwards Pod-bound packets into th
 tunnel.
 
 macOS has no in-kernel WireGuard, so MacVz drives the userspace toolchain from
-Homebrew's `wireguard-tools` (`wg`, `wireguard-go`) plus the system `route` and
-`ifconfig`. Bring-up runs, in order:
+Homebrew's `wireguard-tools` (`wg`, `wireguard-go`) plus the system `route`,
+`ifconfig`, and `pkill`. Bring-up runs, in order:
 
 1. `wireguard-go <iface>` — create the userspace `utun` interface.
 2. `wg setconf <iface> /dev/stdin` — apply keys and peers (config via stdin, no
@@ -118,6 +118,16 @@ Homebrew's `wireguard-tools` (`wg`, `wireguard-go`) plus the system `route` and
 
 Interface creation and route installation tolerate "already exists" / "File
 exists", so bring-up is **idempotent** and safe to re-run.
+
+Teardown removes peer routes, brings the interface down, then stops only the
+matching `wireguard-go <iface>` process before attempting a best-effort
+`ifconfig <iface> destroy`. Stopping the process is required on macOS because
+userspace WireGuard owns the `utun` lifecycle.
+
+`macvz-kubelet` builds its Kubernetes clientset only after this data-plane
+bring-up and the Pod-network route cleanup complete, then probes
+`/version` before starting the Virtual Kubelet controllers. That keeps transient
+host-route churn from poisoning a long-lived client-go transport.
 
 ### Reconcile without restart
 
@@ -488,7 +498,7 @@ kill %1                            # closing the forward cleans up cleanly
 ## Privileged network helper (`macvz-netd`)
 
 The cross-host data plane needs root tools — `pfctl`, `route`, `sysctl`,
-`ifconfig`, `wg`, `wireguard-go` — but `macvz-kubelet` must run as the operator's
+`ifconfig`, `wg`, `wireguard-go`, `pkill` — but `macvz-kubelet` must run as the operator's
 user because `apple/container` is a per-user service that refuses to run as root.
 `macvz-netd` bridges the two: a small root daemon runs a fixed allowlist of
 network commands on behalf of the user-run kubelet, which connects over a unix
@@ -524,9 +534,9 @@ values are pinned to this node's configuration:
   ruleset may contain only `binat`/`rdr` rules on the configured
   `podNetwork.interface`, and translated targets must stay inside configured
   Pod CIDRs or `podNetwork.vmNetCIDRs`.
-- **interfaces** — `route`, `ifconfig`, `wg`, and `wireguard-go` may only touch
-  `mesh.interface`; the assigned address and MTU must equal `mesh.address` /
-  `mesh.mtu`.
+- **interfaces/processes** — `route`, `ifconfig`, `wg`, `wireguard-go`, and the
+  teardown `pkill` may only touch `mesh.interface`; the assigned address and MTU
+  must equal `mesh.address` / `mesh.mtu`.
 - **routes / AllowedIPs** — must fall within a configured peer's Pod CIDR or
   mesh address (`mesh.peers[].podCIDR` / `.address`). A `0.0.0.0/0` route or an
   unlisted CIDR is refused. The only default-route operation allowed is deleting

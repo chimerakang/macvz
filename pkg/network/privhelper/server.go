@@ -108,7 +108,7 @@ func (s *Server) Listen(ownerUID, ownerGID int) error {
 		return fmt.Errorf("listen on %q: %w", s.socketPath, err)
 	}
 	if err := os.Chmod(s.socketPath, 0o660); err != nil {
-		ln.Close()
+		_ = ln.Close()
 		return fmt.Errorf("chmod socket: %w", err)
 	}
 	if s.startedAt.IsZero() {
@@ -116,7 +116,7 @@ func (s *Server) Listen(ownerUID, ownerGID int) error {
 	}
 	if ownerUID >= 0 {
 		if err := os.Chown(s.socketPath, ownerUID, ownerGID); err != nil {
-			ln.Close()
+			_ = ln.Close()
 			return fmt.Errorf("chown socket to %d:%d: %w", ownerUID, ownerGID, err)
 		}
 	}
@@ -131,7 +131,7 @@ func (s *Server) Serve(ctx context.Context) error {
 	}
 	go func() {
 		<-ctx.Done()
-		s.ln.Close()
+		_ = s.ln.Close()
 	}()
 	klog.InfoS("privileged network helper listening", "socket", s.socketPath, "allow", AllowedCommands())
 	for {
@@ -149,7 +149,7 @@ func (s *Server) Serve(ctx context.Context) error {
 // Close stops the listener and removes the socket.
 func (s *Server) Close() error {
 	if s.ln != nil {
-		s.ln.Close()
+		_ = s.ln.Close()
 	}
 	return os.RemoveAll(s.socketPath)
 }
@@ -157,7 +157,7 @@ func (s *Server) Close() error {
 // handle serves one request per connection (the kubelet opens a fresh
 // connection per command, mirroring how exec.Command is one-shot).
 func (s *Server) handle(ctx context.Context, conn net.Conn) {
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	// Bound the bytes a single connection can make the root daemon buffer.
 	dec := json.NewDecoder(bufio.NewReader(io.LimitReader(conn, maxRequestBytes)))
 	var req Request
@@ -280,7 +280,7 @@ func (s *Server) writeResponse(conn net.Conn, resp Response) {
 	if err != nil {
 		b = []byte(`{"exitCode":-1,"err":"marshal response failed","errorCode":"exec_error"}`)
 	}
-	conn.Write(append(b, '\n'))
+	_, _ = conn.Write(append(b, '\n'))
 }
 
 // realExec runs the command for real (server runs as root).

@@ -106,11 +106,11 @@ func (c *Client) roundTrip(ctx context.Context, req Request) (Response, error) {
 	if err != nil {
 		return Response{}, fmt.Errorf("privhelper dial %q: %w", c.socketPath, err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	if deadline, ok := ctx.Deadline(); ok {
-		conn.SetDeadline(deadline)
+		_ = conn.SetDeadline(deadline)
 	} else {
-		conn.SetDeadline(time.Now().Add(2 * time.Minute))
+		_ = conn.SetDeadline(time.Now().Add(2 * time.Minute))
 	}
 
 	if err := json.NewEncoder(conn).Encode(req); err != nil {

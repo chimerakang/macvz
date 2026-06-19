@@ -19,15 +19,15 @@ func startTestServer(t *testing.T, fake ExecFunc) *Client {
 	if err != nil {
 		t.Fatalf("MkdirTemp: %v", err)
 	}
-	t.Cleanup(func() { os.RemoveAll(dir) })
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	sock := filepath.Join(dir, "s")
 	srv := NewServer(sock).withExec(fake)
 	if err := srv.Listen(-1, -1); err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	go srv.Serve(ctx)
-	t.Cleanup(func() { cancel(); srv.Close() })
+	go func() { _ = srv.Serve(ctx) }()
+	t.Cleanup(func() { cancel(); _ = srv.Close() })
 	return NewClient(sock)
 }
 
@@ -113,7 +113,7 @@ func TestDialErrorOnMissingSocket(t *testing.T) {
 }
 
 func TestIsAllowed(t *testing.T) {
-	for _, ok := range []string{"pfctl", "sysctl", "route", "ifconfig", "wg", "wireguard-go"} {
+	for _, ok := range []string{"pfctl", "sysctl", "route", "ifconfig", "wg", "wireguard-go", "pkill"} {
 		if !IsAllowed(ok) {
 			t.Errorf("%q should be allowed", ok)
 		}

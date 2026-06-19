@@ -73,7 +73,8 @@ type Router struct {
 
 	mu        sync.Mutex
 	started   bool
-	endpoints map[string]Endpoint // keyed by PodKey
+	endpoints map[string]Endpoint      // keyed by PodKey
+	services  map[string][]ServiceRule // keyed by service "namespace/name"
 }
 
 // Option configures a Router.
@@ -105,6 +106,7 @@ func New(cfg Config, opts ...Option) *Router {
 		pfctl:     defaultPfctl,
 		sysctl:    defaultSysctl,
 		endpoints: map[string]Endpoint{},
+		services:  map[string][]ServiceRule{},
 	}
 	for _, opt := range opts {
 		opt(rt)
@@ -194,6 +196,7 @@ func (rt *Router) Stop(ctx context.Context) error {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 	rt.endpoints = map[string]Endpoint{}
+	rt.services = map[string][]ServiceRule{}
 	if !rt.started {
 		return nil
 	}
@@ -209,6 +212,7 @@ func (rt *Router) Stop(ctx context.Context) error {
 // atomically via `pfctl -a <anchor> -f -`. Caller holds rt.mu.
 func (rt *Router) loadAnchorLocked(ctx context.Context) error {
 	rules := renderAnchor(rt.cfg.Interface, rt.endpointsSortedLocked())
+	rules += renderServiceRules(rt.cfg.Interface, rt.services, rt.vmipByPodIPLocked())
 	_, err := rt.run.run(ctx, command{
 		Name:  rt.pfctl,
 		Args:  []string{"-a", rt.cfg.Anchor, "-f", "-"},

@@ -55,6 +55,16 @@ type Config struct {
 	// PodNetwork configures the host path that makes each micro-VM reachable at
 	// its assigned Pod IP across the mesh (P3, #22). Disabled by default.
 	PodNetwork PodNetworkConfig `yaml:"podNetwork"`
+
+	// PrivilegedHelperSocket, when set, routes all privileged network commands
+	// (pf, wg, route, sysctl, ifconfig) for the mesh and Pod network path through
+	// the root helper daemon (cmd/macvz-netd, #38) at this unix socket, instead
+	// of executing them in-process. This lets macvz-kubelet run as the operator's
+	// user — required because apple/container refuses to run as root — while the
+	// data plane still gets root for its network operations. Empty runs the
+	// commands directly (the kubelet must then be root, which is incompatible
+	// with apple/container).
+	PrivilegedHelperSocket string `yaml:"privilegedHelperSocket"`
 }
 
 // NodeConfig is the configurable shape of the virtual node registered with
@@ -136,6 +146,17 @@ type NodeConfig struct {
 
 	// Volumes configures Pod volume support (#26).
 	Volumes VolumesConfig `yaml:"volumes"`
+
+	// ClusterDNS are the cluster DNS server IPs (typically the CoreDNS/kube-dns
+	// ClusterIP, e.g. "10.96.0.10") injected into micro-VMs whose Pods use the
+	// ClusterFirst DNS policy, so in-guest Service name resolution works (#37).
+	// Empty leaves each micro-VM with the DNS baked into its image.
+	ClusterDNS []string `yaml:"clusterDNS"`
+
+	// ClusterDomain is the cluster DNS domain used to build Pod search domains
+	// (e.g. "<ns>.svc.cluster.local"). Defaults to "cluster.local" when
+	// clusterDNS is set.
+	ClusterDomain string `yaml:"clusterDomain"`
 }
 
 // VolumesConfig governs which Pod volumes MacVz mounts into micro-VMs and where

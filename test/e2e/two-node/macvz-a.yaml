@@ -1,0 +1,62 @@
+# macvz-kubelet config for node macvz-a (192.168.1.110) in the issue #37
+# two-Mac WireGuard + podNetwork e2e. Apply on the .110 host.
+#
+# Peer publicKey below is macvz-b's PUBLIC key (test/e2e/two-node/keys/macvz-b.pub).
+# The matching PRIVATE key for THIS node is installed by prep-node.sh to
+# mesh.privateKeyFile (from keys/macvz-a.key); it is never committed to git.
+nodeName: macvz-a
+
+# Set by run.sh from KUBECONFIG; left empty so standard resolution applies.
+kubeconfigPath: ""
+runtimeBinary: container
+logLevel: info
+
+node:
+  cpu: "4"
+  memory: 8Gi
+  pods: "20"
+  os: linux
+  arch: arm64
+  internalIP: "192.168.1.110"
+
+  # Disjoint Pod CIDR per node (cluster does not auto-allocate to virtual nodes).
+  podCIDR: "10.244.101.0/24"
+
+  taints:
+    - key: virtual-kubelet.io/provider
+      value: macvz
+      effect: NoSchedule
+
+  kubeletPort: 10250
+  # Serving TLS enables kubectl logs/exec. prep-node.sh generates these if absent.
+  servingTLSCertFile: /etc/macvz/pki/kubelet.crt
+  servingTLSKeyFile: /etc/macvz/pki/kubelet.key
+
+  # Cluster DNS so micro-VMs resolve Service names (#37). Set to your cluster's
+  # CoreDNS ClusterIP (`kubectl -n kube-system get svc kube-dns`).
+  clusterDNS: ["10.96.0.10"]
+  clusterDomain: cluster.local
+
+mesh:
+  enabled: true
+  interface: utun7
+  privateKeyFile: /etc/macvz/wireguard.key
+  address: 10.99.0.1/32
+  listenPort: 51820
+  peers:
+    - name: macvz-b
+      publicKey: kBLohUgv6VLiJAtZ846NrVKTHDmG/bT3qQ6g3D/jgUU=
+      endpoint: 192.168.1.122:51820
+      podCIDR: 10.244.102.0/24
+      address: 10.99.0.2/32
+      persistentKeepalive: 25
+
+podNetwork:
+  enabled: true
+  interface: bridge100
+  anchor: macvz/pods
+  enableForwarding: true
+
+# Privileged network helper (#38): run macvz-netd as root; kubelet runs as the
+# user so apple/container works, and pf/wg/route go through this socket.
+privilegedHelperSocket: /var/run/macvz-netd.sock

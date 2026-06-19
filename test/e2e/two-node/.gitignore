@@ -1,0 +1,3 @@
+# WireGuard private keys must never be committed (global security rule).
+# Public keys (*.pub) are safe and ARE tracked so peer configs stay in sync.
+keys/*.key

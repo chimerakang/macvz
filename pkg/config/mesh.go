@@ -114,11 +114,39 @@ func (c Config) MeshInterfaceConfig() (wireguard.InterfaceConfig, error) {
 		port = DefaultMeshListenPort
 	}
 
+	peers, err := m.resolvePeers()
+	if err != nil {
+		return wireguard.InterfaceConfig{}, err
+	}
+
+	return wireguard.InterfaceConfig{
+		Name:       m.Interface,
+		PrivateKey: priv,
+		Address:    m.Address,
+		ListenPort: port,
+		MTU:        m.MTU,
+		Peers:      peers,
+	}, nil
+}
+
+// MeshPeers resolves the configured mesh peers into wireguard.Peer values,
+// without loading this node's private key. It is the input to peer
+// reconciliation (#42): on a config reload the kubelet feeds the result to
+// wireguard.Mesh.Sync to add/remove peers (and their routes) in place, never
+// recreating the interface. Call only when Mesh.Enabled is true.
+func (c Config) MeshPeers() ([]wireguard.Peer, error) {
+	return c.Mesh.resolvePeers()
+}
+
+// resolvePeers maps the YAML peer entries to wireguard.Peer values. Each peer's
+// AllowedIPs are its Pod CIDR plus (when set) its mesh address, exactly the
+// CIDRs routed through the tunnel to that node.
+func (m MeshConfig) resolvePeers() ([]wireguard.Peer, error) {
 	peers := make([]wireguard.Peer, 0, len(m.Peers))
 	for _, p := range m.Peers {
 		pub, err := wireguard.ParseKey(p.PublicKey)
 		if err != nil {
-			return wireguard.InterfaceConfig{}, fmt.Errorf("mesh peer %q: %w", p.Name, err)
+			return nil, fmt.Errorf("mesh peer %q: %w", p.Name, err)
 		}
 		allowed := []string{p.PodCIDR}
 		if p.Address != "" {
@@ -132,13 +160,5 @@ func (c Config) MeshInterfaceConfig() (wireguard.InterfaceConfig, error) {
 			PersistentKeepalive: p.PersistentKeepalive,
 		})
 	}
-
-	return wireguard.InterfaceConfig{
-		Name:       m.Interface,
-		PrivateKey: priv,
-		Address:    m.Address,
-		ListenPort: port,
-		MTU:        m.MTU,
-		Peers:      peers,
-	}, nil
+	return peers, nil
 }

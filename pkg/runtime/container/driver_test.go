@@ -111,6 +111,32 @@ func TestCreateBuildsArgs(t *testing.T) {
 	}
 }
 
+func TestCreateBuildsDNSArgs(t *testing.T) {
+	f := &fakeRunner{outputs: map[string][]byte{"create": []byte("pod-dns\n")}}
+	d := driverWith(f)
+
+	spec := types.ContainerSpec{
+		Name:       "pod-dns",
+		Image:      "docker.io/library/alpine:3.20",
+		DNS:        []string{"10.96.0.10"},
+		DNSSearch:  []string{"default.svc.cluster.local", "svc.cluster.local"},
+		DNSOptions: []string{"ndots:5"},
+	}
+	if _, err := d.Create(context.Background(), spec); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	got := lastCall(f)
+	if !argsContain(got, "--dns", "10.96.0.10") {
+		t.Errorf("missing --dns flag: %v", got)
+	}
+	if !argsContain(got, "--dns-search", "default.svc.cluster.local") {
+		t.Errorf("missing --dns-search flag: %v", got)
+	}
+	if !argsContain(got, "--dns-option", "ndots:5") {
+		t.Errorf("missing --dns-option flag: %v", got)
+	}
+}
+
 func TestCreateValidates(t *testing.T) {
 	d := driverWith(&fakeRunner{})
 	if _, err := d.Create(context.Background(), types.ContainerSpec{Image: "x"}); err == nil {

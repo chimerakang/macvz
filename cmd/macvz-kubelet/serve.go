@@ -14,6 +14,7 @@ import (
 	"github.com/chimerakang/macvz/pkg/config"
 	"github.com/chimerakang/macvz/pkg/network"
 	"github.com/chimerakang/macvz/pkg/network/podnet"
+	"github.com/chimerakang/macvz/pkg/network/svcroute"
 	"github.com/chimerakang/macvz/pkg/network/wireguard"
 	"github.com/chimerakang/macvz/pkg/provider"
 	vknode "github.com/virtual-kubelet/virtual-kubelet/node"
@@ -158,7 +159,12 @@ func startPodController(ctx context.Context, cfg config.Config, clientset *kuber
 // cleanup func that tears it back down. The mesh encrypts and routes cross-host
 // Pod traffic (issue #21); each peer's Pod CIDR becomes a route through the
 // tunnel. When the mesh is disabled it is a no-op returning a no-op cleanup.
-func setupMesh(ctx context.Context, cfg config.Config) (func(), error) {
+//
+// When configPath is set, it also starts a SIGHUP-driven reconciler (#42): an
+// operator edits the config's peer list and signals the kubelet to add/remove
+// peers and routes in place, with no restart and no disruption to local Pod
+// attachments.
+func setupMesh(ctx context.Context, cfg config.Config, configPath string) (func(), error) {
 	if !cfg.Mesh.Enabled {
 		klog.InfoS("WireGuard mesh disabled; Pods are reachable only on their local node")
 		return func() {}, nil
@@ -168,7 +174,11 @@ func setupMesh(ctx context.Context, cfg config.Config) (func(), error) {
 	if err != nil {
 		return nil, fmt.Errorf("resolve mesh config: %w", err)
 	}
-	mesh := wireguard.New(ifc)
+	var meshOpts []wireguard.Option
+	if cfg.PrivilegedHelperSocket != "" {
+		meshOpts = append(meshOpts, wireguard.WithHelperSocket(cfg.PrivilegedHelperSocket))
+	}
+	mesh := wireguard.New(ifc, meshOpts...)
 	if err := mesh.Up(ctx); err != nil {
 		return nil, fmt.Errorf("bring up mesh interface %q: %w", ifc.Name, err)
 	}
@@ -178,6 +188,13 @@ func setupMesh(ctx context.Context, cfg config.Config) (func(), error) {
 		"peers", mesh.Peers(),
 		"routes", mesh.InstalledRoutes(),
 	)
+
+	// Reconcile peers on SIGHUP so nodes can join/leave without a restart (#42).
+	// Requires the config path to reload; with no --config it is skipped.
+	if configPath != "" {
+		go watchMeshReload(ctx, mesh, configPath)
+		klog.InfoS("mesh peer reload enabled; edit peers then `kill -HUP` the kubelet to reconcile", "config", configPath)
+	}
 
 	return func() {
 		// Tear down with a fresh context: the root ctx is already cancelled by
@@ -192,25 +209,63 @@ func setupMesh(ctx context.Context, cfg config.Config) (func(), error) {
 // it to the provider so each micro-VM is reachable at its Pod IP across the mesh
 // (#22). It returns a cleanup func that flushes the host rules. When disabled it
 // is a no-op returning a no-op cleanup.
-func setupPodNetwork(ctx context.Context, cfg config.Config, p *provider.Provider) (func(), error) {
+func setupPodNetwork(ctx context.Context, cfg config.Config, p *provider.Provider) (*podnet.Router, func(), error) {
 	if !cfg.PodNetwork.Enabled {
 		klog.InfoS("Pod network path disabled; Pods keep the runtime host-only address")
-		return func() {}, nil
+		return nil, func() {}, nil
 	}
 
-	router := podnet.New(cfg.PodNetworkRouterConfig())
+	var pnOpts []podnet.Option
+	if cfg.PrivilegedHelperSocket != "" {
+		pnOpts = append(pnOpts, podnet.WithHelperSocket(cfg.PrivilegedHelperSocket))
+	}
+	router := podnet.New(cfg.PodNetworkRouterConfig(), pnOpts...)
 	if err := router.Start(ctx); err != nil {
-		return nil, fmt.Errorf("start pod network path: %w", err)
+		return nil, nil, fmt.Errorf("start pod network path: %w", err)
 	}
 	p.SetPodNetwork(router)
 	klog.InfoS("Pod network path started", "interface", cfg.PodNetwork.Interface)
 
-	return func() {
+	return router, func() {
 		if err := router.Stop(context.Background()); err != nil {
 			klog.ErrorS(err, "failed to stop pod network path")
 		}
 	}, nil
 }
+
+// startServiceController runs the ClusterIP Service route controller (#37). It
+// watches Services and EndpointSlices cluster-wide and programs the podnet
+// anchor with rdr DNAT rules so micro-VMs can reach Service ClusterIPs. It is a
+// no-op (nil router) when the Pod network path is disabled — without it there is
+// nothing to program. Returns a cleanup that stops the controller.
+func startServiceController(ctx context.Context, cfg config.Config, clientset *kubernetes.Clientset, router *podnet.Router) func() {
+	if router == nil {
+		klog.InfoS("ClusterIP service routing disabled (Pod network path is off)")
+		return func() {}
+	}
+	factory := informers.NewSharedInformerFactory(clientset, informerResync)
+	ctrl := svcroute.New(router, factory)
+
+	ctlCtx, cancel := context.WithCancel(ctx)
+	factory.Start(ctlCtx.Done())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if err := ctrl.Run(ctlCtx, serviceControllerWorkers); err != nil && ctlCtx.Err() == nil {
+			klog.ErrorS(err, "service route controller stopped unexpectedly")
+		}
+	}()
+	klog.InfoS("ClusterIP service routing enabled", "interface", cfg.PodNetwork.Interface)
+	// Wait for the controller to drain on cleanup so no reconcile races the
+	// router's Stop (the Pod network path is torn down right after this).
+	return func() {
+		cancel()
+		<-done
+	}
+}
+
+// serviceControllerWorkers is the concurrency of the service route controller.
+const serviceControllerWorkers = 2
 
 // buildServingTLSConfig assembles the TLS config for the kubelet HTTPS server.
 // When clientCAFile is set, the server requires and verifies a client

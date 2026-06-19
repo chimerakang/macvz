@@ -42,9 +42,9 @@ Mac, and is the recorded P4 acceptance evidence.
 | Port-forward | `port-forward` to a backend reaches the in-Pod HTTP server | #24 |
 | Cleanup | namespace and all workloads removed | — |
 
-On any failure the suite captures diagnostics (node describes, Pod describes,
-endpoints, events) to `MACVZ_E2E_DIAG_DIR` and exits non-zero — suitable for
-release gating.
+On any failure the suite captures diagnostics to `MACVZ_E2E_DIAG_DIR` and exits
+non-zero — suitable for release gating. See [Diagnostics](#diagnostics) for what
+is collected and how to reach node-level network state.
 
 ## Run it
 
@@ -65,10 +65,11 @@ Configuration (environment):
 | --- | --- | --- |
 | `KUBECONFIG` | standard | cluster credentials |
 | `MACVZ_E2E_NODES` | auto-detect | comma-separated node names |
-| `MACVZ_E2E_IMAGE` | `alpine:3.20` | arm64 image (busybox `httpd` + `wget`) |
+| `MACVZ_E2E_IMAGE` | `busybox:1.36.1` | arm64 image with `httpd` + `wget` |
 | `MACVZ_E2E_NAMESPACE` | `macvz-e2e` | namespace for test objects |
 | `MACVZ_E2E_DIAG_DIR` | mktemp | where failure diagnostics are written |
 | `MACVZ_E2E_TIMEOUT` | `120` | per-wait timeout (seconds) |
+| `MACVZ_E2E_DIAG_SSH` | unset | command template to reach a node for node-level network diagnostics; `{node}` → node name (see [Diagnostics](#diagnostics)) |
 
 Setup and teardown are automated: the suite creates its own namespace and tears
 it down at the end (and on failure, after capturing diagnostics). It does **not**
@@ -97,6 +98,60 @@ MACVZ_INTEGRATION=1 go test ./pkg/runtime/container/ -v
 These cover micro-VM lifecycle, logs, exec, volumes, stats, and Rosetta against
 a real `apple/container` service. The [P2 smoke test](P2_SMOKE_TEST.md) covers
 the single-node provider path end-to-end by hand.
+
+## Diagnostics
+
+On any failure the suite writes a bundle to `MACVZ_E2E_DIAG_DIR` (a mktemp dir by
+default; the path is logged). The bundle has two layers, designed to tell apart
+**mesh**, **route**, **pf**, **endpoint/kube-proxy**, and **forwarding** failures
+(issue #43):
+
+- **`diagnostics.txt`** — cluster-side state gathered from the control machine,
+  always available: node readiness and **PodCIDRs**, Pod describes, the
+  **EndpointSlices** that decide Service membership (full YAML), and recent
+  events. This distinguishes endpoint/kube-proxy problems (missing or `NotReady`
+  endpoints, wrong PodCIDR) from data-plane ones.
+- **`node-<name>.txt`** — per-node privileged network state from each Mac:
+  `wg show` (WireGuard handshakes, transfer, endpoints), the IPv4 routing table,
+  the `macvz/pods` **pf anchor** nat/binat and filter rules, the
+  `net.inet.ip.forwarding` sysctl, and the Pod bridge. This is what tells a dead
+  tunnel apart from a missing route, a missing pf rule, or disabled forwarding.
+
+Node-level state needs root on the node, so the suite collects it through a hook:
+
+- If the **host running the suite is itself a target node**, it runs the
+  collector locally (using `sudo -n` when not already root).
+- Otherwise, set **`MACVZ_E2E_DIAG_SSH`** to a command template that reaches the
+  node; the literal token `{node}` is replaced with the node name. The read-only
+  collector is piped over the connection — nothing is pre-staged on the node:
+
+  ```sh
+  export MACVZ_E2E_DIAG_SSH='ssh -o ConnectTimeout=5 admin@{node}.local'
+  MACVZ_E2E=1 MACVZ_E2E_NODES=mac-a,mac-b make e2e
+  ```
+
+- With no hook and a non-local node, that node's collection is skipped with a
+  note in the log.
+
+**Secrets are masked** before anything is written — WireGuard private/preshared
+keys, kubeconfig `client-key-data`, bearer tokens, and passwords are replaced
+with `[REDACTED]`, while public keys, addresses, routes, and rules are kept. So
+a bundle is safe to attach to an issue.
+
+Both acceptance properties are covered by a cluster-free unit test
+([test/e2e/diag_test.go](../test/e2e/diag_test.go)) that runs on every
+`go test ./...`: it drives the real collector against stubbed node commands,
+injects each failure (no handshake, missing route, empty pf anchor, forwarding
+off) one at a time, and asserts the bundle removes exactly that failure's signal
+while keeping the others (so faults stay distinguishable) — and that secrets
+never leak under any scenario.
+
+You can also run the collector by hand on a Mac to inspect the live data plane:
+
+```sh
+sudo ./test/e2e/collect-node-diag.sh            # redacted, to stdout
+sudo ./test/e2e/collect-node-diag.sh > node.txt
+```
 
 ## CI
 

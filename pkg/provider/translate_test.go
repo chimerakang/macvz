@@ -28,7 +28,7 @@ func TestTranslatePodSupported(t *testing.T) {
 		Command: []string{"sleep"},
 		Args:    []string{"3600"},
 	}))
-	spec, _, err := translatePod(p, VolumePolicy{})
+	spec, _, err := translatePod(p, VolumePolicy{}, DNSConfig{})
 	if err != nil {
 		t.Fatalf("translatePod: %v", err)
 	}
@@ -165,7 +165,7 @@ func TestTranslatePodUnsupported(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, _, err := translatePod(pod("ns", "n", tt.spec), VolumePolicy{})
+			_, _, err := translatePod(pod("ns", "n", tt.spec), VolumePolicy{}, DNSConfig{})
 			if err == nil {
 				t.Fatal("expected an unsupported error")
 			}
@@ -186,7 +186,7 @@ func TestTranslatePodToleratesServiceAccountToken(t *testing.T) {
 			}},
 		}},
 	}
-	if _, _, err := translatePod(pod("ns", "n", spec), VolumePolicy{}); err != nil {
+	if _, _, err := translatePod(pod("ns", "n", spec), VolumePolicy{}, DNSConfig{}); err != nil {
 		t.Errorf("auto-mounted service-account token should be tolerated, got %v", err)
 	}
 }

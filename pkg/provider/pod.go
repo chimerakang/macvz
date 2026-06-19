@@ -36,7 +36,7 @@ func (p *Provider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	// Translate the Pod into a single workload spec, resolving its volumes
 	// against the node policy. An unsupported shape or volume is terminal: record
 	// a clear Failed status instead of retrying forever.
-	spec, vols, err := translatePod(pod, p.volumes)
+	spec, vols, err := translatePod(pod, p.volumes, p.dns)
 	if err != nil {
 		return p.markTerminalFailure(key, pod, "UnsupportedPodSpec", err)
 	}

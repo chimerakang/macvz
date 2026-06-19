@@ -1,0 +1,38 @@
+# Two Services for the web Deployment exercise ClusterIP Service routing (#37)
+# from inside the micro-VMs:
+#   - web: a normal ClusterIP, load-balanced across the 2 web replicas. The
+#     checker Deployment reaches it by name, proving cluster DNS + ClusterIP DNAT.
+#   - web-headless: a headless Service (clusterIP: None) exposing per-Pod DNS,
+#     covering the headless code path as well.
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+  namespace: macvz-p6
+  labels:
+    app: web
+    app.kubernetes.io/part-of: macvz-p6-compat
+spec:
+  selector:
+    app: web
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-headless
+  namespace: macvz-p6
+  labels:
+    app: web
+    app.kubernetes.io/part-of: macvz-p6-compat
+spec:
+  clusterIP: None
+  selector:
+    app: web
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

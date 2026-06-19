@@ -1,6 +1,7 @@
 package provider
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -28,7 +29,7 @@ func TestTranslatePodSupported(t *testing.T) {
 		Command: []string{"sleep"},
 		Args:    []string{"3600"},
 	}))
-	spec, _, err := translatePod(p, VolumePolicy{}, DNSConfig{})
+	spec, _, err := translatePod(context.Background(), p, VolumePolicy{}, DNSConfig{}, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("translatePod: %v", err)
 	}
@@ -40,6 +41,19 @@ func TestTranslatePodSupported(t *testing.T) {
 	}
 	if spec.Name != "macvz-default-alpine-alpine" {
 		t.Errorf("workload ID = %q, want macvz-default-alpine-alpine", spec.Name)
+	}
+}
+
+func TestTranslatePodAcceptsControllerRestartPolicies(t *testing.T) {
+	// Deployment/ReplicaSet templates set restartPolicy Always; Jobs use
+	// OnFailure. Both must translate cleanly now that the provider runs the
+	// restart loop (#45), and an unset value (API-server default Always) too.
+	for _, policy := range []corev1.RestartPolicy{"", corev1.RestartPolicyAlways, corev1.RestartPolicyOnFailure, corev1.RestartPolicyNever} {
+		spec := oneContainer(corev1.Container{Name: "app", Image: "nginx"})
+		spec.RestartPolicy = policy
+		if _, _, err := translatePod(context.Background(), pod("default", "app", spec), VolumePolicy{}, DNSConfig{}, nil, nil, nil); err != nil {
+			t.Errorf("restartPolicy %q: unexpected error %v", policy, err)
+		}
 	}
 }
 
@@ -131,20 +145,11 @@ func TestTranslatePodUnsupported(t *testing.T) {
 			wantSub: `volume "data"`,
 		},
 		{
-			name: "container securityContext",
+			name: "privileged container",
 			spec: corev1.PodSpec{Containers: []corev1.Container{
-				{Name: "a", Image: "x", SecurityContext: &corev1.SecurityContext{}},
+				{Name: "a", Image: "x", SecurityContext: &corev1.SecurityContext{Privileged: optionalRef(true)}},
 			}},
-			wantSub: "securityContext",
-		},
-		{
-			name: "env valueFrom",
-			spec: corev1.PodSpec{Containers: []corev1.Container{{
-				Name:  "a",
-				Image: "x",
-				Env:   []corev1.EnvVar{{Name: "K", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"}}}},
-			}}},
-			wantSub: "valueFrom",
+			wantSub: "privileged",
 		},
 		{
 			name: "hostNetwork",
@@ -155,9 +160,9 @@ func TestTranslatePodUnsupported(t *testing.T) {
 			wantSub: "hostNetwork",
 		},
 		{
-			name: "restart policy always",
+			name: "unrecognized restart policy",
 			spec: corev1.PodSpec{
-				RestartPolicy: corev1.RestartPolicyAlways,
+				RestartPolicy: corev1.RestartPolicy("Sometimes"),
 				Containers:    []corev1.Container{{Name: "a", Image: "x"}},
 			},
 			wantSub: "restartPolicy",
@@ -165,7 +170,7 @@ func TestTranslatePodUnsupported(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, _, err := translatePod(pod("ns", "n", tt.spec), VolumePolicy{}, DNSConfig{})
+			_, _, err := translatePod(context.Background(), pod("ns", "n", tt.spec), VolumePolicy{}, DNSConfig{}, nil, nil, nil)
 			if err == nil {
 				t.Fatal("expected an unsupported error")
 			}
@@ -186,7 +191,7 @@ func TestTranslatePodToleratesServiceAccountToken(t *testing.T) {
 			}},
 		}},
 	}
-	if _, _, err := translatePod(pod("ns", "n", spec), VolumePolicy{}, DNSConfig{}); err != nil {
+	if _, _, err := translatePod(context.Background(), pod("ns", "n", spec), VolumePolicy{}, DNSConfig{}, nil, nil, nil); err != nil {
 		t.Errorf("auto-mounted service-account token should be tolerated, got %v", err)
 	}
 }

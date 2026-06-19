@@ -36,16 +36,28 @@ func (p *Provider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	// Translate the Pod into a single workload spec, resolving its volumes
 	// against the node policy. An unsupported shape or volume is terminal: record
 	// a clear Failed status instead of retrying forever.
-	spec, vols, err := translatePod(pod, p.volumes, p.dns)
+	spec, vols, err := translatePod(ctx, pod, p.volumes, p.dns, p.configMaps, p.secrets, p.tokens)
 	if err != nil {
+		// A ConfigMap/Secret/key that is not yet present is not terminal: return the
+		// error so Virtual Kubelet surfaces a clear Pending status and retries, and
+		// the Pod self-heals once the dependency appears (#46/#47). Any other
+		// translation error is a shape this node can never run.
+		if errors.Is(err, errConfigPending) || errors.Is(err, errSecretUnavailable) {
+			klog.InfoS("Pod configuration not ready; will retry", "pod", key, "reason", err.Error())
+			return fmt.Errorf("pod %q configuration not ready: %w", key, err)
+		}
 		return p.markTerminalFailure(key, pod, "UnsupportedPodSpec", err)
 	}
 	c := pod.Spec.Containers[0]
 
-	// Materialize ephemeral (emptyDir) backing directories before the VM starts.
-	// A failure here is host/config-level and worth retrying, not terminal.
+	// Materialize ephemeral (emptyDir) and ConfigMap backing directories, then
+	// write any ConfigMap-projected files, before the VM starts. A failure here is
+	// host/config-level and worth retrying, not terminal.
 	if err := p.ensureVolumeDirs(vols.ephemeralDirs); err != nil {
 		return fmt.Errorf("prepare volumes for pod %q: %w", key, err)
+	}
+	if err := p.writeConfigFiles(vols.configFiles); err != nil {
+		return fmt.Errorf("materialize configMap volumes for pod %q: %w", key, err)
 	}
 
 	// Allocate a stable Pod IP from this node's Pod CIDR. Until the Pod is
@@ -64,12 +76,27 @@ func (p *Provider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 		}()
 	}
 
-	st := &podState{pod: pod.DeepCopy()}
+	st := &podState{
+		pod:           pod.DeepCopy(),
+		spec:          spec,
+		restartPolicy: effectiveRestartPolicy(pod),
+		restarts:      map[string]int32{},
+	}
 	now := metav1.Now()
 	st.pod.Status.StartTime = &now
 	st.pod.Status.PodIP = podIP
 
-	if err := p.rt.Pull(ctx, spec.Image); err != nil {
+	// Resolve any private-registry credentials from the Pod's imagePullSecrets
+	// before pulling (#49). A missing/unreadable pull Secret is transient — return
+	// the error so the Pod stays Pending with an actionable message and retries
+	// once the Secret appears (or is corrected). Credentials never enter the error.
+	auth, err := resolvePullAuth(p.secrets, pod, spec.Image)
+	if err != nil {
+		klog.InfoS("Pod image pull credentials not ready; will retry", "pod", key, "reason", err.Error())
+		return fmt.Errorf("pod %q image pull credentials not ready: %w", key, err)
+	}
+
+	if err := p.rt.Pull(ctx, spec.Image, auth); err != nil {
 		// An image with no arm64 variant can never run here (P1 surfaces this
 		// signal); make it a terminal Failed status. Other pull errors (e.g.
 		// runtime not ready) are transient and worth retrying.
@@ -111,6 +138,9 @@ func (p *Provider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	st.pod.Status = p.reconcileStatus(ctx, st)
 	p.mu.Lock()
 	p.pods[key] = st
+	// Launch the container's probers, if any, against the now-running workload
+	// (#50). Held under the lock so reconcileStatus sees a consistent probe state.
+	p.startProbes(st)
 	p.mu.Unlock()
 	committed = true // the allocated Pod IP is now owned by the stored Pod.
 	klog.InfoS("created Pod", "pod", key, "workloadID", spec.Name, "podIP", podIP)
@@ -180,6 +210,9 @@ func (p *Provider) DeletePod(ctx context.Context, pod *corev1.Pod) error {
 	p.mu.Lock()
 	st, ok := p.pods[key]
 	if ok {
+		// Stop the probers before dropping the Pod so they do not race a restart
+		// against a workload that is being torn down (#50).
+		p.stopProbes(st)
 		delete(p.pods, key)
 	}
 	p.mu.Unlock()

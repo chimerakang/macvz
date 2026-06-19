@@ -53,13 +53,29 @@ type ExecIO struct {
 	TTY    bool
 }
 
+// RegistryAuth carries the credentials for authenticating an image pull against
+// a private registry, resolved from a Pod's imagePullSecrets (#49). Server is the
+// registry host the credential applies to (e.g. "registry.example.com" or
+// "registry.example.com:5000"). A nil *RegistryAuth means an anonymous pull.
+//
+// The Password is sensitive: implementations must keep it off process argv and
+// out of logs (pass it over stdin), and must not persist it to repo-controlled
+// paths.
+type RegistryAuth struct {
+	Server   string
+	Username string
+	Password string
+}
+
 // Runtime drives the full lifecycle of a workload micro-VM on a single host.
 //
 // Implementations must be safe for concurrent use; the provider may operate on
 // multiple workloads at once.
 type Runtime interface {
-	// Pull fetches an OCI image into the local store.
-	Pull(ctx context.Context, image string) error
+	// Pull fetches an OCI image into the local store. When auth is non-nil the
+	// pull authenticates against the registry with the given credentials;
+	// a nil auth performs an anonymous pull.
+	Pull(ctx context.Context, image string, auth *RegistryAuth) error
 	// Create provisions (but does not start) a workload, returning its ID.
 	Create(ctx context.Context, spec types.ContainerSpec) (id string, err error)
 	// Start boots the workload's micro-VM.

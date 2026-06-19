@@ -45,6 +45,19 @@ type ContainerSpec struct {
 	// DNSOptions are resolv.conf options such as "ndots:5" (passed as
 	// `--dns-option`).
 	DNSOptions []string
+
+	// User sets the guest process user as "uid" or "uid:gid", translated from the
+	// Pod's securityContext runAsUser/runAsGroup (#52). Empty runs the image's
+	// configured user.
+	User string
+	// ReadOnlyRootFS mounts the guest root filesystem read-only, translated from
+	// securityContext.readOnlyRootFilesystem (#52).
+	ReadOnlyRootFS bool
+	// CapAdd and CapDrop are Linux capabilities to grant or remove for the guest
+	// process, translated from securityContext.capabilities (#52). Names are in
+	// the runtime's form (e.g. "CAP_NET_ADMIN", or "ALL").
+	CapAdd  []string
+	CapDrop []string
 }
 
 // Mount describes one filesystem mount inside the micro-VM. A bind mount shares

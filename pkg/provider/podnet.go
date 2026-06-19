@@ -39,7 +39,14 @@ func (p *Provider) observeVMIP(ctx context.Context, st *podState) string {
 	if len(st.workloads) == 0 {
 		return ""
 	}
-	id := st.workloads[0].id
+	return p.observeVMIPByID(ctx, st.workloads[0].id)
+}
+
+// observeVMIPByID polls the runtime for a specific workload's host-only address.
+// It returns "" if the address never appears within the poll budget or the
+// context is cancelled. The restart path (#45) uses it to re-attach a freshly
+// recreated micro-VM whose ID is not yet stored on the podState.
+func (p *Provider) observeVMIPByID(ctx context.Context, id string) string {
 	for attempt := 0; attempt < vmIPPollAttempts; attempt++ {
 		if rs, err := p.rt.Status(ctx, id); err == nil && rs.IP != "" {
 			return rs.IP

@@ -1,6 +1,7 @@
 package provider
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -30,6 +31,9 @@ type VolumePolicy struct {
 type resolvedVolumes struct {
 	mounts        []types.Mount
 	ephemeralDirs []string
+	// configFiles are ConfigMap- and Secret-projected files to materialize under
+	// their volume's backing dir before the micro-VM starts (#46/#47).
+	configFiles []fileToWrite
 }
 
 // resolveVolumes validates every volume a Pod declares and maps the container's
@@ -38,11 +42,14 @@ type resolvedVolumes struct {
 // is rejected with a clear, Kubernetes-facing error. Validating all declared
 // volumes — not just mounted ones — keeps an unsupported volume a hard failure
 // even when no container references it.
-func resolveVolumes(pod *corev1.Pod, policy VolumePolicy) (resolvedVolumes, error) {
+func resolveVolumes(ctx context.Context, pod *corev1.Pod, policy VolumePolicy, cms ConfigMapGetter, secrets SecretGetter, tokens TokenRequester) (resolvedVolumes, error) {
 	byName := make(map[string]corev1.Volume, len(pod.Spec.Volumes))
 	for _, v := range pod.Spec.Volumes {
-		// The auto-injected service-account token is tolerated but never mounted.
-		if isDefaultProjectedToken(v) {
+		// A projected service-account token volume (the auto-injected
+		// kube-api-access) is only materialized when this node has a token issuer
+		// configured (#51). Without one it is tolerated but not mounted, preserving
+		// the prior behavior on nodes that grant Pods no in-cluster credentials.
+		if isDefaultProjectedToken(v) && tokens == nil {
 			continue
 		}
 		if err := validateVolumeSource(v, policy); err != nil {
@@ -63,14 +70,15 @@ func resolveVolumes(pod *corev1.Pod, policy VolumePolicy) (resolvedVolumes, erro
 			// the token is mounted by the guest's own tooling, not by MacVz.
 			continue
 		}
-		mount, ephemeral, err := resolveMount(pod, vol, vm, policy)
+		mount, back, err := resolveMount(ctx, pod, vol, vm, policy, cms, secrets, tokens)
 		if err != nil {
 			return resolvedVolumes{}, err
 		}
 		out.mounts = append(out.mounts, mount)
-		if ephemeral != "" {
-			out.ephemeralDirs = append(out.ephemeralDirs, ephemeral)
+		if back.dir != "" {
+			out.ephemeralDirs = append(out.ephemeralDirs, back.dir)
 		}
+		out.configFiles = append(out.configFiles, back.files...)
 	}
 	return out, nil
 }
@@ -95,8 +103,40 @@ func validateVolumeSource(v corev1.Volume, policy VolumePolicy) error {
 			return fmt.Errorf("volume %q is an emptyDir, but node.volumes.root %q is not absolute", v.Name, policy.Root)
 		}
 		return nil
+	case v.ConfigMap != nil:
+		// ConfigMap volumes are materialized as files under the ephemeral root
+		// before the VM starts (#46), so they need the same backing storage as an
+		// emptyDir.
+		if policy.Root == "" {
+			return fmt.Errorf("volume %q is a configMap, but no volume root is configured to back it (set node.volumes.root)", v.Name)
+		}
+		if !filepath.IsAbs(policy.Root) {
+			return fmt.Errorf("volume %q is a configMap, but node.volumes.root %q is not absolute", v.Name, policy.Root)
+		}
+		return nil
+	case v.Secret != nil:
+		// Secret volumes are materialized as files under the ephemeral root before
+		// the VM starts (#47), so they need the same backing storage as a configMap.
+		if policy.Root == "" {
+			return fmt.Errorf("volume %q is a secret, but no volume root is configured to back it (set node.volumes.root)", v.Name)
+		}
+		if !filepath.IsAbs(policy.Root) {
+			return fmt.Errorf("volume %q is a secret, but node.volumes.root %q is not absolute", v.Name, policy.Root)
+		}
+		return nil
+	case v.Projected != nil:
+		// Projected volumes (the auto-injected kube-api-access token, CA, and
+		// namespace) are materialized as files under the ephemeral root before the
+		// VM starts (#51), so they need the same backing storage as a configMap.
+		if policy.Root == "" {
+			return fmt.Errorf("volume %q is projected, but no volume root is configured to back it (set node.volumes.root)", v.Name)
+		}
+		if !filepath.IsAbs(policy.Root) {
+			return fmt.Errorf("volume %q is projected, but node.volumes.root %q is not absolute", v.Name, policy.Root)
+		}
+		return nil
 	default:
-		return fmt.Errorf("volume %q uses an unsupported source type (only hostPath and emptyDir are supported in the beta)", v.Name)
+		return fmt.Errorf("volume %q uses an unsupported source type (only hostPath, emptyDir, configMap, secret, and projected are supported in the beta)", v.Name)
 	}
 }
 
@@ -121,16 +161,25 @@ func validateHostPath(name string, hp *corev1.HostPathVolumeSource, policy Volum
 	return nil
 }
 
-// resolveMount builds the runtime mount for one volumeMount, returning the host
-// directory to pre-create when the volume is a disk-backed emptyDir.
-func resolveMount(pod *corev1.Pod, vol corev1.Volume, vm corev1.VolumeMount, policy VolumePolicy) (types.Mount, string, error) {
+// backing is the host storage a mount needs prepared before the micro-VM starts:
+// a directory to create (emptyDir, configMap) and, for a configMap, the files to
+// materialize inside it. A zero backing means the mount needs no preparation
+// (hostPath, or a tmpfs emptyDir).
+type backing struct {
+	dir   string
+	files []fileToWrite
+}
+
+// resolveMount builds the runtime mount for one volumeMount, plus the host
+// storage that must be prepared before the VM starts.
+func resolveMount(ctx context.Context, pod *corev1.Pod, vol corev1.Volume, vm corev1.VolumeMount, policy VolumePolicy, cms ConfigMapGetter, secrets SecretGetter, tokens TokenRequester) (types.Mount, backing, error) {
 	if !filepath.IsAbs(vm.MountPath) {
-		return types.Mount{}, "", fmt.Errorf("volume %q mountPath %q must be absolute", vm.Name, vm.MountPath)
+		return types.Mount{}, backing{}, fmt.Errorf("volume %q mountPath %q must be absolute", vm.Name, vm.MountPath)
 	}
 	// subPath needs careful traversal handling; defer it rather than mount the
 	// wrong directory.
 	if vm.SubPath != "" || vm.SubPathExpr != "" {
-		return types.Mount{}, "", fmt.Errorf("volume %q uses subPath, which is not supported yet", vm.Name)
+		return types.Mount{}, backing{}, fmt.Errorf("volume %q uses subPath, which is not supported yet", vm.Name)
 	}
 	target := filepath.Clean(vm.MountPath)
 
@@ -140,26 +189,82 @@ func resolveMount(pod *corev1.Pod, vol corev1.Volume, vm corev1.VolumeMount, pol
 			Source:   filepath.Clean(vol.HostPath.Path),
 			Target:   target,
 			ReadOnly: vm.ReadOnly,
-		}, "", nil
+		}, backing{}, nil
 
 	case vol.EmptyDir != nil:
 		// A Memory-medium emptyDir is guest-local tmpfs with no host backing.
 		if vol.EmptyDir.Medium == corev1.StorageMediumMemory {
-			return types.Mount{Target: target, Tmpfs: true}, "", nil
+			return types.Mount{Target: target, Tmpfs: true}, backing{}, nil
 		}
 		dir, err := safeVolumeDir(policy.Root, string(pod.UID), vm.Name)
 		if err != nil {
-			return types.Mount{}, "", err
+			return types.Mount{}, backing{}, err
 		}
 		return types.Mount{
 			Source:   dir,
 			Target:   target,
 			ReadOnly: vm.ReadOnly,
-		}, dir, nil
+		}, backing{dir: dir}, nil
+
+	case vol.ConfigMap != nil:
+		// Materialize the ConfigMap's keys as files under a per-Pod dir, then bind
+		// it read-only into the guest (#46). Kubernetes always mounts projected
+		// ConfigMap volumes read-only.
+		dir, err := safeVolumeDir(policy.Root, string(pod.UID), vm.Name)
+		if err != nil {
+			return types.Mount{}, backing{}, err
+		}
+		files, err := configMapVolumeFiles(pod.Namespace, vol.ConfigMap, dir, cms)
+		if err != nil {
+			return types.Mount{}, backing{}, err
+		}
+		return types.Mount{
+			Source:   dir,
+			Target:   target,
+			ReadOnly: true,
+		}, backing{dir: dir, files: files}, nil
+
+	case vol.Secret != nil:
+		// Materialize the Secret's keys as files under a per-Pod dir, then bind it
+		// read-only into the guest (#47). Kubernetes always mounts projected Secret
+		// volumes read-only; keeping them off the runtime's writable path also avoids
+		// leaking values back through a shared mount.
+		dir, err := safeVolumeDir(policy.Root, string(pod.UID), vm.Name)
+		if err != nil {
+			return types.Mount{}, backing{}, err
+		}
+		files, err := secretVolumeFiles(pod.Namespace, vol.Secret, dir, secrets)
+		if err != nil {
+			return types.Mount{}, backing{}, err
+		}
+		return types.Mount{
+			Source:   dir,
+			Target:   target,
+			ReadOnly: true,
+		}, backing{dir: dir, files: files}, nil
+
+	case vol.Projected != nil:
+		// Materialize the projected sources (service-account token, cluster CA, and
+		// namespace for the auto-injected kube-api-access volume) as files under a
+		// per-Pod dir, then bind it read-only into the guest (#51). Kubernetes always
+		// mounts projected volumes read-only.
+		dir, err := safeVolumeDir(policy.Root, string(pod.UID), vm.Name)
+		if err != nil {
+			return types.Mount{}, backing{}, err
+		}
+		files, err := projectedVolumeFiles(ctx, pod, vol.Projected, dir, cms, secrets, tokens)
+		if err != nil {
+			return types.Mount{}, backing{}, err
+		}
+		return types.Mount{
+			Source:   dir,
+			Target:   target,
+			ReadOnly: true,
+		}, backing{dir: dir, files: files}, nil
 
 	default:
 		// validateVolumeSource already rejected other types; defensive.
-		return types.Mount{}, "", fmt.Errorf("volume %q uses an unsupported source type", vm.Name)
+		return types.Mount{}, backing{}, fmt.Errorf("volume %q uses an unsupported source type", vm.Name)
 	}
 }
 
@@ -232,6 +337,25 @@ func (p *Provider) ensureVolumeDirs(dirs []string) error {
 	for _, d := range dirs {
 		if err := os.MkdirAll(d, 0o770); err != nil {
 			return fmt.Errorf("create ephemeral volume dir %q: %w", d, err)
+		}
+	}
+	return nil
+}
+
+// writeConfigFiles materializes ConfigMap-projected files on the host before the
+// micro-VM starts (#46). Each file's parent directory is created (a projected
+// key may sit in a subdirectory), and an explicit Chmod follows WriteFile so the
+// requested mode is not narrowed by the process umask.
+func (p *Provider) writeConfigFiles(files []fileToWrite) error {
+	for _, f := range files {
+		if err := os.MkdirAll(filepath.Dir(f.path), 0o770); err != nil {
+			return fmt.Errorf("create configMap volume dir for %q: %w", f.path, err)
+		}
+		if err := os.WriteFile(f.path, f.data, f.mode); err != nil {
+			return fmt.Errorf("write configMap volume file %q: %w", f.path, err)
+		}
+		if err := os.Chmod(f.path, f.mode); err != nil {
+			return fmt.Errorf("set mode on configMap volume file %q: %w", f.path, err)
 		}
 	}
 	return nil

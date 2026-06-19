@@ -1,0 +1,36 @@
+# ConfigMaps exercise #46 (ConfigMap-backed env and volumes).
+#
+# web-config is consumed three ways by the web Deployment:
+#   - envFrom (prefix CFG_): every valid-name key becomes an env var. The dotted
+#     key `app.conf` is NOT a valid env var name, so Kubernetes (and MacVz) skip
+#     it for envFrom while still projecting it as a file — a deliberate edge case.
+#   - valueFrom.configMapKeyRef: APP_GREETING is pulled into GREETING.
+#   - a volume mount at /etc/web: app.conf appears as a file in the guest.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: web-config
+  namespace: macvz-p6
+  labels:
+    app.kubernetes.io/part-of: macvz-p6-compat
+data:
+  APP_GREETING: "hello-from-configmap"
+  APP_MODE: "production"
+  app.conf: |
+    mode=production
+    feature_x=on
+---
+# checker-config drives the second Deployment, proving ConfigMaps work across
+# more than one workload. CHECK_URL is injected via configMapKeyRef.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: checker-config
+  namespace: macvz-p6
+  labels:
+    app.kubernetes.io/part-of: macvz-p6-compat
+  # Namespace-relative short name: the cluster DNS search domains MacVz injects
+  # (#37) resolve it to the in-namespace web Service, so it stays correct even
+  # when the fixture is applied to a non-default namespace.
+data:
+  CHECK_URL: "http://web"

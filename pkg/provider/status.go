@@ -38,7 +38,13 @@ func (p *Provider) reconcileStatus(ctx context.Context, st *podState) corev1.Pod
 		rs, err := p.rt.Status(ctx, w.id)
 		if err != nil {
 			if errors.Is(err, runtime.ErrNotFound) {
-				// The workload vanished from the runtime; report it terminated.
+				// The workload vanished from the runtime. Under a restart policy
+				// that recreates it, this is a (failure-equivalent) exit to restart
+				// from; otherwise report it terminated/Lost.
+				if p.maybeTriggerRestart(st, c.Name, w.id, 1) {
+					statuses = append(statuses, restartingStatus(c, st.restarts[c.Name]))
+					continue
+				}
 				statuses = append(statuses, terminatedStatus(c, w.id, 0, "Lost", "runtime workload not found"))
 				continue
 			}
@@ -53,14 +59,42 @@ func (p *Provider) reconcileStatus(ctx context.Context, st *podState) corev1.Pod
 			statuses = append(statuses, waitingStatus(c, "RuntimeError", err.Error()))
 			continue
 		}
-		statuses = append(statuses, containerStatus(c, w.id, rs))
+		// A terminated workload under an Always/OnFailure policy is restarted as a
+		// fresh micro-VM (#45); while that is pending, report CrashLoopBackOff so
+		// the Pod does not surface as terminally Failed/Succeeded.
+		if rs.Phase == runtime.PhaseStopped || rs.Phase == runtime.PhaseFailed {
+			exit := rs.ExitCode
+			if rs.Phase == runtime.PhaseFailed {
+				exit = int(nonZero(int32(rs.ExitCode)))
+			}
+			if p.maybeTriggerRestart(st, c.Name, w.id, exit) {
+				statuses = append(statuses, restartingStatus(c, st.restarts[c.Name]))
+				continue
+			}
+		}
+		cs := containerStatus(c, w.id, rs)
+		cs.RestartCount = st.restarts[c.Name]
+		statuses = append(statuses, cs)
 		if status.PodIP == "" && rs.IP != "" {
 			status.PodIP = rs.IP
 		}
 	}
 
-	status.ContainerStatuses = statuses
 	status.Phase = aggregatePhase(statuses)
+
+	// Reflect probe results on the running container's Ready/Started flags (#50).
+	// A readiness probe that has not yet passed keeps the container un-Ready (and
+	// therefore out of Service endpoints) even though its micro-VM is Running.
+	started, probeReady := p.probeReadiness(st, status.Phase)
+	if st.probes != nil {
+		for i := range statuses {
+			if statuses[i].State.Running != nil {
+				statuses[i].Ready = probeReady
+				statuses[i].Started = boolPtr(started)
+			}
+		}
+	}
+	status.ContainerStatuses = statuses
 
 	// Publish the Pod's address in both the singular and plural fields. The
 	// EndpointSlice controller reads PodIPs, so populating it is what makes a
@@ -76,8 +110,9 @@ func (p *Provider) reconcileStatus(ctx context.Context, st *podState) corev1.Pod
 	}
 
 	// Readiness drives EndpointSlice membership: a Pod is Ready only when it is
-	// running AND has an address, so endpoints never point at an unreachable Pod.
-	ready := status.Phase == corev1.PodRunning && status.PodIP != ""
+	// running, has an address, and (when configured) has passed its startup and
+	// readiness probes — so endpoints never point at an unready or unreachable Pod.
+	ready := probeReady && status.PodIP != ""
 	status.Conditions = podConditions(status.Phase, ready)
 	switch {
 	case status.Message != "":
@@ -85,6 +120,9 @@ func (p *Provider) reconcileStatus(ctx context.Context, st *podState) corev1.Pod
 	case status.Phase == corev1.PodRunning && status.PodIP == "":
 		status.Conditions = withConditionReason(status.Conditions, "PodNetworkNotReady",
 			"waiting for Pod IP allocation and network attach")
+	case status.Phase == corev1.PodRunning && !ready:
+		status.Conditions = withConditionReason(status.Conditions, "ContainersNotReady",
+			"container has not passed its startup/readiness probe")
 	}
 	return status
 }
@@ -123,6 +161,23 @@ func containerStatus(c corev1.Container, id string, rs runtime.Status) corev1.Co
 		cs.State.Waiting = &corev1.ContainerStateWaiting{Reason: "Unknown", Message: rs.Message}
 	}
 	return cs
+}
+
+// restartingStatus reports a container that exited and is being restarted under
+// its Pod's restart policy (#45). It carries the accumulated RestartCount and a
+// CrashLoopBackOff waiting reason, matching how the kubelet surfaces a workload
+// between exits.
+func restartingStatus(c corev1.Container, restartCount int32) corev1.ContainerStatus {
+	return corev1.ContainerStatus{
+		Name:         c.Name,
+		Image:        c.Image,
+		ImageID:      c.Image,
+		RestartCount: restartCount,
+		State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{
+			Reason:  "CrashLoopBackOff",
+			Message: "container exited; restarting per restartPolicy",
+		}},
+	}
 }
 
 func waitingStatus(c corev1.Container, reason, msg string) corev1.ContainerStatus {

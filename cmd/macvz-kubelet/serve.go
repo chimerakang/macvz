@@ -22,6 +22,7 @@ import (
 	vknode "github.com/virtual-kubelet/virtual-kubelet/node"
 	vkapi "github.com/virtual-kubelet/virtual-kubelet/node/api"
 	"github.com/virtual-kubelet/virtual-kubelet/node/nodeutil"
+	authnv1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
@@ -29,9 +30,32 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
+	corev1listers "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/klog/v2"
 )
+
+// configMapLister adapts a ConfigMap informer's lister to the provider's
+// ConfigMapGetter so Pods can consume ConfigMap-backed env vars and volumes
+// (#46) from the controller's already-synced cache.
+type configMapLister struct {
+	lister corev1listers.ConfigMapLister
+}
+
+func (c configMapLister) GetConfigMap(namespace, name string) (*corev1.ConfigMap, error) {
+	return c.lister.ConfigMaps(namespace).Get(name)
+}
+
+// clientsetTokenCreator mints bound service-account tokens through the live
+// clientset's TokenRequest subresource, so Pods get normal in-cluster API access
+// (#51). It is the namespace-aware adapter the provider's token issuer needs.
+type clientsetTokenCreator struct {
+	clientset kubernetes.Interface
+}
+
+func (c clientsetTokenCreator) CreateToken(ctx context.Context, namespace, serviceAccountName string, tr *authnv1.TokenRequest, opts metav1.CreateOptions) (*authnv1.TokenRequest, error) {
+	return c.clientset.CoreV1().ServiceAccounts(namespace).CreateToken(ctx, serviceAccountName, tr, opts)
+}
 
 // informerResync is how often the shared informers do a full relist.
 const informerResync = time.Minute
@@ -173,6 +197,20 @@ func startPodController(ctx context.Context, cfg config.Config, clientset *kuber
 	secretInformer := scmFactory.Core().V1().Secrets()
 	configMapInformer := scmFactory.Core().V1().ConfigMaps()
 	serviceInformer := scmFactory.Core().V1().Services()
+
+	// Resolve ConfigMap-backed env vars and volumes from the controller's own
+	// ConfigMap cache (#46). Wired in before the controller starts reconciling.
+	p.SetConfigMapGetter(configMapLister{lister: configMapInformer.Lister()})
+
+	// Resolve imagePullSecrets from the controller's own Secret cache (#49), so
+	// private images are pulled with the Pod's credentials. Wired in before the
+	// controller starts reconciling.
+	p.SetSecretGetter(provider.NewSecretLister(secretInformer.Lister()))
+
+	// Issue bound service-account tokens through the clientset's TokenRequest API
+	// so Pods get the projected kube-api-access volume and normal in-cluster API
+	// access (#51). Wired in before the controller starts reconciling.
+	p.SetTokenRequester(provider.NewTokenRequester(clientsetTokenCreator{clientset: clientset}))
 
 	eb := record.NewBroadcaster()
 	eb.StartRecordingToSink(&corev1client.EventSinkImpl{Interface: clientset.CoreV1().Events(corev1.NamespaceAll)})

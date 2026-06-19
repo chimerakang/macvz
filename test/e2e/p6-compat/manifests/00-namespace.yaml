@@ -1,0 +1,8 @@
+# P6 compatibility fixture (#53): a self-contained namespace holding the whole
+# acceptance workload, so the run.sh harness can apply and tear it down as a unit.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: macvz-p6
+  labels:
+    app.kubernetes.io/part-of: macvz-p6-compat

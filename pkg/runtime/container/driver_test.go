@@ -111,6 +111,50 @@ func TestCreateBuildsArgs(t *testing.T) {
 	}
 }
 
+func TestCreateBuildsSecurityContextArgs(t *testing.T) {
+	f := &fakeRunner{outputs: map[string][]byte{"create": []byte("pod-sc\n")}}
+	d := driverWith(f)
+
+	spec := types.ContainerSpec{
+		Name:           "pod-sc",
+		Image:          "docker.io/library/alpine:3.20",
+		User:           "1000:2000",
+		ReadOnlyRootFS: true,
+		CapAdd:         []string{"CAP_NET_ADMIN"},
+		CapDrop:        []string{"ALL"},
+	}
+	if _, err := d.Create(context.Background(), spec); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	got := lastCall(f)
+	if !argsContain(got, "--user", "1000:2000") {
+		t.Errorf("missing --user flag: %v", got)
+	}
+	if !argsContain(got, "--read-only") {
+		t.Errorf("missing --read-only flag: %v", got)
+	}
+	if !argsContain(got, "--cap-add", "CAP_NET_ADMIN") {
+		t.Errorf("missing --cap-add flag: %v", got)
+	}
+	if !argsContain(got, "--cap-drop", "ALL") {
+		t.Errorf("missing --cap-drop flag: %v", got)
+	}
+}
+
+func TestCreateOmitsSecurityContextArgsByDefault(t *testing.T) {
+	f := &fakeRunner{outputs: map[string][]byte{"create": []byte("pod-default\n")}}
+	d := driverWith(f)
+	if _, err := d.Create(context.Background(), types.ContainerSpec{Name: "pod-default", Image: "alpine"}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	joined := strings.Join(lastCall(f), " ")
+	for _, flag := range []string{"--user", "--read-only", "--cap-add", "--cap-drop"} {
+		if strings.Contains(joined, flag) {
+			t.Errorf("unset securityContext should not emit %s; got %q", flag, joined)
+		}
+	}
+}
+
 func TestCreateBuildsDNSArgs(t *testing.T) {
 	f := &fakeRunner{outputs: map[string][]byte{"create": []byte("pod-dns\n")}}
 	d := driverWith(f)
@@ -163,7 +207,7 @@ func TestPullVerifiesArm64(t *testing.T) {
 		"image pull":    []byte(""),
 		"image inspect": []byte(arm64Variants),
 	}}
-	if err := driverWith(f).Pull(context.Background(), "alpine"); err != nil {
+	if err := driverWith(f).Pull(context.Background(), "alpine", nil); err != nil {
 		t.Fatalf("Pull of arm64-capable image: %v", err)
 	}
 }
@@ -173,7 +217,7 @@ func TestPullRejectsNonArm64(t *testing.T) {
 		"image pull":    []byte(""),
 		"image inspect": []byte(amd64OnlyVariants),
 	}}
-	err := driverWith(f).Pull(context.Background(), "amd64/alpine")
+	err := driverWith(f).Pull(context.Background(), "amd64/alpine", nil)
 	if !errors.Is(err, runtime.ErrIncompatibleArch) {
 		t.Fatalf("err = %v, want ErrIncompatibleArch", err)
 	}
@@ -181,6 +225,68 @@ func TestPullRejectsNonArm64(t *testing.T) {
 	msg := err.Error()
 	if !strings.Contains(msg, "linux/arm64") || !strings.Contains(msg, "linux/amd64") {
 		t.Errorf("error not actionable enough: %q", msg)
+	}
+}
+
+func TestPullWithAuthLogsInAndOut(t *testing.T) {
+	f := &fakeRunner{outputs: map[string][]byte{
+		"image pull":    []byte(""),
+		"image inspect": []byte(arm64Variants),
+	}}
+	auth := &runtime.RegistryAuth{Server: "registry.example.com", Username: "alice", Password: "s3cret"}
+	if err := driverWith(f).Pull(context.Background(), "registry.example.com/app:v1", auth); err != nil {
+		t.Fatalf("authenticated Pull: %v", err)
+	}
+
+	// The full sequence must run: login, pull, inspect (arch check), logout.
+	var sawLogin, sawPull, sawLogout bool
+	for _, c := range f.calls {
+		switch {
+		case argsContain(c, "registry", "login"):
+			sawLogin = true
+			// The password must never appear in the command arguments.
+			for _, a := range c {
+				if a == "s3cret" {
+					t.Error("password leaked into registry login arguments")
+				}
+			}
+			if !argsContain(c, "--password-stdin", "registry.example.com") {
+				t.Errorf("login args missing --password-stdin/server: %v", c)
+			}
+		case argsContain(c, "image", "pull"):
+			sawPull = true
+		case argsContain(c, "registry", "logout"):
+			sawLogout = true
+		}
+	}
+	if !sawLogin || !sawPull || !sawLogout {
+		t.Fatalf("sequence incomplete: login=%v pull=%v logout=%v", sawLogin, sawPull, sawLogout)
+	}
+
+	// The password must be supplied over stdin.
+	if f.lastRunS.Stdin == nil {
+		t.Fatal("login did not wire a stdin for the password")
+	}
+	pw, _ := io.ReadAll(f.lastRunS.Stdin)
+	if string(pw) != "s3cret" {
+		t.Errorf("stdin password = %q, want %q", pw, "s3cret")
+	}
+}
+
+func TestPullWithAuthLoginFailureAbortsPull(t *testing.T) {
+	f := &fakeRunner{
+		outputs: map[string][]byte{"image pull": []byte("")},
+		runErr:  errors.New("unauthorized"),
+	}
+	auth := &runtime.RegistryAuth{Server: "registry.example.com", Username: "alice", Password: "p"}
+	err := driverWith(f).Pull(context.Background(), "registry.example.com/app", auth)
+	if err == nil {
+		t.Fatal("expected Pull to fail when registry login fails")
+	}
+	for _, c := range f.calls {
+		if argsContain(c, "image", "pull") {
+			t.Error("image pull ran despite a failed login")
+		}
 	}
 }
 

@@ -1,0 +1,143 @@
+# The web Deployment is the heart of the P6 acceptance workload. A single
+# busybox container (arm64, public) renders a status page from every P6 input,
+# then serves it over HTTP so probes and the checker Deployment can reach it.
+#
+# Features exercised:
+#   #45 Deployment-managed Pods (restartPolicy Always via the controller template)
+#   #46 ConfigMap env (envFrom prefix + configMapKeyRef) and a configMap volume
+#   #47 Secret env (secretKeyRef) and a read-only secret volume
+#   #48 Downward API env (fieldRef metadata.name/spec.nodeName, resourceFieldRef)
+#   #50 readiness, liveness, and startup HTTP probes
+#   #51 ServiceAccount (serviceAccountName -> projected kube-api-access volume)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  namespace: macvz-p6
+  labels:
+    app: web
+    app.kubernetes.io/part-of: macvz-p6-compat
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+        app.kubernetes.io/part-of: macvz-p6-compat
+    spec:
+      serviceAccountName: web-sa
+      # Land on a MacVz virtual node and tolerate its provider taint.
+      nodeSelector:
+        type: virtual-kubelet
+      tolerations:
+        - key: virtual-kubelet.io/provider
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: web
+          image: busybox:1.36.1
+          # Render /www/index.html from the ConfigMap/Secret/Downward inputs, then
+          # serve it with busybox httpd. The startup banner on stdout gives the
+          # harness a deterministic `kubectl logs` assertion. Secret values are
+          # reported only as present/absent, never printed.
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              echo "macvz-p6 web starting pod=${POD_NAME} node=${NODE_NAME}"
+              mkdir -p /www
+              {
+                echo "greeting=${GREETING}"
+                echo "cfg_app_greeting=${CFG_APP_GREETING:-}"
+                echo "cfg_app_mode=${CFG_APP_MODE:-}"
+                echo "pod=${POD_NAME}"
+                echo "node=${NODE_NAME}"
+                echo "mem_limit_mb=${MEM_LIMIT_MB}"
+                if [ -n "${API_TOKEN:-}" ]; then echo "token_present=yes"; else echo "token_present=no"; fi
+                if [ -r /etc/web/app.conf ]; then echo "configfile_present=yes"; else echo "configfile_present=no"; fi
+                if [ -s /etc/web-secret/api-token ]; then echo "secretfile_present=yes"; else echo "secretfile_present=no"; fi
+              } > /www/index.html
+              exec httpd -f -v -p 8080 -h /www
+          ports:
+            - name: http
+              containerPort: 8080
+          envFrom:
+            # Every valid-name key of web-config, prefixed CFG_ (#46).
+            - configMapRef:
+                name: web-config
+              prefix: CFG_
+          env:
+            # configMapKeyRef (#46)
+            - name: GREETING
+              valueFrom:
+                configMapKeyRef:
+                  name: web-config
+                  key: APP_GREETING
+            # secretKeyRef (#47)
+            - name: API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: web-secret
+                  key: api-token
+            # Downward API fieldRef (#48)
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            # Downward API resourceFieldRef (#48): memory limit in MiB.
+            - name: MEM_LIMIT_MB
+              valueFrom:
+                resourceFieldRef:
+                  containerName: web
+                  resource: limits.memory
+                  divisor: 1Mi
+          volumeMounts:
+            - name: config
+              mountPath: /etc/web
+              readOnly: true
+            - name: secret
+              mountPath: /etc/web-secret
+              readOnly: true
+          # Startup gates the slower first boot; readiness adds the Pod to the
+          # Service only once httpd answers; liveness restarts a wedged container.
+          startupProbe:
+            httpGet:
+              path: /
+              port: http
+            periodSeconds: 2
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: "250m"
+              memory: 256Mi
+            limits:
+              cpu: "500m"
+              memory: 512Mi
+      volumes:
+        - name: config
+          configMap:
+            name: web-config
+        - name: secret
+          secret:
+            secretName: web-secret
+            defaultMode: 0400

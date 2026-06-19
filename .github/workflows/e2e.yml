@@ -50,3 +50,26 @@ jobs:
           name: macvz-e2e-diagnostics
           path: ${{ runner.temp }}/macvz-e2e-diag
           if-no-files-found: ignore
+
+  compat:
+    # P6 workload compatibility fixture (issue #53). Same self-hosted topology as
+    # the e2e job; deploys the multi-Deployment acceptance workload and validates
+    # rollout/status/logs/exec. Needs only one MacVz node (more spread the replicas).
+    runs-on: [self-hosted, macvz-e2e]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run P6 compatibility fixture
+        # The fixture needs an arm64 image with httpd+wget; run.sh defaults to
+        # busybox:1.36.1. Override locally with MACVZ_P6_IMAGE if needed.
+        env:
+          MACVZ_P6_DIAG_DIR: ${{ runner.temp }}/macvz-p6-diag
+        run: make compat
+
+      - name: Upload diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macvz-p6-diagnostics
+          path: ${{ runner.temp }}/macvz-p6-diag
+          if-no-files-found: ignore

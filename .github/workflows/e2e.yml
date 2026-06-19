@@ -1,0 +1,52 @@
+name: E2E (multi-node)
+
+# Multi-node end-to-end suite for MacVz (issue #30).
+#
+# This requires real hardware — a Kubernetes control plane plus 2+ Apple Silicon
+# Macs running macvz-kubelet — which GitHub-hosted runners cannot provide. It is
+# therefore manual (workflow_dispatch) and targets a self-hosted runner that has
+# kubectl configured against the beta topology. See docs/E2E.md for setup.
+
+on:
+  workflow_dispatch:
+    inputs:
+      nodes:
+        description: "Comma-separated MacVz node names (>=2 for cross-node coverage)"
+        required: false
+        default: ""
+      image:
+        description: "arm64 test image (busybox httpd + wget)"
+        required: false
+        default: "alpine:3.20"
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    # Self-hosted runner with kubectl pointed at the beta cluster. Override the
+    # label set to match your runner.
+    runs-on: [self-hosted, macvz-e2e]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run multi-node e2e suite
+        env:
+          MACVZ_E2E: "1"
+          MACVZ_E2E_NODES: ${{ inputs.nodes }}
+          MACVZ_E2E_IMAGE: ${{ inputs.image }}
+          MACVZ_E2E_DIAG_DIR: ${{ runner.temp }}/macvz-e2e-diag
+        run: make e2e
+
+      - name: Upload diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macvz-e2e-diagnostics
+          path: ${{ runner.temp }}/macvz-e2e-diag
+          if-no-files-found: ignore

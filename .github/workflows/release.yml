@@ -1,0 +1,74 @@
+name: Release
+
+# Build, sign, notarize, and publish a darwin/arm64 macvz-kubelet release.
+# Triggered by pushing a version tag (e.g. v0.4.0).
+#
+# Signing and notarization run only when the required secrets are present, so
+# the workflow still produces an (ad-hoc-signed) artifact in forks without them.
+# Configure these repository secrets to enable a full signed+notarized release:
+#   MACOS_CERT_P12_BASE64   base64 of a "Developer ID Application" .p12
+#   MACOS_CERT_PASSWORD     password for that .p12
+#   MACOS_SIGN_IDENTITY     e.g. "Developer ID Application: Name (TEAMID)"
+#   NOTARY_APPLE_ID         Apple ID email for notarytool
+#   NOTARY_TEAM_ID          Apple Developer team ID
+#   NOTARY_PASSWORD         app-specific password for that Apple ID
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-15
+    env:
+      # Job-level so step `if:` guards can read it (secrets aren't readable in
+      # `if` directly).
+      MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # tags needed for `git describe`
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Import signing certificate
+        if: ${{ env.MACOS_CERT_P12_BASE64 != '' }}
+        env:
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN="$RUNNER_TEMP/build.keychain"
+          KEYCHAIN_PW="$(uuidgen)"
+          security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          echo "$MACOS_CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$MACOS_CERT_PASSWORD" \
+            -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PW" "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+      - name: Build, sign, package (and notarize when configured)
+        env:
+          CODESIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          NOTARY_APPLE_ID: ${{ secrets.NOTARY_APPLE_ID }}
+          NOTARY_TEAM_ID: ${{ secrets.NOTARY_TEAM_ID }}
+          NOTARY_PASSWORD: ${{ secrets.NOTARY_PASSWORD }}
+        run: |
+          # Default to ad-hoc signing when no identity secret is configured.
+          export CODESIGN_IDENTITY="${CODESIGN_IDENTITY:--}"
+          ./scripts/macos-release.sh
+
+      - name: Publish release artifacts
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256

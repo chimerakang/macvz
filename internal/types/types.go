@@ -31,4 +31,23 @@ type ContainerSpec struct {
 	CPUMillis int64
 	// MemoryBytes is the memory request/limit in bytes; 0 means unset.
 	MemoryBytes int64
+	// Mounts are the filesystem mounts exposed inside the micro-VM, in the order
+	// they should be applied. The runtime realizes each as a VirtioFS share (or a
+	// guest tmpfs); the provider is responsible for validating sources.
+	Mounts []Mount
+}
+
+// Mount describes one filesystem mount inside the micro-VM. A bind mount shares
+// a host directory into the guest over VirtioFS; a tmpfs mount allocates
+// in-guest memory-backed storage with no host source.
+type Mount struct {
+	// Source is the host path shared into the guest. It is ignored when Tmpfs is
+	// set, and required otherwise.
+	Source string
+	// Target is the absolute mount path inside the micro-VM.
+	Target string
+	// ReadOnly mounts the source read-only in the guest.
+	ReadOnly bool
+	// Tmpfs requests a guest-local tmpfs at Target instead of a host bind mount.
+	Tmpfs bool
 }

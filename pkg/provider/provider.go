@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/chimerakang/macvz/pkg/metrics"
 	"github.com/chimerakang/macvz/pkg/network"
 	"github.com/chimerakang/macvz/pkg/runtime"
 	"github.com/virtual-kubelet/virtual-kubelet/node"
@@ -47,6 +48,15 @@ type Provider struct {
 	// `kubectl get pod -o wide` and topology-aware routing resolve the host. Set
 	// once at startup before the Pod controller runs; treated as immutable after.
 	hostIP string
+
+	// collector builds the node/Pod resource metrics served through the kubelet
+	// stats and resource-metrics endpoints (#25).
+	collector *metrics.Collector
+
+	// volumes is the policy governing which Pod volumes are mounted into
+	// micro-VMs and where ephemeral storage is backed (#26). The zero value is
+	// safe: hostPath disabled, no ephemeral root.
+	volumes VolumePolicy
 }
 
 // Option configures a Provider at construction time.
@@ -67,6 +77,13 @@ func WithPodNetwork(pn PodNetwork) Option {
 // WithHostIP sets the node address reported as each Pod's HostIP.
 func WithHostIP(ip string) Option {
 	return func(p *Provider) { p.hostIP = ip }
+}
+
+// WithVolumePolicy sets the Pod volume policy (#26): the ephemeral storage root
+// and the hostPath allowlist. Without it, hostPath is disabled and emptyDir is
+// rejected for want of a root.
+func WithVolumePolicy(policy VolumePolicy) Option {
+	return func(p *Provider) { p.volumes = policy }
 }
 
 // podState tracks one Pod and the runtime workloads backing its containers.
@@ -104,7 +121,16 @@ func New(nodeName string, rt runtime.Runtime, opts ...Option) *Provider {
 	for _, opt := range opts {
 		opt(p)
 	}
+	if p.collector == nil {
+		p.collector = metrics.NewCollector(nodeName, metrics.DefaultMemorySampler())
+	}
 	return p
+}
+
+// WithCollector overrides the metrics collector, chiefly so tests can inject a
+// fake host memory sampler. Production wiring uses the default in New.
+func WithCollector(c *metrics.Collector) Option {
+	return func(p *Provider) { p.collector = c }
 }
 
 // SetIPAM attaches a Pod IP allocator after construction. The node's Pod CIDR is

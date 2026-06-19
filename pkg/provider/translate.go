@@ -22,14 +22,19 @@ const workloadIDPrefix = "macvz"
 // translates its single container into a runtime ContainerSpec. Unsupported
 // shapes return a clear error so the caller can surface a Kubernetes-facing
 // Failed status rather than silently running a partial workload.
-func translatePod(pod *corev1.Pod) (types.ContainerSpec, error) {
+func translatePod(pod *corev1.Pod, policy VolumePolicy) (types.ContainerSpec, resolvedVolumes, error) {
 	if reasons := unsupportedReasons(pod); len(reasons) > 0 {
-		return types.ContainerSpec{}, fmt.Errorf("unsupported Pod spec: %s", strings.Join(reasons, "; "))
+		return types.ContainerSpec{}, resolvedVolumes{}, fmt.Errorf("unsupported Pod spec: %s", strings.Join(reasons, "; "))
+	}
+	vols, err := resolveVolumes(pod, policy)
+	if err != nil {
+		return types.ContainerSpec{}, resolvedVolumes{}, fmt.Errorf("unsupported Pod spec: %v", err)
 	}
 	c := pod.Spec.Containers[0]
 	spec := translateContainer(pod, c)
 	spec.Name = workloadID(pod.Namespace, pod.Name, c.Name)
-	return spec, nil
+	spec.Mounts = vols.mounts
+	return spec, vols, nil
 }
 
 // unsupportedReasons returns a human-readable reason for every feature in the
@@ -54,12 +59,8 @@ func unsupportedReasons(pod *corev1.Pod) []string {
 		reasons = append(reasons, fmt.Sprintf("restartPolicy %q is not supported yet (only Never is supported in the MVP)", pod.Spec.RestartPolicy))
 	}
 
-	for _, v := range pod.Spec.Volumes {
-		if isDefaultProjectedToken(v) {
-			continue // the auto-mounted service-account token is tolerated (ignored)
-		}
-		reasons = append(reasons, fmt.Sprintf("volume %q is not supported yet (only the default service-account token is tolerated)", v.Name))
-	}
+	// Volume sources are validated by resolveVolumes against the node's volume
+	// policy (#26); the shape checks here stay focused on Pod-level features.
 
 	if pod.Spec.SecurityContext != nil && !isEmptyPodSecurityContext(pod.Spec.SecurityContext) {
 		reasons = append(reasons, "pod-level securityContext is not supported yet")

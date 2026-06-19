@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -33,6 +34,12 @@ type Config struct {
 	// RuntimeBinary is the apple/container CLI to drive (path or PATH-resolved
 	// name). Defaults to "container".
 	RuntimeBinary string `yaml:"runtimeBinary"`
+
+	// RuntimeRosetta enables running linux/amd64 images via Rosetta-for-Linux
+	// translation on Apple Silicon (#27). Disabled by default: only linux/arm64
+	// images run, and amd64-only images fail with an actionable error. Enabling
+	// it requires Rosetta to be installed on the host.
+	RuntimeRosetta bool `yaml:"runtimeRosetta"`
 
 	// LogLevel is the klog verbosity ("info", "debug") or a numeric V level.
 	LogLevel string `yaml:"logLevel"`
@@ -118,6 +125,34 @@ type NodeConfig struct {
 	// reach the node's InternalIP on KubeletPort and trust the serving cert.
 	ServingTLSCertFile string `yaml:"servingTLSCertFile"`
 	ServingTLSKeyFile  string `yaml:"servingTLSKeyFile"`
+
+	// ServingClientCAFile, when set, makes the kubelet HTTPS server require and
+	// verify a client certificate signed by this CA (mutual TLS) for every
+	// logs/exec/portforward/stats request (#28). Point it at the cluster's API
+	// server client CA so only the API server can reach these endpoints. When
+	// empty, the endpoint is unauthenticated and must be restricted by network
+	// (bind address + firewall); macvz-kubelet logs a warning in that case.
+	ServingClientCAFile string `yaml:"servingClientCAFile"`
+
+	// Volumes configures Pod volume support (#26).
+	Volumes VolumesConfig `yaml:"volumes"`
+}
+
+// VolumesConfig governs which Pod volumes MacVz mounts into micro-VMs and where
+// ephemeral storage is backed. hostPath is disabled by default and must be
+// opted into per allowed prefix, so a Pod cannot bind arbitrary host paths into
+// a guest without operator consent.
+type VolumesConfig struct {
+	// Root is the host directory under which per-Pod ephemeral (emptyDir) volumes
+	// are created, as "<root>/<podUID>/<volumeName>". Defaults to
+	// "/var/lib/macvz/volumes".
+	Root string `yaml:"root"`
+
+	// HostPathAllowedPrefixes is the allowlist of absolute host path prefixes a
+	// Pod's hostPath volume may resolve under. Empty (the default) disables
+	// hostPath entirely. A source is admitted only when, after cleaning, it lies
+	// within one of these prefixes.
+	HostPathAllowedPrefixes []string `yaml:"hostPathAllowedPrefixes"`
 }
 
 // TaintConfig is a YAML-friendly node taint.
@@ -158,6 +193,9 @@ func Default() Config {
 			StatusUpdateInterval: "1m",
 			// Standard kubelet API port.
 			KubeletPort: 10250,
+			// Ephemeral volumes live under a dedicated host root; hostPath stays
+			// disabled until an operator allowlists prefixes.
+			Volumes: VolumesConfig{Root: "/var/lib/macvz/volumes"},
 		},
 	}
 }
@@ -309,6 +347,9 @@ func (c Config) Validate() error {
 	if (c.Node.ServingTLSCertFile == "") != (c.Node.ServingTLSKeyFile == "") {
 		return fmt.Errorf("node.servingTLSCertFile and node.servingTLSKeyFile must be set together")
 	}
+	if c.Node.ServingClientCAFile != "" && c.Node.ServingTLSCertFile == "" {
+		return fmt.Errorf("node.servingClientCAFile requires node.servingTLSCertFile/servingTLSKeyFile (client auth needs the serving TLS endpoint)")
+	}
 	if c.Node.PodCIDR != "" {
 		if _, _, err := net.ParseCIDR(c.Node.PodCIDR); err != nil {
 			return fmt.Errorf("node.podCIDR %q is not a valid CIDR: %w", c.Node.PodCIDR, err)
@@ -319,6 +360,26 @@ func (c Config) Validate() error {
 	}
 	if err := c.validatePodNetwork(); err != nil {
 		return err
+	}
+	if err := c.validateVolumes(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateVolumes checks the volume policy: a configured ephemeral root and any
+// hostPath allowlist prefixes must be absolute, cleaned paths so policy checks
+// at admission time compare like with like.
+func (c Config) validateVolumes() error {
+	if r := c.Node.Volumes.Root; r != "" {
+		if !filepath.IsAbs(r) {
+			return fmt.Errorf("node.volumes.root %q must be an absolute path", r)
+		}
+	}
+	for _, p := range c.Node.Volumes.HostPathAllowedPrefixes {
+		if !filepath.IsAbs(p) {
+			return fmt.Errorf("node.volumes.hostPathAllowedPrefixes entry %q must be an absolute path", p)
+		}
 	}
 	return nil
 }

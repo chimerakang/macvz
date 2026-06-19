@@ -18,18 +18,33 @@ kind: ClusterRole
 metadata:
   name: macvz-kubelet
 rules:
-  # Register and maintain the virtual node and its status.
+  # Register the virtual node and read it back (waitForPodCIDR). The Virtual
+  # Kubelet node controller only creates and gets the node; it never deletes it,
+  # so `delete` is intentionally omitted (a stale node is removed by the
+  # operator, not by macvz-kubelet).
   - apiGroups: [""]
-    resources: ["nodes", "nodes/status"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-
-  # Reconcile Pods scheduled to this node and report their status.
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch", "create"]
+  # Maintain the node's status (conditions, addresses, capacity) via patch.
   - apiGroups: [""]
-    resources: ["pods", "pods/status"]
-    verbs: ["get", "list", "watch", "update", "patch", "delete"]
+    resources: ["nodes/status"]
+    verbs: ["get", "patch", "update"]
 
-  # Resolve Pod references (env, projected volumes) via the pod controller's
-  # informers.
+  # Watch Pods scheduled to this node; the pod controller deletes Pods whose
+  # workloads are gone. The Pod *spec* is never written, so update/patch on the
+  # main resource are omitted (status is the separate rule below).
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "delete"]
+  # Report Pod status back to the API server (UpdateStatus).
+  - apiGroups: [""]
+    resources: ["pods/status"]
+    verbs: ["get", "update", "patch"]
+
+  # The upstream pod controller builds informers over these even though MacVz
+  # does not materialize their contents (env valueFrom and configMap/secret
+  # volumes are rejected). Read-only, cluster-wide because Pods may land in any
+  # namespace. See docs/SECURITY.md for scoping guidance.
   - apiGroups: [""]
     resources: ["configmaps", "secrets", "services"]
     verbs: ["get", "list", "watch"]
@@ -39,10 +54,11 @@ rules:
     resources: ["events"]
     verbs: ["create", "patch", "update"]
 
-  # Node heartbeat lease in kube-node-lease.
+  # Node heartbeat lease in kube-node-lease. The v1 lease controller only
+  # creates, gets, and updates the lease, so list/watch/patch/delete are omitted.
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+    verbs: ["get", "create", "update"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

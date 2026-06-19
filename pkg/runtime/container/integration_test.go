@@ -321,6 +321,140 @@ func TestExecIntegration(t *testing.T) {
 	}
 }
 
+// TestStatsIntegration confirms the Stater capability reads real resource usage
+// from a running micro-VM and reports ErrStatsUnavailable for a missing one.
+func TestStatsIntegration(t *testing.T) {
+	if os.Getenv("MACVZ_INTEGRATION") != "1" {
+		t.Skip("set MACVZ_INTEGRATION=1 to run against a real apple/container service")
+	}
+
+	d := New(Config{})
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	if err := d.Ready(ctx); err != nil {
+		t.Fatalf("Ready: %v", err)
+	}
+
+	const image = "docker.io/library/alpine:3.20"
+	if err := d.Pull(ctx, image); err != nil {
+		t.Fatalf("Pull: %v", err)
+	}
+	spec := types.ContainerSpec{Name: "macvz-stats-it", Image: image, Command: []string{"sleep", "120"}}
+	_ = d.Destroy(ctx, spec.Name)
+	id, err := d.Create(ctx, spec)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	t.Cleanup(func() { _ = d.Destroy(context.Background(), id) })
+	if err := d.Start(ctx, id); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// Poll until the VM is running so stats are sampleable.
+	for i := 0; i < 30; i++ {
+		if st, _ := d.Status(ctx, id); st.Phase == runtime.PhaseRunning {
+			break
+		}
+		time.Sleep(time.Second)
+	}
+
+	rs, err := d.Stats(ctx, id)
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if rs.MemoryUsageBytes == 0 {
+		t.Error("expected non-zero memory usage for a running VM")
+	}
+	if rs.MemoryLimitBytes == 0 {
+		t.Error("expected a memory limit for a running VM")
+	}
+	if rs.Timestamp.IsZero() {
+		t.Error("expected a sample timestamp")
+	}
+	t.Logf("stats: cpu=%dns mem=%d/%d bytes net=%d/%d",
+		rs.CPUUsageCoreNanoSeconds, rs.MemoryUsageBytes, rs.MemoryLimitBytes, rs.NetworkRxBytes, rs.NetworkTxBytes)
+
+	// A nonexistent workload has no sampleable stats.
+	if _, err := d.Stats(ctx, "macvz-stats-it-absent"); !errors.Is(err, runtime.ErrStatsUnavailable) {
+		t.Errorf("Stats(absent) err = %v, want ErrStatsUnavailable", err)
+	}
+}
+
+// TestVolumeMountIntegration confirms VirtioFS bind mounts and a guest tmpfs
+// work end-to-end: a read-only host share is readable inside the VM, a
+// read-write share persists a write back to the host, and a tmpfs is writable.
+func TestVolumeMountIntegration(t *testing.T) {
+	if os.Getenv("MACVZ_INTEGRATION") != "1" {
+		t.Skip("set MACVZ_INTEGRATION=1 to run against a real apple/container service")
+	}
+
+	d := New(Config{})
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	if err := d.Ready(ctx); err != nil {
+		t.Fatalf("Ready: %v", err)
+	}
+
+	// A read-only host source with a known file, and a read-write scratch dir.
+	roSrc := t.TempDir()
+	if err := os.WriteFile(roSrc+"/hello.txt", []byte("from-host"), 0o644); err != nil {
+		t.Fatalf("seed ro source: %v", err)
+	}
+	rwSrc := t.TempDir()
+
+	const image = "docker.io/library/alpine:3.20"
+	if err := d.Pull(ctx, image); err != nil {
+		t.Fatalf("Pull: %v", err)
+	}
+	spec := types.ContainerSpec{
+		Name:    "macvz-vol-it",
+		Image:   image,
+		Command: []string{"sleep", "120"},
+		Mounts: []types.Mount{
+			{Source: roSrc, Target: "/ro", ReadOnly: true},
+			{Source: rwSrc, Target: "/rw"},
+			{Target: "/cache", Tmpfs: true},
+		},
+	}
+	_ = d.Destroy(ctx, spec.Name)
+	id, err := d.Create(ctx, spec)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	t.Cleanup(func() { _ = d.Destroy(context.Background(), id) })
+	if err := d.Start(ctx, id); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	for i := 0; i < 30; i++ {
+		if st, _ := d.Status(ctx, id); st.Phase == runtime.PhaseRunning {
+			break
+		}
+		time.Sleep(time.Second)
+	}
+
+	// Read-only share is readable inside the guest.
+	var out strings.Builder
+	if err := d.Exec(ctx, id, []string{"cat", "/ro/hello.txt"}, runtime.ExecIO{Stdout: &out}); err != nil {
+		t.Fatalf("Exec cat /ro/hello.txt: %v", err)
+	}
+	if !strings.Contains(out.String(), "from-host") {
+		t.Errorf("ro mount content = %q, want from-host", out.String())
+	}
+
+	// Read-write share persists a guest write back to the host.
+	if err := d.Exec(ctx, id, []string{"sh", "-c", "echo from-guest > /rw/out.txt"}, runtime.ExecIO{}); err != nil {
+		t.Fatalf("Exec write /rw: %v", err)
+	}
+	if b, err := os.ReadFile(rwSrc + "/out.txt"); err != nil || !strings.Contains(string(b), "from-guest") {
+		t.Errorf("rw mount did not persist to host: data=%q err=%v", string(b), err)
+	}
+
+	// tmpfs is writable inside the guest.
+	if err := d.Exec(ctx, id, []string{"sh", "-c", "echo x > /cache/f && cat /cache/f"}, runtime.ExecIO{}); err != nil {
+		t.Errorf("Exec write tmpfs: %v", err)
+	}
+}
+
 // TestArchVerificationIntegration confirms an arm64 image pulls and boots, and a
 // non-arm64 image is rejected with a clear ErrIncompatibleArch — both at Pull
 // (inspect-based) and at Create (auto-pull path).
@@ -370,5 +504,49 @@ func TestArchVerificationIntegration(t *testing.T) {
 	t.Cleanup(func() { _ = d.Destroy(context.Background(), "macvz-arch-amd64") })
 	if !errors.Is(err, runtime.ErrIncompatibleArch) {
 		t.Errorf("Create(amd64) err = %v, want ErrIncompatibleArch", err)
+	}
+}
+
+// TestRosettaIntegration confirms that, with Rosetta enabled, an amd64-only
+// image pulls, boots, and reports an x86_64 guest architecture.
+func TestRosettaIntegration(t *testing.T) {
+	if os.Getenv("MACVZ_INTEGRATION") != "1" {
+		t.Skip("set MACVZ_INTEGRATION=1 to run against a real apple/container service")
+	}
+
+	d := New(Config{Rosetta: true})
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	if err := d.Ready(ctx); err != nil {
+		t.Fatalf("Ready: %v", err)
+	}
+
+	const amd64Image = "docker.io/amd64/alpine:3.20"
+	if err := d.Pull(ctx, amd64Image); err != nil {
+		t.Fatalf("Pull(amd64) with Rosetta should succeed: %v", err)
+	}
+	spec := types.ContainerSpec{Name: "macvz-rosetta", Image: amd64Image, Command: []string{"sleep", "60"}}
+	_ = d.Destroy(ctx, spec.Name)
+	id, err := d.Create(ctx, spec)
+	if err != nil {
+		t.Fatalf("Create(amd64) with Rosetta: %v", err)
+	}
+	t.Cleanup(func() { _ = d.Destroy(context.Background(), id) })
+	if err := d.Start(ctx, id); err != nil {
+		t.Fatalf("Start(amd64) with Rosetta: %v", err)
+	}
+	for i := 0; i < 30; i++ {
+		if st, _ := d.Status(ctx, id); st.Phase == runtime.PhaseRunning {
+			break
+		}
+		time.Sleep(time.Second)
+	}
+
+	var out strings.Builder
+	if err := d.Exec(ctx, id, []string{"uname", "-m"}, runtime.ExecIO{Stdout: &out}); err != nil {
+		t.Fatalf("Exec uname -m: %v", err)
+	}
+	if got := strings.TrimSpace(out.String()); got != "x86_64" {
+		t.Errorf("guest arch = %q, want x86_64 (amd64 via Rosetta)", got)
 	}
 }

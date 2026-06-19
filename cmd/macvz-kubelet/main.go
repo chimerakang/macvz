@@ -80,11 +80,12 @@ func run(ctx context.Context, configPath, runtimeBinary string) error {
 		"node", cfg.NodeName,
 		"runtimeSocket", cfg.RuntimeSocket,
 		"runtimeBinary", bin,
+		"rosetta", cfg.RuntimeRosetta,
 		"logLevel", cfg.LogLevel,
 	)
 
 	// Build the apple/container driver and report runtime readiness (P1).
-	driver := container.New(container.Config{Binary: bin})
+	driver := container.New(container.Config{Binary: bin, Rosetta: cfg.RuntimeRosetta})
 	if err := driver.Ready(ctx); err != nil {
 		klog.ErrorS(err, "apple/container runtime is not ready",
 			"hint", "ensure the binary is installed and `container system start` has been run")
@@ -109,7 +110,13 @@ func run(ctx context.Context, configPath, runtimeBinary string) error {
 
 	// Construct the provider over the runtime driver. The node's reachable
 	// address is reported as each Pod's HostIP so Services/`-o wide` resolve it.
-	p := provider.New(cfg.NodeName, driver, provider.WithHostIP(internalIP))
+	p := provider.New(cfg.NodeName, driver,
+		provider.WithHostIP(internalIP),
+		provider.WithVolumePolicy(provider.VolumePolicy{
+			Root:                    cfg.Node.Volumes.Root,
+			HostPathAllowedPrefixes: cfg.Node.Volumes.HostPathAllowedPrefixes,
+		}),
+	)
 
 	// Resolve the configured node shape (capacity/taints validated at load).
 	capacity, err := cfg.Capacity()
@@ -228,7 +235,7 @@ func run(ctx context.Context, configPath, runtimeBinary string) error {
 	defer stopPods()
 
 	// Start the kubelet API server for kubectl logs/exec (no-op without certs).
-	stopServer, err := startKubeletServer(ctx, cfg, p)
+	stopServer, err := startKubeletServer(ctx, cfg, p, internalIP)
 	if err != nil {
 		return fmt.Errorf("start kubelet server: %w", err)
 	}

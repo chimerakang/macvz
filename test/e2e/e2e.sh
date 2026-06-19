@@ -15,8 +15,8 @@
 #   KUBECONFIG            Cluster credentials (standard kubectl resolution).
 #   MACVZ_E2E_NODES       Comma-separated MacVz node names. Default: auto-detect
 #                         nodes labeled type=virtual-kubelet.
-#   MACVZ_E2E_IMAGE       arm64 image providing busybox httpd + wget.
-#                         Default: alpine:3.20.
+#   MACVZ_E2E_IMAGE       arm64 image providing sh, httpd, and wget.
+#                         Default: busybox:1.36.1.
 #   MACVZ_E2E_NAMESPACE   Namespace for test objects. Default: macvz-e2e.
 #   MACVZ_E2E_DIAG_DIR    Directory for failure diagnostics. Default: a mktemp dir.
 #   MACVZ_E2E_TIMEOUT     Per-wait timeout (seconds). Default: 120.
@@ -24,7 +24,7 @@ set -uo pipefail
 
 KUBECTL="${KUBECTL:-kubectl}"
 NS="${MACVZ_E2E_NAMESPACE:-macvz-e2e}"
-IMAGE="${MACVZ_E2E_IMAGE:-alpine:3.20}"
+IMAGE="${MACVZ_E2E_IMAGE:-busybox:1.36.1}"
 TIMEOUT="${MACVZ_E2E_TIMEOUT:-120}"
 PROVIDER_TAINT_KEY="virtual-kubelet.io/provider"
 
@@ -226,8 +226,8 @@ spec:
       image: $IMAGE
       command: ["sh", "-c", "$cmd"]
       resources:
-        requests: { cpu: "250m", memory: 64Mi }
-        limits:   { cpu: "500m", memory: 128Mi }
+        requests: { cpu: "250m", memory: 256Mi }
+        limits:   { cpu: "500m", memory: 256Mi }
 EOF
 }
 
@@ -250,8 +250,8 @@ spec:
       command: ["sh", "-c", "mkdir -p /w && echo $marker > /w/index.html && httpd -f -p 8080 -h /w"]
       ports: [ { containerPort: 8080 } ]
       resources:
-        requests: { cpu: "250m", memory: 64Mi }
-        limits:   { cpu: "500m", memory: 128Mi }
+        requests: { cpu: "250m", memory: 256Mi }
+        limits:   { cpu: "500m", memory: 256Mi }
 EOF
 }
 

@@ -73,6 +73,36 @@ func TestResolveEmptyDirNeedsRoot(t *testing.T) {
 	}
 }
 
+func TestResolveEmptyDirRejectsRelativeRoot(t *testing.T) {
+	pod := volPod("uid-1",
+		[]corev1.Volume{{Name: "scratch", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}}},
+		[]corev1.VolumeMount{{Name: "scratch", MountPath: "/data"}},
+	)
+	if _, err := resolveVolumes(pod, VolumePolicy{Root: "relative"}); err == nil || !strings.Contains(err.Error(), "not absolute") {
+		t.Errorf("expected relative-root rejection, got %v", err)
+	}
+}
+
+func TestResolveEmptyDirRejectsMissingPodUID(t *testing.T) {
+	pod := volPod("",
+		[]corev1.Volume{{Name: "scratch", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}}},
+		[]corev1.VolumeMount{{Name: "scratch", MountPath: "/data"}},
+	)
+	if _, err := resolveVolumes(pod, VolumePolicy{Root: "/var/lib/macvz/volumes"}); err == nil || !strings.Contains(err.Error(), "Pod UID") {
+		t.Errorf("expected missing-UID rejection, got %v", err)
+	}
+}
+
+func TestResolveEmptyDirRejectsPodUIDEscape(t *testing.T) {
+	pod := volPod("..",
+		[]corev1.Volume{{Name: "scratch", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}}},
+		[]corev1.VolumeMount{{Name: "scratch", MountPath: "/data"}},
+	)
+	if _, err := resolveVolumes(pod, VolumePolicy{Root: "/var/lib/macvz/volumes"}); err == nil || !strings.Contains(err.Error(), "escapes volume root") {
+		t.Errorf("expected UID escape rejection, got %v", err)
+	}
+}
+
 func TestResolveHostPathDisabledByDefault(t *testing.T) {
 	pod := volPod("uid-1",
 		[]corev1.Volume{{Name: "h", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/srv/data"}}}},
@@ -183,6 +213,21 @@ func TestCreatePodMaterializesEmptyDirAndDeleteCleansUp(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(root, "uid-1")); !os.IsNotExist(err) {
 		t.Errorf("expected Pod volume root to be removed on delete, stat err = %v", err)
+	}
+}
+
+func TestCleanupVolumeDirsRefusesMissingPodUID(t *testing.T) {
+	root := t.TempDir()
+	keep := filepath.Join(root, "keep")
+	if err := os.MkdirAll(keep, 0o770); err != nil {
+		t.Fatalf("mkdir keep: %v", err)
+	}
+	p := New("mac-1", newRecordingRuntime(), WithVolumePolicy(VolumePolicy{Root: root}))
+
+	p.cleanupVolumeDirs(volPod("", nil, nil))
+
+	if fi, err := os.Stat(keep); err != nil || !fi.IsDir() {
+		t.Fatalf("cleanup with empty UID removed unrelated root content: %v", err)
 	}
 }
 

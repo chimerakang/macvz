@@ -24,14 +24,6 @@ type VolumePolicy struct {
 	HostPathAllowedPrefixes []string
 }
 
-// podRoot returns the host directory holding this Pod's ephemeral volumes.
-func (vp VolumePolicy) podRoot(podUID string) string {
-	if vp.Root == "" {
-		return ""
-	}
-	return filepath.Join(vp.Root, podUID)
-}
-
 // resolvedVolumes is the outcome of translating a Pod's volumes: the mounts to
 // pass to the runtime, and the host directories that must exist before the VM
 // starts (emptyDir backing dirs, created on CreatePod and removed on DeletePod).
@@ -99,6 +91,9 @@ func validateVolumeSource(v corev1.Volume, policy VolumePolicy) error {
 		if policy.Root == "" {
 			return fmt.Errorf("volume %q is an emptyDir, but no ephemeral volume root is configured (set node.volumes.root)", v.Name)
 		}
+		if !filepath.IsAbs(policy.Root) {
+			return fmt.Errorf("volume %q is an emptyDir, but node.volumes.root %q is not absolute", v.Name, policy.Root)
+		}
 		return nil
 	default:
 		return fmt.Errorf("volume %q uses an unsupported source type (only hostPath and emptyDir are supported in the beta)", v.Name)
@@ -152,7 +147,10 @@ func resolveMount(pod *corev1.Pod, vol corev1.Volume, vm corev1.VolumeMount, pol
 		if vol.EmptyDir.Medium == corev1.StorageMediumMemory {
 			return types.Mount{Target: target, Tmpfs: true}, "", nil
 		}
-		dir := filepath.Join(policy.podRoot(string(pod.UID)), vm.Name)
+		dir, err := safeVolumeDir(policy.Root, string(pod.UID), vm.Name)
+		if err != nil {
+			return types.Mount{}, "", err
+		}
 		return types.Mount{
 			Source:   dir,
 			Target:   target,
@@ -176,6 +174,47 @@ func withinAllowedPrefix(clean string, prefixes []string) bool {
 		}
 	}
 	return false
+}
+
+// safePodRoot returns the per-Pod volume directory, rejecting empty or escaping
+// identities before any filesystem operation can target the volume root itself
+// or a path outside it.
+func safePodRoot(root, podUID string) (string, error) {
+	if root == "" {
+		return "", fmt.Errorf("emptyDir volume root is not configured")
+	}
+	if podUID == "" {
+		return "", fmt.Errorf("emptyDir volumes require a non-empty Pod UID")
+	}
+	return safeJoinUnderRoot(root, podUID)
+}
+
+func safeVolumeDir(root, podUID, volumeName string) (string, error) {
+	if volumeName == "" {
+		return "", fmt.Errorf("emptyDir volume name must not be empty")
+	}
+	podRoot, err := safePodRoot(root, podUID)
+	if err != nil {
+		return "", err
+	}
+	return safeJoinUnderRoot(podRoot, volumeName)
+}
+
+func safeJoinUnderRoot(root string, elems ...string) (string, error) {
+	cleanRoot := filepath.Clean(root)
+	if !filepath.IsAbs(cleanRoot) {
+		return "", fmt.Errorf("volume root %q must be absolute", root)
+	}
+	parts := append([]string{cleanRoot}, elems...)
+	joined := filepath.Clean(filepath.Join(parts...))
+	rel, err := filepath.Rel(cleanRoot, joined)
+	if err != nil {
+		return "", fmt.Errorf("resolve volume path %q under %q: %w", joined, cleanRoot, err)
+	}
+	if rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return "", fmt.Errorf("resolved volume path %q escapes volume root %q", joined, cleanRoot)
+	}
+	return joined, nil
 }
 
 // hostPathType returns the volume's hostPath type, defaulting to unset.
@@ -202,8 +241,9 @@ func (p *Provider) ensureVolumeDirs(dirs []string) error {
 // a failure to remove scratch storage is logged, not surfaced, so it never
 // blocks Pod deletion. hostPath sources are never touched.
 func (p *Provider) cleanupVolumeDirs(pod *corev1.Pod) {
-	root := p.volumes.podRoot(string(pod.UID))
-	if root == "" {
+	root, err := safePodRoot(p.volumes.Root, string(pod.UID))
+	if err != nil {
+		klog.ErrorS(err, "refusing to remove Pod ephemeral volume dir", "pod", podKey(pod.Namespace, pod.Name))
 		return
 	}
 	if err := os.RemoveAll(root); err != nil {

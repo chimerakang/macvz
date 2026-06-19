@@ -1,8 +1,10 @@
 package provider
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -22,16 +24,30 @@ const workloadIDPrefix = "macvz"
 // translates its single container into a runtime ContainerSpec. Unsupported
 // shapes return a clear error so the caller can surface a Kubernetes-facing
 // Failed status rather than silently running a partial workload.
-func translatePod(pod *corev1.Pod, policy VolumePolicy, dns DNSConfig) (types.ContainerSpec, resolvedVolumes, error) {
+func translatePod(ctx context.Context, pod *corev1.Pod, policy VolumePolicy, dns DNSConfig, cms ConfigMapGetter, secrets SecretGetter, tokens TokenRequester) (types.ContainerSpec, resolvedVolumes, error) {
 	if reasons := unsupportedReasons(pod); len(reasons) > 0 {
 		return types.ContainerSpec{}, resolvedVolumes{}, fmt.Errorf("unsupported Pod spec: %s", strings.Join(reasons, "; "))
 	}
-	vols, err := resolveVolumes(pod, policy)
+	vols, err := resolveVolumes(ctx, pod, policy, cms, secrets, tokens)
 	if err != nil {
+		// An unresolved ConfigMap/Secret dependency (errConfigPending /
+		// errSecretUnavailable) must propagate untouched so CreatePod can
+		// distinguish "retry later" from a terminal "unsupported" shape; only wrap
+		// the unsupported-volume case.
+		if errors.Is(err, errConfigPending) || errors.Is(err, errSecretUnavailable) {
+			return types.ContainerSpec{}, resolvedVolumes{}, err
+		}
 		return types.ContainerSpec{}, resolvedVolumes{}, fmt.Errorf("unsupported Pod spec: %v", err)
 	}
 	c := pod.Spec.Containers[0]
 	spec := translateContainer(pod, c)
+	env, err := resolveEnv(pod, c, cms, secrets)
+	if err != nil {
+		return types.ContainerSpec{}, resolvedVolumes{}, err
+	}
+	if env != nil {
+		spec.Env = env
+	}
 	spec.Name = workloadID(pod.Namespace, pod.Name, c.Name)
 	spec.Mounts = vols.mounts
 	spec.DNS, spec.DNSSearch, spec.DNSOptions = resolveDNS(pod, dns)
@@ -56,16 +72,24 @@ func unsupportedReasons(pod *corev1.Pod) []string {
 	if n := len(pod.Spec.EphemeralContainers); n > 0 {
 		reasons = append(reasons, fmt.Sprintf("ephemeral containers are not supported yet (found %d)", n))
 	}
-	if pod.Spec.RestartPolicy != "" && pod.Spec.RestartPolicy != corev1.RestartPolicyNever {
-		reasons = append(reasons, fmt.Sprintf("restartPolicy %q is not supported yet (only Never is supported in the MVP)", pod.Spec.RestartPolicy))
+	// All three Kubernetes restart policies are honored: Always and OnFailure
+	// drive the provider's micro-VM restart loop (see restart.go), Never leaves a
+	// terminated workload terminal. Only an unrecognized value is rejected; the
+	// API server defaults an unset policy to Always before the Pod reaches us.
+	switch pod.Spec.RestartPolicy {
+	case "", corev1.RestartPolicyAlways, corev1.RestartPolicyOnFailure, corev1.RestartPolicyNever:
+	default:
+		reasons = append(reasons, fmt.Sprintf("restartPolicy %q is not a recognized value (use Always, OnFailure, or Never)", pod.Spec.RestartPolicy))
 	}
 
 	// Volume sources are validated by resolveVolumes against the node's volume
 	// policy (#26); the shape checks here stay focused on Pod-level features.
 
-	if pod.Spec.SecurityContext != nil && !isEmptyPodSecurityContext(pod.Spec.SecurityContext) {
-		reasons = append(reasons, "pod-level securityContext is not supported yet")
-	}
+	// securityContext is honored field-by-field (#52): supported fields are mapped
+	// onto the runtime in translateContainer, and unsupported ones are rejected
+	// here with a precise reason instead of silently no-opping.
+	reasons = append(reasons, securityContextReasons(pod)...)
+
 	if pod.Spec.HostNetwork {
 		reasons = append(reasons, "hostNetwork is not supported")
 	}
@@ -76,19 +100,11 @@ func unsupportedReasons(pod *corev1.Pod) []string {
 		reasons = append(reasons, "hostIPC is not supported")
 	}
 
-	for _, c := range pod.Spec.Containers {
-		if c.SecurityContext != nil {
-			reasons = append(reasons, fmt.Sprintf("container %q securityContext is not supported yet", c.Name))
-		}
-		if len(c.EnvFrom) > 0 {
-			reasons = append(reasons, fmt.Sprintf("container %q envFrom is not supported yet", c.Name))
-		}
-		for _, e := range c.Env {
-			if e.ValueFrom != nil {
-				reasons = append(reasons, fmt.Sprintf("container %q env %q uses valueFrom, which is not supported yet", c.Name, e.Name))
-			}
-		}
-	}
+	// env/envFrom sources — ConfigMap (#46), Secret (#47), and the downward-API
+	// sources fieldRef/resourceFieldRef (#48) — are all resolved in resolveEnv,
+	// which surfaces a precise error for an unsupported fieldRef path (e.g.
+	// status.podIP) or a missing required ConfigMap/Secret. No shape rejection is
+	// needed here.
 
 	return reasons
 }
@@ -119,6 +135,11 @@ func translateContainer(pod *corev1.Pod, c corev1.Container) types.ContainerSpec
 	if mem := resourceQuantity(c, corev1.ResourceMemory); mem != nil {
 		spec.MemoryBytes = mem.Value()
 	}
+
+	// securityContext: map the supported fields (user/group, read-only root,
+	// capabilities) onto the spec. Unsupported fields are already rejected by
+	// unsupportedReasons, so the Pod never reaches here with one (#52).
+	applySecurityContext(pod, c, &spec)
 	return spec
 }
 
@@ -178,24 +199,6 @@ func isDefaultProjectedToken(v corev1.Volume) bool {
 		}
 	}
 	return false
-}
-
-// isEmptyPodSecurityContext reports whether a pod securityContext carries no
-// meaningful settings. kubectl run leaves it nil, but other tooling may attach
-// an empty struct that should not trip the unsupported check.
-func isEmptyPodSecurityContext(sc *corev1.PodSecurityContext) bool {
-	if sc == nil {
-		return true
-	}
-	return sc.RunAsUser == nil &&
-		sc.RunAsGroup == nil &&
-		sc.RunAsNonRoot == nil &&
-		sc.FSGroup == nil &&
-		sc.SELinuxOptions == nil &&
-		sc.WindowsOptions == nil &&
-		len(sc.SupplementalGroups) == 0 &&
-		len(sc.Sysctls) == 0 &&
-		sc.SeccompProfile == nil
 }
 
 // resourceQuantity returns the limit for a resource, falling back to the

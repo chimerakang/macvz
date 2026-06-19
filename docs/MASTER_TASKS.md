@@ -85,15 +85,15 @@ As of 2026-06-19, `main` has passed the two-node baseline described in
 | #42 | Add mesh peer reconciliation for adding/removing MacVz nodes without full restart | P5 | in progress |
 | #43 | Extend e2e diagnostics for WireGuard handshakes, routes, pf anchors, and forwarding state | P5 | in progress |
 | #44 | Document full privileged networking setup and recovery procedures | P5 | done — [docs/PRIVILEGED_NETWORKING.md](PRIVILEGED_NETWORKING.md) |
-| #45 | Support restartPolicy Always and controller-managed workload expectations | P6 | planned |
-| #46 | Support ConfigMap-backed environment variables and volume mounts | P6 | planned |
-| #47 | Support Secret-backed environment variables and volume mounts | P6 | planned |
-| #48 | Support envFrom, valueFrom, fieldRef, and resourceFieldRef translation | P6 | planned |
-| #49 | Support imagePullSecrets and private registry authentication | P6 | planned |
-| #50 | Implement readiness, liveness, and startup probe handling | P6 | planned |
-| #51 | Improve ServiceAccount token projection and in-cluster API compatibility | P6 | planned |
-| #52 | Define supported and unsupported securityContext behavior for MacVz Pods | P6 | planned |
-| #53 | Build a multi-Deployment compatibility fixture for rollout validation | P6 | planned |
+| #45 | Support restartPolicy Always and controller-managed workload expectations | P6 | in progress — restart loop + docs in [docs/WORKLOADS.md](WORKLOADS.md) |
+| #46 | Support ConfigMap-backed environment variables and volume mounts | P6 | in progress — env + volume projection, docs in [docs/WORKLOADS.md](WORKLOADS.md) |
+| #47 | Support Secret-backed environment variables and volume mounts | P6 | in progress — `secretKeyRef`/`envFrom secretRef` env + read-only `secret` volume projection (items, modes, optional), values never logged; tests in `pkg/provider/secrets_test.go`, docs in [docs/WORKLOADS.md](WORKLOADS.md) |
+| #48 | Support envFrom, valueFrom, fieldRef, and resourceFieldRef translation | P6 | in progress — unified env resolver covers `envFrom` precedence, literal `$(VAR)` expansion, `fieldRef` metadata/spec paths, and `resourceFieldRef` CPU/memory/ephemeral-storage divisors; tests in `pkg/provider/downward_test.go`, fixture coverage in [test/e2e/p6-compat](../test/e2e/p6-compat/) |
+| #49 | Support imagePullSecrets and private registry authentication | P6 | in progress — dockerconfigjson pull secrets resolved per Pod, registry login/pull/logout in the driver, docs in [docs/WORKLOADS.md](WORKLOADS.md) |
+| #50 | Implement readiness, liveness, and startup probe handling | P6 | in progress — exec/HTTP/TCP probes gate readiness, restart on liveness failure, startup gating; docs in [docs/WORKLOADS.md](WORKLOADS.md) |
+| #51 | Improve ServiceAccount token projection and in-cluster API compatibility | P6 | in progress — projected kube-api-access volume (bound token via TokenRequest, cluster CA, namespace) materialized at the standard path, docs in [docs/WORKLOADS.md](WORKLOADS.md) |
+| #52 | Define supported and unsupported securityContext behavior for MacVz Pods | P6 | in progress — field-by-field policy: maps `runAsUser`/`runAsGroup`/`readOnlyRootFilesystem`/`capabilities` onto runtime flags, accepts VM-isolation no-ops, rejects `privileged`/`seLinux`/`Localhost` seccomp+appArmor/`procMount`/`sysctls` terminally; tests in `pkg/provider/securitycontext_test.go` + `pkg/runtime/container/driver_test.go`, model in [README](../README.md) and [docs/WORKLOADS.md](WORKLOADS.md) |
+| #53 | Build a multi-Deployment compatibility fixture for rollout validation | P6 | in progress — P6 acceptance workload under [test/e2e/p6-compat/](../test/e2e/p6-compat/) (web + checker Deployments, ConfigMap/Secret/probe/ServiceAccount/Downward coverage), `run.sh` validates rollout/status/logs/exec/Service with redacted diagnostics; `make compat` + CI `compat` job |
 | #54 | Create a node bootstrap/join command or documented workflow | P7 | planned |
 | #55 | Automate WireGuard key generation, public key exchange, and config rendering | P7 | planned |
 | #56 | Add node health and readiness diagnostics across runtime, provider, mesh, and pod network | P7 | planned |

@@ -16,7 +16,7 @@ import (
 // treats it as readiness-unknown (assumed ready).
 type fakeRuntime struct{}
 
-func (fakeRuntime) Pull(context.Context, string) error                          { return nil }
+func (fakeRuntime) Pull(context.Context, string, *runtime.RegistryAuth) error   { return nil }
 func (fakeRuntime) Create(context.Context, types.ContainerSpec) (string, error) { return "", nil }
 func (fakeRuntime) Start(context.Context, string) error                         { return nil }
 func (fakeRuntime) Stop(context.Context, string, time.Duration) error           { return nil }

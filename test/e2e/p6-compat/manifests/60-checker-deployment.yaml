@@ -1,0 +1,73 @@
+# The checker Deployment is the second workload. It continuously fetches the web
+# Service by its cluster DNS name and gates its OWN readiness on success, so a
+# green checker proves the full path: cluster DNS resolution, ClusterIP Service
+# routing into the micro-VM (#37), and that web actually served its rendered page.
+#
+# Features exercised: a second Deployment (#45/#53), ConfigMap env via
+# configMapKeyRef (#46), the shared ServiceAccount (#51), and an exec
+# readinessProbe (#50).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: checker
+  namespace: macvz-p6
+  labels:
+    app: checker
+    app.kubernetes.io/part-of: macvz-p6-compat
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: checker
+  template:
+    metadata:
+      labels:
+        app: checker
+        app.kubernetes.io/part-of: macvz-p6-compat
+    spec:
+      serviceAccountName: web-sa
+      nodeSelector:
+        type: virtual-kubelet
+      tolerations:
+        - key: virtual-kubelet.io/provider
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: checker
+          image: busybox:1.36.1
+          # Poll the web Service. On success, cache the body in /tmp/last and
+          # touch /tmp/ready; on failure, drop /tmp/ready so readiness flips false.
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -u
+              echo "macvz-p6 checker starting target=${CHECK_URL}"
+              while true; do
+                if wget -qO- "${CHECK_URL}" > /tmp/last 2>/dev/null && [ -s /tmp/last ]; then
+                  : > /tmp/ready
+                else
+                  rm -f /tmp/ready
+                fi
+                sleep 5
+              done
+          env:
+            - name: CHECK_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: checker-config
+                  key: CHECK_URL
+          # Ready only once the web Service has been successfully reached.
+          readinessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "test -f /tmp/ready"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: "100m"
+              memory: 256Mi
+            limits:
+              cpu: "250m"
+              memory: 256Mi

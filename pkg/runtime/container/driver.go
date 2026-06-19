@@ -21,6 +21,7 @@ import (
 
 	"github.com/chimerakang/macvz/internal/types"
 	"github.com/chimerakang/macvz/pkg/runtime"
+	"k8s.io/klog/v2"
 )
 
 // DefaultBinary is the CLI invoked when Config.Binary is empty. It is a bare
@@ -91,15 +92,57 @@ func (d *Driver) Ready(ctx context.Context) error {
 // with no bootable variant pulls without error but is rejected here with a
 // clear ErrIncompatibleArch, rather than failing later with the runtime's
 // cryptic create-time message.
-func (d *Driver) Pull(ctx context.Context, image string) error {
+//
+// When auth is non-nil the pull authenticates against the registry: apple/container
+// has no inline pull credentials, so the driver logs in to the registry (password
+// over stdin, never argv), pulls, then logs out again so the credential does not
+// linger in the runtime's credential store beyond the pull (#49). The
+// login/pull/logout sequence is serialized per registry server, since the login
+// is global runtime state two concurrent pulls would otherwise race.
+func (d *Driver) Pull(ctx context.Context, image string, auth *runtime.RegistryAuth) error {
 	if image == "" {
 		return fmt.Errorf("pull: image reference is empty")
+	}
+	if auth != nil && auth.Server != "" {
+		defer d.locks.lock("registry:" + auth.Server)()
+		if err := d.registryLogin(ctx, auth); err != nil {
+			return fmt.Errorf("pull %q: %w", image, err)
+		}
+		// Best-effort logout: the image is already in the local store, so a failed
+		// logout must not fail the pull, but it is logged so a lingering credential
+		// is visible. nil-context guard keeps logout running even if ctx is done.
+		defer d.registryLogout(image, auth)
 	}
 	if _, err := d.run.output(ctx, "image", "pull", image); err != nil {
 		return fmt.Errorf("pull %q: %w", image, mapErr(err))
 	}
 	_, err := d.selectPlatform(ctx, image)
 	return err
+}
+
+// registryLogin authenticates against auth.Server using the apple/container
+// `registry login` command. The password is supplied on stdin via
+// `--password-stdin` so it never appears in process arguments or logs.
+func (d *Driver) registryLogin(ctx context.Context, auth *runtime.RegistryAuth) error {
+	args := []string{"registry", "login", "--username", auth.Username, "--password-stdin", auth.Server}
+	s := streams{Stdin: strings.NewReader(auth.Password)}
+	if err := d.run.run(ctx, s, args...); err != nil {
+		// mapErr is applied, but the credential is never part of the args/stderr the
+		// CLI echoes, so the wrapped error is safe to surface.
+		return fmt.Errorf("authenticate to registry %q: %w", auth.Server, mapErr(err))
+	}
+	return nil
+}
+
+// registryLogout drops the credential established by registryLogin. It is
+// best-effort and detached from the pull's context so cancellation of the pull
+// still clears the login; failures are reported through the caller's logging.
+func (d *Driver) registryLogout(image string, auth *runtime.RegistryAuth) {
+	if _, err := d.run.output(context.Background(), "registry", "logout", auth.Server); err != nil {
+		// Logged, not returned: the pull succeeded and the credential, if it
+		// lingers, is in the runtime's own store (not a repo-controlled path).
+		logPullSecretWarning(image, auth.Server, err)
+	}
 }
 
 // imageInspect is the subset of `container image inspect` JSON used to confirm
@@ -180,6 +223,13 @@ func (d *Driver) selectPlatform(ctx context.Context, image string) (platformChoi
 		runtime.ErrIncompatibleArch, image, targetOS, targetArch, rosettaSuffix(d.rosetta), strings.Join(found, ", "))
 }
 
+// logPullSecretWarning reports a failed registry logout without exposing any
+// credential: only the image, the registry server, and the runtime error.
+func logPullSecretWarning(image, server string, err error) {
+	klog.V(2).InfoS("registry logout after authenticated pull failed; credential may linger in the runtime store",
+		"image", image, "registry", server, "err", err)
+}
+
 // rosettaSuffix names the amd64 fallback in error messages when Rosetta is on.
 func rosettaSuffix(rosetta bool) string {
 	if rosetta {
@@ -247,6 +297,22 @@ func (d *Driver) Create(ctx context.Context, spec types.ContainerSpec) (string, 
 		const miB = 1024 * 1024
 		mib := (spec.MemoryBytes + miB - 1) / miB
 		args = append(args, "--memory", strconv.FormatInt(mib, 10)+"M")
+	}
+
+	// securityContext (#52): run as a specific user/group, a read-only root
+	// filesystem, and Linux capability adjustments, all of which apple/container
+	// exposes as create flags.
+	if spec.User != "" {
+		args = append(args, "--user", spec.User)
+	}
+	if spec.ReadOnlyRootFS {
+		args = append(args, "--read-only")
+	}
+	for _, c := range spec.CapAdd {
+		args = append(args, "--cap-add", c)
+	}
+	for _, c := range spec.CapDrop {
+		args = append(args, "--cap-drop", c)
 	}
 
 	// Filesystem mounts, in spec order. A tmpfs is guest-local; a bind mount

@@ -26,6 +26,7 @@ type recordingRuntime struct {
 	statuses map[string]runtime.Status // id -> status to report
 
 	pulls        []string
+	pullAuths    []*runtime.RegistryAuth // auth passed to Pull, parallel to pulls
 	createdSpecs []types.ContainerSpec
 	startedIDs   []string
 	stoppedIDs   []string
@@ -54,10 +55,11 @@ func newRecordingRuntime() *recordingRuntime {
 	}
 }
 
-func (r *recordingRuntime) Pull(_ context.Context, image string) error {
+func (r *recordingRuntime) Pull(_ context.Context, image string, auth *runtime.RegistryAuth) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.pulls = append(r.pulls, image)
+	r.pullAuths = append(r.pullAuths, auth)
 	return r.pullErr
 }
 
@@ -161,8 +163,19 @@ func testPod(containers ...string) *corev1.Pod {
 	}
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "p1"},
-		Spec:       corev1.PodSpec{Containers: cs},
+		// Default fixtures use restartPolicy Never so a terminated workload stays
+		// terminal; tests that exercise the restart loop (#45) set Always/OnFailure
+		// explicitly via restartTestPod.
+		Spec: corev1.PodSpec{RestartPolicy: corev1.RestartPolicyNever, Containers: cs},
 	}
+}
+
+// restartTestPod is testPod with an explicit restart policy, for exercising the
+// micro-VM restart loop (#45).
+func restartTestPod(policy corev1.RestartPolicy, containers ...string) *corev1.Pod {
+	pod := testPod(containers...)
+	pod.Spec.RestartPolicy = policy
+	return pod
 }
 
 func newTestProvider() (*Provider, *recordingRuntime) {
@@ -188,6 +201,68 @@ func TestCreatePodLaunchesContainer(t *testing.T) {
 	}
 	if len(got.Status.ContainerStatuses) != 1 {
 		t.Errorf("container statuses = %d, want 1", len(got.Status.ContainerStatuses))
+	}
+}
+
+func TestCreatePodResolvesImagePullSecret(t *testing.T) {
+	rt := newRecordingRuntime()
+	body := `{"auths":{"registry.example.com":{"username":"alice","password":"s3cret"}}}`
+	getter := fakeSecretGetter{secrets: map[string]*corev1.Secret{
+		"default/reg": dockerConfigSecret("reg", body),
+	}}
+	p := New("mac-01", rt, WithSecretGetter(getter))
+
+	pod := testPod("web")
+	pod.Spec.Containers[0].Image = "registry.example.com/team/app:v1"
+	pod.Spec.ImagePullSecrets = []corev1.LocalObjectReference{{Name: "reg"}}
+
+	if err := p.CreatePod(context.Background(), pod); err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	if len(rt.pullAuths) != 1 || rt.pullAuths[0] == nil {
+		t.Fatalf("expected one authenticated pull, got %+v", rt.pullAuths)
+	}
+	got := rt.pullAuths[0]
+	if got.Username != "alice" || got.Password != "s3cret" || got.Server != "registry.example.com" {
+		t.Errorf("pull auth = %+v", got)
+	}
+}
+
+func TestCreatePodAnonymousPullWithoutPullSecret(t *testing.T) {
+	p, rt := newTestProvider()
+	if err := p.CreatePod(context.Background(), testPod("web")); err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	if len(rt.pullAuths) != 1 || rt.pullAuths[0] != nil {
+		t.Errorf("expected a single anonymous (nil-auth) pull, got %+v", rt.pullAuths)
+	}
+}
+
+func TestCreatePodMissingPullSecretIsTransient(t *testing.T) {
+	rt := newRecordingRuntime()
+	// Getter with no secrets: the named pull secret is absent.
+	p := New("mac-01", rt, WithSecretGetter(fakeSecretGetter{secrets: map[string]*corev1.Secret{}}))
+
+	pod := testPod("web")
+	pod.Spec.Containers[0].Image = "registry.example.com/app:v1"
+	pod.Spec.ImagePullSecrets = []corev1.LocalObjectReference{{Name: "absent"}}
+
+	err := p.CreatePod(context.Background(), pod)
+	if err == nil {
+		t.Fatal("expected a transient error so the Pod stays Pending and retries")
+	}
+	// The runtime must not be touched when credentials cannot be resolved.
+	if pulls, creates, _, _, _ := rt.counts(); pulls != 0 || creates != 0 {
+		t.Errorf("runtime touched despite unresolved pull secret: pulls=%d creates=%d", pulls, creates)
+	}
+	// The Pod must not be recorded as a terminal failure: it should self-heal once
+	// the Secret appears.
+	if _, gErr := p.GetPodStatus(context.Background(), "default", "p1"); gErr == nil {
+		t.Error("Pod should not be tracked after a transient pull-credential failure")
 	}
 }
 

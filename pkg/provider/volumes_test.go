@@ -29,7 +29,7 @@ func TestResolveEmptyDirMount(t *testing.T) {
 		[]corev1.Volume{{Name: "scratch", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}}},
 		[]corev1.VolumeMount{{Name: "scratch", MountPath: "/data"}},
 	)
-	rv, err := resolveVolumes(pod, VolumePolicy{Root: "/var/lib/macvz/volumes"})
+	rv, err := resolveVolumes(context.Background(), pod, VolumePolicy{Root: "/var/lib/macvz/volumes"}, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("resolveVolumes: %v", err)
 	}
@@ -51,7 +51,7 @@ func TestResolveEmptyDirMemoryIsTmpfs(t *testing.T) {
 		[]corev1.Volume{{Name: "cache", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory}}}},
 		[]corev1.VolumeMount{{Name: "cache", MountPath: "/cache"}},
 	)
-	rv, err := resolveVolumes(pod, VolumePolicy{Root: "/var/lib/macvz/volumes"})
+	rv, err := resolveVolumes(context.Background(), pod, VolumePolicy{Root: "/var/lib/macvz/volumes"}, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("resolveVolumes: %v", err)
 	}
@@ -68,7 +68,7 @@ func TestResolveEmptyDirNeedsRoot(t *testing.T) {
 		[]corev1.Volume{{Name: "scratch", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}}},
 		nil,
 	)
-	if _, err := resolveVolumes(pod, VolumePolicy{}); err == nil || !strings.Contains(err.Error(), "node.volumes.root") {
+	if _, err := resolveVolumes(context.Background(), pod, VolumePolicy{}, nil, nil, nil); err == nil || !strings.Contains(err.Error(), "node.volumes.root") {
 		t.Errorf("expected emptyDir-without-root error, got %v", err)
 	}
 }
@@ -78,7 +78,7 @@ func TestResolveEmptyDirRejectsRelativeRoot(t *testing.T) {
 		[]corev1.Volume{{Name: "scratch", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}}},
 		[]corev1.VolumeMount{{Name: "scratch", MountPath: "/data"}},
 	)
-	if _, err := resolveVolumes(pod, VolumePolicy{Root: "relative"}); err == nil || !strings.Contains(err.Error(), "not absolute") {
+	if _, err := resolveVolumes(context.Background(), pod, VolumePolicy{Root: "relative"}, nil, nil, nil); err == nil || !strings.Contains(err.Error(), "not absolute") {
 		t.Errorf("expected relative-root rejection, got %v", err)
 	}
 }
@@ -88,7 +88,7 @@ func TestResolveEmptyDirRejectsMissingPodUID(t *testing.T) {
 		[]corev1.Volume{{Name: "scratch", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}}},
 		[]corev1.VolumeMount{{Name: "scratch", MountPath: "/data"}},
 	)
-	if _, err := resolveVolumes(pod, VolumePolicy{Root: "/var/lib/macvz/volumes"}); err == nil || !strings.Contains(err.Error(), "Pod UID") {
+	if _, err := resolveVolumes(context.Background(), pod, VolumePolicy{Root: "/var/lib/macvz/volumes"}, nil, nil, nil); err == nil || !strings.Contains(err.Error(), "Pod UID") {
 		t.Errorf("expected missing-UID rejection, got %v", err)
 	}
 }
@@ -98,7 +98,7 @@ func TestResolveEmptyDirRejectsPodUIDEscape(t *testing.T) {
 		[]corev1.Volume{{Name: "scratch", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}}},
 		[]corev1.VolumeMount{{Name: "scratch", MountPath: "/data"}},
 	)
-	if _, err := resolveVolumes(pod, VolumePolicy{Root: "/var/lib/macvz/volumes"}); err == nil || !strings.Contains(err.Error(), "escapes volume root") {
+	if _, err := resolveVolumes(context.Background(), pod, VolumePolicy{Root: "/var/lib/macvz/volumes"}, nil, nil, nil); err == nil || !strings.Contains(err.Error(), "escapes volume root") {
 		t.Errorf("expected UID escape rejection, got %v", err)
 	}
 }
@@ -108,7 +108,7 @@ func TestResolveHostPathDisabledByDefault(t *testing.T) {
 		[]corev1.Volume{{Name: "h", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/srv/data"}}}},
 		[]corev1.VolumeMount{{Name: "h", MountPath: "/data"}},
 	)
-	_, err := resolveVolumes(pod, VolumePolicy{})
+	_, err := resolveVolumes(context.Background(), pod, VolumePolicy{}, nil, nil, nil)
 	if err == nil || !strings.Contains(err.Error(), "disabled") {
 		t.Errorf("hostPath should be disabled by default, got %v", err)
 	}
@@ -122,7 +122,7 @@ func TestResolveHostPathAllowlist(t *testing.T) {
 		[]corev1.Volume{{Name: "h", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/srv/data"}}}},
 		[]corev1.VolumeMount{{Name: "h", MountPath: "/data", ReadOnly: true}},
 	)
-	rv, err := resolveVolumes(pod, policy)
+	rv, err := resolveVolumes(context.Background(), pod, policy, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("resolveVolumes: %v", err)
 	}
@@ -135,7 +135,7 @@ func TestResolveHostPathAllowlist(t *testing.T) {
 		[]corev1.Volume{{Name: "h", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/srvother/data"}}}},
 		[]corev1.VolumeMount{{Name: "h", MountPath: "/data"}},
 	)
-	if _, err := resolveVolumes(bad, policy); err == nil || !strings.Contains(err.Error(), "not within an allowed prefix") {
+	if _, err := resolveVolumes(context.Background(), bad, policy, nil, nil, nil); err == nil || !strings.Contains(err.Error(), "not within an allowed prefix") {
 		t.Errorf("expected prefix rejection for /srvother, got %v", err)
 	}
 }
@@ -146,7 +146,7 @@ func TestResolveHostPathRejectsTraversalEscape(t *testing.T) {
 		[]corev1.Volume{{Name: "h", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/srv/app/../../etc"}}}},
 		[]corev1.VolumeMount{{Name: "h", MountPath: "/data"}},
 	)
-	if _, err := resolveVolumes(pod, policy); err == nil {
+	if _, err := resolveVolumes(context.Background(), pod, policy, nil, nil, nil); err == nil {
 		t.Error("path escaping the allowed prefix via .. should be rejected")
 	}
 }
@@ -157,7 +157,7 @@ func TestResolveHostPathRejectsNonDirectoryType(t *testing.T) {
 		[]corev1.Volume{{Name: "h", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/srv/sock", Type: hostPathPtr(corev1.HostPathSocket)}}}},
 		[]corev1.VolumeMount{{Name: "h", MountPath: "/data"}},
 	)
-	if _, err := resolveVolumes(pod, policy); err == nil || !strings.Contains(err.Error(), "not supported") {
+	if _, err := resolveVolumes(context.Background(), pod, policy, nil, nil, nil); err == nil || !strings.Contains(err.Error(), "not supported") {
 		t.Errorf("socket hostPath type should be rejected, got %v", err)
 	}
 }
@@ -167,18 +167,20 @@ func TestResolveRejectsSubPath(t *testing.T) {
 		[]corev1.Volume{{Name: "scratch", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}}},
 		[]corev1.VolumeMount{{Name: "scratch", MountPath: "/data", SubPath: "sub"}},
 	)
-	if _, err := resolveVolumes(pod, VolumePolicy{Root: "/var/lib/macvz/volumes"}); err == nil || !strings.Contains(err.Error(), "subPath") {
+	if _, err := resolveVolumes(context.Background(), pod, VolumePolicy{Root: "/var/lib/macvz/volumes"}, nil, nil, nil); err == nil || !strings.Contains(err.Error(), "subPath") {
 		t.Errorf("subPath should be rejected, got %v", err)
 	}
 }
 
 func TestResolveRejectsUnsupportedSource(t *testing.T) {
+	// hostPath, emptyDir, configMap (#46), and secret (#47) are supported; a PVC
+	// source is not.
 	pod := volPod("uid-1",
-		[]corev1.Volume{{Name: "cm", VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{}}}},
+		[]corev1.Volume{{Name: "pvc", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "c"}}}},
 		nil,
 	)
-	if _, err := resolveVolumes(pod, VolumePolicy{Root: "/x"}); err == nil || !strings.Contains(err.Error(), "unsupported source type") {
-		t.Errorf("configMap should be rejected as unsupported, got %v", err)
+	if _, err := resolveVolumes(context.Background(), pod, VolumePolicy{Root: "/x"}, nil, nil, nil); err == nil || !strings.Contains(err.Error(), "unsupported source type") {
+		t.Errorf("PVC volume should be rejected as unsupported, got %v", err)
 	}
 }
 
@@ -187,7 +189,7 @@ func TestResolveRejectsRelativeMountPath(t *testing.T) {
 		[]corev1.Volume{{Name: "scratch", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}}},
 		[]corev1.VolumeMount{{Name: "scratch", MountPath: "rel/path"}},
 	)
-	if _, err := resolveVolumes(pod, VolumePolicy{Root: "/x"}); err == nil || !strings.Contains(err.Error(), "must be absolute") {
+	if _, err := resolveVolumes(context.Background(), pod, VolumePolicy{Root: "/x"}, nil, nil, nil); err == nil || !strings.Contains(err.Error(), "must be absolute") {
 		t.Errorf("relative mountPath should be rejected, got %v", err)
 	}
 }
@@ -234,7 +236,7 @@ func TestCleanupVolumeDirsRefusesMissingPodUID(t *testing.T) {
 func TestCreatePodUnsupportedVolumeIsTerminal(t *testing.T) {
 	p := New("mac-1", newRecordingRuntime(), WithVolumePolicy(VolumePolicy{Root: t.TempDir()}))
 	pod := volPod("uid-2",
-		[]corev1.Volume{{Name: "cm", VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{}}}},
+		[]corev1.Volume{{Name: "pvc", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "c"}}}},
 		nil,
 	)
 	// CreatePod returns nil (terminal) but records a Failed status.
@@ -257,7 +259,7 @@ func TestResolveToleratesServiceAccountTokenMount(t *testing.T) {
 		}}}},
 		[]corev1.VolumeMount{{Name: "kube-api-access-x", MountPath: "/var/run/secrets/kubernetes.io/serviceaccount"}},
 	)
-	rv, err := resolveVolumes(pod, VolumePolicy{Root: "/x"})
+	rv, err := resolveVolumes(context.Background(), pod, VolumePolicy{Root: "/x"}, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("SA token should be tolerated: %v", err)
 	}

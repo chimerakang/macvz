@@ -1,8 +1,8 @@
 // Package svcroute programs host ClusterIP Service routing for MacVz nodes.
 //
 // A MacVz node is a macOS host and cannot run kube-proxy (the kube-proxy Pod
-// spec — Always restart, hostNetwork, privileged securityContext — is rejected
-// by the provider), so nothing would otherwise translate a Service ClusterIP for
+// spec — hostNetwork, privileged securityContext — is rejected by the
+// provider), so nothing would otherwise translate a Service ClusterIP for
 // a micro-VM. This controller watches Services and their EndpointSlices and
 // programs the podnet pf anchor with `rdr` DNAT rules (ClusterIP:port -> ready
 // backend), giving micro-VMs working ClusterIP Service access (#37/P5).

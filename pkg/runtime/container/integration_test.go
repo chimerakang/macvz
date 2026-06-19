@@ -30,7 +30,7 @@ func TestLifecycleIntegration(t *testing.T) {
 	}
 
 	const image = "docker.io/library/alpine:3.20"
-	if err := d.Pull(ctx, image); err != nil {
+	if err := d.Pull(ctx, image, nil); err != nil {
 		t.Fatalf("Pull: %v", err)
 	}
 
@@ -146,7 +146,7 @@ func TestLogStreamingIntegration(t *testing.T) {
 	}
 
 	const image = "docker.io/library/alpine:3.20"
-	if err := d.Pull(ctx, image); err != nil {
+	if err := d.Pull(ctx, image, nil); err != nil {
 		t.Fatalf("Pull: %v", err)
 	}
 
@@ -248,7 +248,7 @@ func TestExecIntegration(t *testing.T) {
 		t.Fatalf("Ready: %v", err)
 	}
 	const image = "docker.io/library/alpine:3.20"
-	if err := d.Pull(ctx, image); err != nil {
+	if err := d.Pull(ctx, image, nil); err != nil {
 		t.Fatalf("Pull: %v", err)
 	}
 
@@ -336,7 +336,7 @@ func TestStatsIntegration(t *testing.T) {
 	}
 
 	const image = "docker.io/library/alpine:3.20"
-	if err := d.Pull(ctx, image); err != nil {
+	if err := d.Pull(ctx, image, nil); err != nil {
 		t.Fatalf("Pull: %v", err)
 	}
 	spec := types.ContainerSpec{Name: "macvz-stats-it", Image: image, Command: []string{"sleep", "120"}}
@@ -403,7 +403,7 @@ func TestVolumeMountIntegration(t *testing.T) {
 	rwSrc := t.TempDir()
 
 	const image = "docker.io/library/alpine:3.20"
-	if err := d.Pull(ctx, image); err != nil {
+	if err := d.Pull(ctx, image, nil); err != nil {
 		t.Fatalf("Pull: %v", err)
 	}
 	spec := types.ContainerSpec{
@@ -472,7 +472,7 @@ func TestArchVerificationIntegration(t *testing.T) {
 
 	// arm64 image: pulls and boots.
 	const arm64Image = "docker.io/library/alpine:3.20"
-	if err := d.Pull(ctx, arm64Image); err != nil {
+	if err := d.Pull(ctx, arm64Image, nil); err != nil {
 		t.Fatalf("Pull(arm64): %v", err)
 	}
 	spec := types.ContainerSpec{Name: "macvz-arch-arm64", Image: arm64Image, Command: []string{"sleep", "30"}}
@@ -488,7 +488,7 @@ func TestArchVerificationIntegration(t *testing.T) {
 
 	// amd64-only image: Pull must reject with a clear, actionable arch error.
 	const amd64Image = "docker.io/amd64/alpine:3.20"
-	err = d.Pull(ctx, amd64Image)
+	err = d.Pull(ctx, amd64Image, nil)
 	if !errors.Is(err, runtime.ErrIncompatibleArch) {
 		t.Fatalf("Pull(amd64) err = %v, want ErrIncompatibleArch", err)
 	}
@@ -522,7 +522,7 @@ func TestRosettaIntegration(t *testing.T) {
 	}
 
 	const amd64Image = "docker.io/amd64/alpine:3.20"
-	if err := d.Pull(ctx, amd64Image); err != nil {
+	if err := d.Pull(ctx, amd64Image, nil); err != nil {
 		t.Fatalf("Pull(amd64) with Rosetta should succeed: %v", err)
 	}
 	spec := types.ContainerSpec{Name: "macvz-rosetta", Image: amd64Image, Command: []string{"sleep", "60"}}

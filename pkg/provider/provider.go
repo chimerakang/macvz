@@ -9,9 +9,13 @@
 package provider
 
 import (
+	"context"
+	"crypto/tls"
+	"net/http"
 	"sync"
 	"time"
 
+	"github.com/chimerakang/macvz/internal/types"
 	"github.com/chimerakang/macvz/pkg/metrics"
 	"github.com/chimerakang/macvz/pkg/network"
 	"github.com/chimerakang/macvz/pkg/runtime"
@@ -21,6 +25,11 @@ import (
 
 // defaultStopTimeout is used when a Pod has no terminationGracePeriodSeconds.
 const defaultStopTimeout = 30 * time.Second
+
+// defaultProbeUnit is the wall-clock duration of one "second" of a probe's
+// timing fields (#50). Production runs at real time; tests shrink it so probe
+// loops converge in milliseconds.
+const defaultProbeUnit = time.Second
 
 // Provider realizes Kubernetes Pods as micro-VMs via a runtime.Runtime.
 type Provider struct {
@@ -61,6 +70,37 @@ type Provider struct {
 	// dns is the cluster DNS injected into micro-VMs so in-guest Service name
 	// resolution works (#37). The zero value injects nothing.
 	dns DNSConfig
+
+	// configMaps resolves ConfigMaps referenced by a Pod's env vars and volumes
+	// (#46). Nil disables ConfigMap support: a Pod that references one then fails
+	// fast with a clear message.
+	configMaps ConfigMapGetter
+
+	// secrets resolves Secrets referenced by a Pod, today the dockerconfigjson
+	// pull secrets named in imagePullSecrets (#49). Nil disables Secret support: a
+	// Pod that names an imagePullSecret then fails fast with a clear message.
+	secrets SecretGetter
+
+	// tokens issues bound service-account tokens for the projected
+	// kube-api-access volume, giving Pods normal in-cluster API access (#51). Nil
+	// disables it: the auto-injected token volume is tolerated but not mounted, so
+	// a Pod gets no service-account credentials.
+	tokens TokenRequester
+
+	// restartBackoffBase is the first delay before a terminated workload is
+	// restarted under an Always/OnFailure policy; subsequent restarts back off
+	// exponentially up to restartBackoffMax (#45). New sets it to
+	// defaultRestartBackoffBase; tests lower it for determinism.
+	restartBackoffBase time.Duration
+
+	// probeUnit scales a probe's whole-second timing fields (#50). New sets it to
+	// defaultProbeUnit (one second); tests shrink it so probe loops run fast.
+	probeUnit time.Duration
+
+	// probeHTTPClient performs HTTP GET probes. It follows no redirects and skips
+	// TLS verification (HTTPS probes target the Pod's own self-signed endpoint),
+	// matching the kubelet; per-attempt deadlines come from the request context.
+	probeHTTPClient *http.Client
 }
 
 // Option configures a Provider at construction time.
@@ -114,6 +154,26 @@ type podState struct {
 	// attached records whether the Pod's micro-VM has been wired into the Pod
 	// network path, so DeletePod knows to tear the mapping down.
 	attached bool
+	// spec is the resolved single-container workload spec, retained so a restart
+	// can recreate the micro-VM without re-resolving the Pod (#45).
+	spec types.ContainerSpec
+	// restartPolicy is the Pod's effective restart policy (an unset value
+	// defaults to Always, matching Kubernetes), governing the restart loop (#45).
+	restartPolicy corev1.RestartPolicy
+	// restarts counts how many times each container has been restarted, reported
+	// as ContainerStatus.RestartCount and used to grow the restart backoff (#45).
+	restarts map[string]int32
+	// restarting is true while an asynchronous restart of this Pod's workload is
+	// in flight, so reconcileStatus reports CrashLoopBackOff and does not launch a
+	// second restart goroutine (#45). Guarded by Provider.mu.
+	restarting bool
+	// probes holds the live results of this Pod's startup/readiness/liveness
+	// probes, read by reconcileStatus to gate readiness (#50). Nil when the
+	// container declares no probes. Guarded by Provider.mu.
+	probes *probeState
+	// probesCancel stops the prober goroutines. It is reset when the workload is
+	// restarted (fresh probers replace it) and on Pod deletion (#50).
+	probesCancel context.CancelFunc
 }
 
 // workload binds a Pod container to a runtime workload ID.
@@ -125,9 +185,19 @@ type workload struct {
 // New constructs a Provider bound to a node name and runtime driver.
 func New(nodeName string, rt runtime.Runtime, opts ...Option) *Provider {
 	p := &Provider{
-		nodeName: nodeName,
-		rt:       rt,
-		pods:     make(map[string]*podState),
+		nodeName:           nodeName,
+		rt:                 rt,
+		pods:               make(map[string]*podState),
+		restartBackoffBase: defaultRestartBackoffBase,
+		probeUnit:          defaultProbeUnit,
+		probeHTTPClient: &http.Client{
+			// Probes evaluate a single endpoint; never chase redirects.
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+			Transport: &http.Transport{
+				TLSClientConfig:   &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // kubelet HTTPS probes skip verification by design
+				DisableKeepAlives: true,
+			},
+		},
 	}
 	for _, opt := range opts {
 		opt(p)
@@ -160,6 +230,48 @@ func (p *Provider) SetPodNetwork(pn PodNetwork) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.podNet = pn
+}
+
+// SetConfigMapGetter attaches the ConfigMap resolver after construction (#46).
+// The pod controller owns the ConfigMap informer, so the getter is wired in once
+// that informer exists, before the controller starts reconciling Pods.
+func (p *Provider) SetConfigMapGetter(g ConfigMapGetter) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.configMaps = g
+}
+
+// SetSecretGetter attaches the Secret resolver after construction (#49), wired in
+// from the pod controller's own Secret informer once it exists and before the
+// controller starts reconciling Pods. It is used to read dockerconfigjson pull
+// secrets named in a Pod's imagePullSecrets.
+func (p *Provider) SetSecretGetter(g SecretGetter) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.secrets = g
+}
+
+// WithSecretGetter wires the Secret resolver at construction time (#49), chiefly
+// for tests; production wiring uses SetSecretGetter once the informer exists.
+func WithSecretGetter(g SecretGetter) Option {
+	return func(p *Provider) { p.secrets = g }
+}
+
+// SetTokenRequester attaches the service-account token issuer after construction
+// (#51), wired from the kubelet once the clientset exists and before the pod
+// controller starts reconciling. It lets Pods consume the projected
+// kube-api-access volume for in-cluster API access.
+func (p *Provider) SetTokenRequester(t TokenRequester) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.tokens = t
+}
+
+// WithTokenRequester wires the service-account token issuer at construction time
+// (#51), chiefly for tests; production wiring uses SetTokenRequester once the
+// clientset exists.
+func WithTokenRequester(t TokenRequester) Option {
+	return func(p *Provider) { p.tokens = t }
 }
 
 // Compile-time assertion that Provider satisfies the Virtual Kubelet contract.

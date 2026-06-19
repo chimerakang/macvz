@@ -53,7 +53,7 @@ func TestPullAcceptsAMD64WhenRosettaEnabled(t *testing.T) {
 		"image pull":    []byte(""),
 		"image inspect": []byte(amd64OnlyVariants),
 	}}
-	if err := rosettaDriver(f).Pull(context.Background(), "amd64/img"); err != nil {
+	if err := rosettaDriver(f).Pull(context.Background(), "amd64/img", nil); err != nil {
 		t.Fatalf("Pull of amd64 image with Rosetta enabled: %v", err)
 	}
 }

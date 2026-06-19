@@ -137,7 +137,7 @@ func run(p benchParams) error {
 	}
 
 	fmt.Printf("warming image %s ...\n", p.image)
-	if err := d.Pull(ctx, p.image); err != nil {
+	if err := d.Pull(ctx, p.image, nil); err != nil {
 		return fmt.Errorf("pull image: %w", err)
 	}
 

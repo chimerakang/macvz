@@ -10,13 +10,17 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"errors"
+	"io"
 	"math/big"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
+	"github.com/chimerakang/macvz/pkg/config"
 	"k8s.io/apimachinery/pkg/runtime"
 	apiversion "k8s.io/apimachinery/pkg/version"
 	"k8s.io/client-go/discovery/fake"
@@ -173,4 +177,45 @@ func TestListenKubeletTLSFailsAfterAddressInUseTimeout(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected address-in-use timeout")
 	}
+}
+
+func TestStartKubeletServerWithoutTLSServesLocalDiagnosticsOnly(t *testing.T) {
+	port := freeTCPPort(t)
+	cfg := config.Default()
+	cfg.Node.KubeletPort = int32(port)
+	cfg.Node.ServingTLSCertFile = ""
+	cfg.Node.ServingTLSKeyFile = ""
+
+	stop, err := startKubeletServer(context.Background(), cfg, nil, "192.0.2.10", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/healthz/diagnostics" {
+			http.Error(w, "unexpected path", http.StatusNotFound)
+			return
+		}
+		_, _ = w.Write([]byte("diagnostics-ok"))
+	}))
+	if err != nil {
+		t.Fatalf("startKubeletServer: %v", err)
+	}
+	defer stop()
+
+	client := http.Client{Timeout: time.Second}
+	res, err := client.Get("http://127.0.0.1:" + strconv.Itoa(port) + "/healthz/diagnostics")
+	if err != nil {
+		t.Fatalf("GET local diagnostics: %v", err)
+	}
+	defer func() { _ = res.Body.Close() }()
+	body, _ := io.ReadAll(res.Body)
+	if res.StatusCode != http.StatusOK || string(body) != "diagnostics-ok" {
+		t.Fatalf("diagnostics response status=%d body=%q", res.StatusCode, body)
+	}
+}
+
+func freeTCPPort(t *testing.T) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen free port: %v", err)
+	}
+	defer func() { _ = ln.Close() }()
+	return ln.Addr().(*net.TCPAddr).Port
 }

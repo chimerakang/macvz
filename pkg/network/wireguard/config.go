@@ -128,18 +128,29 @@ func (c InterfaceConfig) render(quick bool) string {
 	b.WriteString("ListenPort = " + strconv.Itoa(c.ListenPort) + "\n")
 
 	for _, p := range sortedPeers(c.Peers) {
-		b.WriteString("\n[Peer]\n")
-		if p.Name != "" {
-			b.WriteString("# " + p.Name + "\n")
-		}
-		b.WriteString("PublicKey = " + p.PublicKey.String() + "\n")
-		if p.Endpoint != "" {
-			b.WriteString("Endpoint = " + p.Endpoint + "\n")
-		}
-		b.WriteString("AllowedIPs = " + strings.Join(p.AllowedIPs, ", ") + "\n")
-		if p.PersistentKeepalive > 0 {
-			b.WriteString("PersistentKeepalive = " + strconv.Itoa(p.PersistentKeepalive) + "\n")
-		}
+		b.WriteString("\n")
+		b.WriteString(p.ConfigBlock())
+	}
+	return b.String()
+}
+
+// ConfigBlock renders this peer as a standalone wg(8) `[Peer]` block, the exact
+// snippet an operator pastes into another node's WireGuard config to peer with
+// the node this Peer describes. It carries only public material, so it is safe
+// to copy between hosts.
+func (p Peer) ConfigBlock() string {
+	var b strings.Builder
+	b.WriteString("[Peer]\n")
+	if p.Name != "" {
+		b.WriteString("# " + p.Name + "\n")
+	}
+	b.WriteString("PublicKey = " + p.PublicKey.String() + "\n")
+	if p.Endpoint != "" {
+		b.WriteString("Endpoint = " + p.Endpoint + "\n")
+	}
+	b.WriteString("AllowedIPs = " + strings.Join(p.AllowedIPs, ", ") + "\n")
+	if p.PersistentKeepalive > 0 {
+		b.WriteString("PersistentKeepalive = " + strconv.Itoa(p.PersistentKeepalive) + "\n")
 	}
 	return b.String()
 }

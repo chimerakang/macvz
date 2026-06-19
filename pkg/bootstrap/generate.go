@@ -1,0 +1,269 @@
+package bootstrap
+
+import (
+	"fmt"
+	"net"
+	"os"
+	"sort"
+	"strings"
+
+	"github.com/chimerakang/macvz/pkg/config"
+)
+
+// JoinParams is the minimum set of inputs needed to make a new MacVz node join
+// an existing cluster (#54 Scope): cluster credentials, node identity, the
+// node's reachable address, its Pod CIDR, and — when the cross-host mesh is
+// used — its mesh address and peer data. Everything else falls back to the
+// kubelet's built-in defaults.
+type JoinParams struct {
+	NodeName       string // Kubernetes node name (required)
+	InternalIP     string // node's reachable IPv4 (required)
+	KubeconfigPath string // path to the cluster kubeconfig (required)
+	PodCIDR        string // optional manual Pod CIDR (clusters without node CIDRs)
+
+	ClusterDNS    []string // CoreDNS/kube-dns ClusterIP(s) for in-VM Service DNS
+	ClusterDomain string   // cluster DNS domain (default cluster.local when DNS set)
+
+	// Serving TLS for kubectl logs/exec. Leave empty to omit (logs/exec off).
+	ServingTLSCertFile string
+	ServingTLSKeyFile  string
+
+	// PrivilegedHelperSocket routes pf/wg/route through macvz-netd. Required
+	// whenever Mesh or PodNetwork is enabled (the kubelet runs as a normal user).
+	PrivilegedHelperSocket string
+
+	// Mesh, when set, emits an enabled WireGuard mesh stanza with these peers.
+	Mesh *MeshParams
+	// PodNetwork, when set, emits an enabled host Pod network stanza.
+	PodNetwork *PodNetworkParams
+}
+
+// MeshParams describes this node's WireGuard mesh identity and its peers.
+type MeshParams struct {
+	Interface      string // e.g. "utun7" (default)
+	Address        string // this node's mesh address in CIDR form (required)
+	ListenPort     int    // UDP port (default 51820)
+	PrivateKeyFile string // path to the node's private key (default /etc/macvz/wireguard.key)
+	Peers          []PeerParams
+}
+
+// PeerParams is one remote node in the mesh.
+type PeerParams struct {
+	Name      string
+	PublicKey string
+	Endpoint  string
+	PodCIDR   string
+	Address   string
+}
+
+// PodNetworkParams describes the host vmnet path.
+type PodNetworkParams struct {
+	Interface  string   // host vmnet bridge, e.g. "bridge100" (required)
+	Anchor     string   // pf anchor (default macvz/pods)
+	VMNetCIDRs []string // host-only vmnet ranges (default 192.168.64.0/24)
+}
+
+const (
+	defaultMeshInterface  = "utun7"
+	defaultMeshKeyFile    = "/etc/macvz/wireguard.key"
+	defaultHelperSocket   = "/var/run/macvz-netd.sock"
+	defaultPodNetAnchor   = "macvz/pods"
+	defaultPodNetVMNetCIDR = config.DefaultVMNetCIDR
+)
+
+// Validate checks that the required join inputs are present and well-formed so
+// the generated config will load. It returns the first problem found, naming
+// the missing or invalid input.
+func (p JoinParams) Validate() error {
+	if strings.TrimSpace(p.NodeName) == "" {
+		return fmt.Errorf("node name is required (--node-name)")
+	}
+	if p.InternalIP == "" {
+		return fmt.Errorf("internal IP is required (--internal-ip)")
+	}
+	if net.ParseIP(p.InternalIP) == nil {
+		return fmt.Errorf("internal IP %q is not a valid IP address", p.InternalIP)
+	}
+	if strings.TrimSpace(p.KubeconfigPath) == "" {
+		return fmt.Errorf("kubeconfig path is required (--kubeconfig)")
+	}
+	if p.PodCIDR != "" {
+		if _, _, err := net.ParseCIDR(p.PodCIDR); err != nil {
+			return fmt.Errorf("pod CIDR %q is not valid: %w", p.PodCIDR, err)
+		}
+	}
+	if (p.ServingTLSCertFile == "") != (p.ServingTLSKeyFile == "") {
+		return fmt.Errorf("serving TLS cert and key must be provided together")
+	}
+	if p.Mesh != nil {
+		if _, _, err := net.ParseCIDR(p.Mesh.Address); err != nil {
+			return fmt.Errorf("mesh address %q must be a CIDR (e.g. 10.99.0.1/32): %w", p.Mesh.Address, err)
+		}
+		if p.PrivilegedHelperSocket == "" {
+			return fmt.Errorf("privileged helper socket is required when the mesh is enabled (--helper-socket)")
+		}
+		for i, peer := range p.Mesh.Peers {
+			if peer.PublicKey == "" {
+				return fmt.Errorf("mesh peer %d (%q) is missing publicKey", i, peer.Name)
+			}
+			if _, _, err := net.ParseCIDR(peer.PodCIDR); err != nil {
+				return fmt.Errorf("mesh peer %d (%q) podCIDR %q is not a CIDR: %w", i, peer.Name, peer.PodCIDR, err)
+			}
+		}
+	}
+	if p.PodNetwork != nil {
+		if p.PodNetwork.Interface == "" {
+			return fmt.Errorf("pod network interface is required when the Pod network is enabled (--podnet-interface)")
+		}
+		if p.PrivilegedHelperSocket == "" {
+			return fmt.Errorf("privileged helper socket is required when the Pod network is enabled (--helper-socket)")
+		}
+	}
+	return nil
+}
+
+// GenerateConfig renders a commented macvz-kubelet config YAML from the join
+// inputs. The output is deterministic and loads cleanly through config.Load; it
+// is meant to be reviewed and adjusted (peer keys, CIDRs) before first start.
+func GenerateConfig(p JoinParams) (string, error) {
+	if err := p.Validate(); err != nil {
+		return "", err
+	}
+	var b strings.Builder
+	w := func(format string, args ...any) { fmt.Fprintf(&b, format, args...) }
+
+	w("# macvz-kubelet config generated by `macvz-kubelet bootstrap` (#54).\n")
+	w("# Review every value before first start, then run `macvz-kubelet doctor --config <this file>`.\n\n")
+
+	w("nodeName: %s\n", p.NodeName)
+	w("kubeconfigPath: %s\n", p.KubeconfigPath)
+	w("logLevel: info\n\n")
+
+	w("node:\n")
+	w("  internalIP: %q\n", p.InternalIP)
+	if p.PodCIDR != "" {
+		w("  # Manual Pod CIDR: only for clusters that do not assign node CIDRs.\n")
+		w("  podCIDR: %q\n", p.PodCIDR)
+	}
+	if p.ServingTLSCertFile != "" {
+		w("  kubeletPort: 10250\n")
+		w("  servingTLSCertFile: %s\n", p.ServingTLSCertFile)
+		w("  servingTLSKeyFile: %s\n", p.ServingTLSKeyFile)
+	} else {
+		w("  # servingTLSCertFile/servingTLSKeyFile unset: kubectl logs/exec disabled.\n")
+	}
+	if len(p.ClusterDNS) > 0 {
+		w("  clusterDNS: [%s]\n", quoteJoin(p.ClusterDNS))
+		domain := p.ClusterDomain
+		if domain == "" {
+			domain = "cluster.local"
+		}
+		w("  clusterDomain: %q\n", domain)
+	}
+	w("\n")
+
+	if p.PrivilegedHelperSocket != "" {
+		w("# Privileged network helper (macvz-netd) socket. The kubelet runs as your\n")
+		w("# user; pf/wg/route are executed by the root helper over this socket.\n")
+		w("privilegedHelperSocket: %s\n\n", p.PrivilegedHelperSocket)
+	}
+
+	if p.Mesh != nil {
+		writeMesh(w, p.Mesh)
+	}
+	if p.PodNetwork != nil {
+		writePodNetwork(w, p.PodNetwork)
+	}
+
+	out := b.String()
+	// Self-check: the generated config must load and validate.
+	if err := loadCheck(out); err != nil {
+		return "", fmt.Errorf("generated config failed self-validation: %w", err)
+	}
+	return out, nil
+}
+
+func writeMesh(w func(string, ...any), m *MeshParams) {
+	iface := orDefault(m.Interface, defaultMeshInterface)
+	keyFile := orDefault(m.PrivateKeyFile, defaultMeshKeyFile)
+	port := m.ListenPort
+	if port == 0 {
+		port = config.DefaultMeshListenPort
+	}
+	w("mesh:\n")
+	w("  enabled: true\n")
+	w("  interface: %s\n", iface)
+	w("  privateKeyFile: %s\n", keyFile)
+	w("  address: %q\n", m.Address)
+	w("  listenPort: %d\n", port)
+	if len(m.Peers) == 0 {
+		w("  # Add a peer stanza per other MacVz node (publicKey, endpoint, podCIDR, address).\n")
+		w("  peers: []\n\n")
+		return
+	}
+	w("  peers:\n")
+	for _, peer := range m.Peers {
+		w("    - name: %s\n", peer.Name)
+		w("      publicKey: %q\n", peer.PublicKey)
+		if peer.Endpoint != "" {
+			w("      endpoint: %q\n", peer.Endpoint)
+		}
+		w("      podCIDR: %q\n", peer.PodCIDR)
+		if peer.Address != "" {
+			w("      address: %q\n", peer.Address)
+		}
+		w("      persistentKeepalive: 25\n")
+	}
+	w("\n")
+}
+
+func writePodNetwork(w func(string, ...any), pn *PodNetworkParams) {
+	anchor := orDefault(pn.Anchor, defaultPodNetAnchor)
+	cidrs := pn.VMNetCIDRs
+	if len(cidrs) == 0 {
+		cidrs = []string{defaultPodNetVMNetCIDR}
+	}
+	w("podNetwork:\n")
+	w("  enabled: true\n")
+	w("  interface: %s\n", pn.Interface)
+	w("  anchor: %s\n", anchor)
+	w("  enableForwarding: true\n")
+	w("  vmNetCIDRs: [%s]\n\n", quoteJoin(cidrs))
+}
+
+// loadCheck parses generated YAML through config.Load to guarantee the output
+// is a valid macvz-kubelet config. It writes to a temp file because config.Load
+// reads from disk.
+func loadCheck(yaml string) error {
+	f, err := os.CreateTemp("", "macvz-bootstrap-*.yaml")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = os.Remove(f.Name()) }()
+	if _, err := f.WriteString(yaml); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	_, err = config.Load(f.Name())
+	return err
+}
+
+func orDefault(v, def string) string {
+	if strings.TrimSpace(v) == "" {
+		return def
+	}
+	return v
+}
+
+func quoteJoin(items []string) string {
+	cp := append([]string(nil), items...)
+	sort.Strings(cp)
+	quoted := make([]string, len(cp))
+	for i, s := range cp {
+		quoted[i] = fmt.Sprintf("%q", s)
+	}
+	return strings.Join(quoted, ", ")
+}

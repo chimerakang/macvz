@@ -413,6 +413,30 @@ func TestStatusParsesRunning(t *testing.T) {
 	}
 }
 
+func TestListBuildsArgsAndParsesStatuses(t *testing.T) {
+	const body = `[
+		{"id":"macvz-default-web-app","status":{"state":"running","startedDate":"2026-06-18T13:55:56Z"}},
+		{"id":"macvz-default-done-app","status":{"state":"stopped","startedDate":"2026-06-18T13:56:56Z","exitStatus":3}}
+	]`
+	f := &fakeRunner{outputs: map[string][]byte{"list": []byte(body)}}
+	statuses, err := driverWith(f).List(context.Background())
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if !argsContain(lastCall(f), "list", "--all", "--format", "json") {
+		t.Fatalf("List args = %v, want list --all --format json", lastCall(f))
+	}
+	if len(statuses) != 2 {
+		t.Fatalf("got %d statuses, want 2: %+v", len(statuses), statuses)
+	}
+	if statuses[0].ID != "macvz-default-web-app" || statuses[0].Phase != runtime.PhaseRunning {
+		t.Fatalf("status[0] = %+v, want running web app", statuses[0])
+	}
+	if statuses[1].ID != "macvz-default-done-app" || statuses[1].Phase != runtime.PhaseFailed || statuses[1].ExitCode != 3 {
+		t.Fatalf("status[1] = %+v, want failed done app exit 3", statuses[1])
+	}
+}
+
 func TestStatusCreatedVsStopped(t *testing.T) {
 	created := `[{"id":"x","status":{"state":"stopped","networks":[]}}]`
 	stopped := `[{"id":"x","status":{"state":"stopped","startedDate":"2026-06-18T13:55:56Z","networks":[]}}]`

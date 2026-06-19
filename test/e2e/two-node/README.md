@@ -78,6 +78,9 @@ MACVZ_E2E_NODES=macvz-a,macvz-b MACVZ_E2E_TIMEOUT=120 \
 
 ```sh
 ./run.sh stop a                 # stop kubelet (flushes the macvz/pods anchor)
+# Reap any orphan micro-VMs + flush the anchor (e.g. after a kubelet kill -9).
+# See docs/NODE_DRAIN.md for the full drain/remove workflow.
+macvz-kubelet cleanup --config macvz-a.yaml --all
 sudo pfctl -a macvz/pods -F all # belt-and-suspenders anchor flush
 sudo sysctl -w net.inet.ip.forwarding=0   # if you want to revert forwarding
 # restore /etc/pf.conf from the .macvz.bak.* prep-node.sh left, if desired

@@ -194,7 +194,36 @@ func (m *Mesh) Sync(ctx context.Context, peers []Peer) error {
 func (m *Mesh) Down(ctx context.Context) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.teardownLocked(ctx)
+	klog.InfoS("wireguard mesh down", "interface", m.cfg.Name)
+	return nil
+}
 
+// Remove performs a permanent-removal teardown of this node's mesh: it deletes
+// every route the current config implies (not only those this process
+// installed) before destroying the interface. Unlike Down, it does not rely on
+// in-memory state, so it cleans up routes and the interface left behind by a
+// crashed or already-exited kubelet — the node-removal path (#58). It is
+// best-effort and idempotent: missing routes/interface are tolerated, so it is
+// safe to re-run after a partially failed removal.
+func (m *Mesh) Remove(ctx context.Context) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Seed the route set from the config so teardown deletes routes this process
+	// never tracked (e.g. after a restart-less crash). Union with any tracked
+	// routes so nothing is missed.
+	for _, target := range m.cfg.RouteTargets() {
+		m.routes[target] = true
+	}
+	m.teardownLocked(ctx)
+	klog.InfoS("wireguard mesh removed", "interface", m.cfg.Name)
+	return nil
+}
+
+// teardownLocked deletes all currently-tracked routes and destroys the
+// interface, tolerating missing state throughout. Caller holds m.mu.
+func (m *Mesh) teardownLocked(ctx context.Context) {
 	for target := range m.routes {
 		if _, err := m.runTolerating(ctx, m.routeCmd("delete", target), errRouteMissing); err != nil {
 			klog.ErrorS(err, "wireguard: failed to delete route", "target", target, "interface", m.cfg.Name)
@@ -215,8 +244,6 @@ func (m *Mesh) Down(ctx context.Context) error {
 		klog.ErrorS(err, "wireguard: failed to destroy interface", "interface", m.cfg.Name)
 	}
 	m.up = false
-	klog.InfoS("wireguard mesh down", "interface", m.cfg.Name)
-	return nil
 }
 
 func (m *Mesh) killWireGuardGoCmd() command {

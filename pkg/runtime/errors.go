@@ -47,3 +47,13 @@ type Pinger interface {
 	// otherwise an error wrapping ErrNotReady.
 	Ready(ctx context.Context) error
 }
+
+// Lister is an optional capability for a Runtime that can enumerate every
+// workload it knows about, including stopped ones. Node drain/cleanup tooling
+// (#57) uses it to find orphan micro-VMs — workloads this node created whose
+// backing Pod is gone — so they can be reaped after a drain or a crash.
+type Lister interface {
+	// List returns the status of every workload known to the runtime, including
+	// stopped ones.
+	List(ctx context.Context) ([]Status, error)
+}

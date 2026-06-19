@@ -174,6 +174,50 @@ first start if absent, giving the node a **stable identity across restarts**
 without keys ever appearing in config or git. Share each node's **public key**
 (logged at startup, or `wg pubkey < key`) with its peers.
 
+#### `macvz-mesh` — automated key/config exchange (#55)
+
+`macvz-mesh` (build with `make mesh`) automates the error-prone parts of mesh
+setup so operators **never copy private keys by hand** and never hand-edit base64
+keys into config:
+
+```sh
+# 1. On each node: generate/load its stable private key, print the public key.
+#    Idempotent — re-running loads the existing key, it does not rotate it.
+macvz-mesh keygen --key /var/lib/macvz/wg.key
+
+# 2. On each node: export its shareable identity (public key, endpoint, mesh
+#    address, Pod CIDR). The document contains NO private key — safe to copy.
+macvz-mesh export --config /etc/macvz/config.yaml --out macvz-a.meta.yaml
+
+# 3. Collect the other nodes' metadata, then render peer entries to paste under
+#    `mesh:` in THIS node's config (or use --format wg for raw [Peer] blocks).
+macvz-mesh peer macvz-b.meta.yaml macvz-c.meta.yaml
+```
+
+`export` reuses `mesh.privateKeyFile`, generating the key on first call, so the
+same key the kubelet later loads is the one whose public key is exported — the
+exported document is consistent with the running node by construction. The
+rendered `peers:` fragment is the canonical config form: paste it in and reload
+with SIGHUP (see above), no restart required.
+
+#### Key rotation
+
+A node's identity is its private key file; rotation is deliberate, never
+automatic:
+
+- **Re-running `keygen`/`export`/the kubelet never rotates the key** — an
+  existing `mesh.privateKeyFile` is loaded as-is. This is what makes identity
+  stable across restarts.
+- **To rotate**, delete (or move) the node's `mesh.privateKeyFile` and re-run
+  `macvz-mesh keygen` (or restart the kubelet) to mint a fresh key. The public
+  key changes, so you must **re-export** that node's metadata and **re-render +
+  re-apply** the peer entry on every other node (edit `mesh.peers`, then
+  `kill -HUP`). Until every peer has the new public key, handshakes to the
+  rotated node fail — rotate during a maintenance window or roll peers one at a
+  time.
+- The private key file is created mode 0600 and stays on the node; only public
+  metadata is ever exchanged, so a leaked metadata file is not a secret exposure.
+
 ### Prerequisites
 
 ```sh
@@ -255,6 +299,9 @@ ping 10.99.0.2                      # reach the peer across the tunnel
   `Sync`, and best-effort `Down`.
 - `pkg/config/mesh_test.go` — mesh config validation and translation into the
   `wireguard` package's interface config.
+- `pkg/config/metadata_test.go` — node metadata export (public-key derivation, no
+  private-key leakage), marshal round-trip, and peer-snippet rendering that
+  round-trips back into a valid config (`macvz-mesh` automation, #55).
 
 ## Micro-VM network attach (MVP)
 

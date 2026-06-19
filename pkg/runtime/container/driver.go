@@ -9,6 +9,7 @@
 package container
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -66,6 +67,7 @@ type Driver struct {
 var (
 	_ runtime.Runtime = (*Driver)(nil)
 	_ runtime.Pinger  = (*Driver)(nil)
+	_ runtime.Lister  = (*Driver)(nil)
 )
 
 // New returns a Driver backed by the apple/container CLI described by cfg.
@@ -393,6 +395,31 @@ func (d *Driver) Destroy(ctx context.Context, id string) error {
 	return nil
 }
 
+// List returns the status of every workload apple/container knows about on this
+// host, including stopped ones. It powers node-removal cleanup (#58), which must
+// find and destroy MacVz micro-VMs left behind by an exited kubelet. The caller
+// filters by workload-ID prefix to act only on MacVz-managed VMs. An empty host
+// returns an empty slice, not an error.
+func (d *Driver) List(ctx context.Context) ([]runtime.Status, error) {
+	out, err := d.run.output(ctx, "list", "--all", "--format", "json")
+	if err != nil {
+		return nil, fmt.Errorf("list workloads: %w", mapErr(err))
+	}
+	out = bytes.TrimSpace(out)
+	if len(out) == 0 || string(out) == "null" {
+		return nil, nil
+	}
+	var results []inspectResult
+	if err := json.Unmarshal(out, &results); err != nil {
+		return nil, fmt.Errorf("list workloads: parse output: %w", err)
+	}
+	statuses := make([]runtime.Status, 0, len(results))
+	for _, r := range results {
+		statuses = append(statuses, statusFromInspect(r))
+	}
+	return statuses, nil
+}
+
 // Status returns the current observed state of the workload.
 func (d *Driver) Status(ctx context.Context, id string) (runtime.Status, error) {
 	out, err := d.run.output(ctx, "inspect", id)
@@ -497,8 +524,11 @@ func parseStatus(id string, out []byte) (runtime.Status, error) {
 	if len(results) == 0 {
 		return runtime.Status{}, fmt.Errorf("status %q: %w", id, runtime.ErrNotFound)
 	}
-	r := results[0]
+	return statusFromInspect(results[0]), nil
+}
 
+// statusFromInspect maps one inspect/list snapshot to a runtime.Status.
+func statusFromInspect(r inspectResult) runtime.Status {
 	exitCode := firstInt(r.Status.ExitCode, r.Status.ExitStatus)
 	st := runtime.Status{ID: r.ID, Phase: phaseFor(r.Status.State, r.Status.StartedDate, exitCode)}
 	if exitCode != nil {
@@ -516,7 +546,7 @@ func parseStatus(id string, out []byte) (runtime.Status, error) {
 			break
 		}
 	}
-	return st, nil
+	return st
 }
 
 // phaseFor translates an apple/container state string into a runtime.Phase. A

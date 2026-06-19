@@ -197,8 +197,8 @@ func TestTranslatePodToleratesServiceAccountToken(t *testing.T) {
 }
 
 func TestWorkloadIDIsStableAndDNSSafe(t *testing.T) {
-	id1 := workloadID("default", "alpine", "alpine")
-	id2 := workloadID("default", "alpine", "alpine")
+	id1 := WorkloadID("default", "alpine", "alpine")
+	id2 := WorkloadID("default", "alpine", "alpine")
 	if id1 != id2 {
 		t.Errorf("workloadID not stable: %q != %q", id1, id2)
 	}
@@ -207,7 +207,7 @@ func TestWorkloadIDIsStableAndDNSSafe(t *testing.T) {
 	}
 
 	// Uppercase and illegal characters are sanitized.
-	id := workloadID("Team_A", "My.Pod", "Web/Server")
+	id := WorkloadID("Team_A", "My.Pod", "Web/Server")
 	if !isDNSLabel(id) {
 		t.Errorf("sanitized workloadID %q is not a valid DNS label", id)
 	}
@@ -215,7 +215,7 @@ func TestWorkloadIDIsStableAndDNSSafe(t *testing.T) {
 
 func TestWorkloadIDTruncatesLongNames(t *testing.T) {
 	long := strings.Repeat("x", 100)
-	id := workloadID("ns", long, "container")
+	id := WorkloadID("ns", long, "container")
 	if len(id) > maxWorkloadIDLen {
 		t.Errorf("workloadID length = %d, want <= %d", len(id), maxWorkloadIDLen)
 	}
@@ -223,11 +223,11 @@ func TestWorkloadIDTruncatesLongNames(t *testing.T) {
 		t.Errorf("truncated workloadID %q is not a valid DNS label", id)
 	}
 	// Still stable after truncation.
-	if id != workloadID("ns", long, "container") {
+	if id != WorkloadID("ns", long, "container") {
 		t.Error("truncated workloadID is not stable")
 	}
 	// Distinct inputs produce distinct IDs even when truncated.
-	other := workloadID("ns", long+"y", "container")
+	other := WorkloadID("ns", long+"y", "container")
 	if id == other {
 		t.Error("truncated workloadIDs collide for distinct inputs")
 	}

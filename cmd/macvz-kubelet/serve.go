@@ -260,15 +260,15 @@ func startPodController(ctx context.Context, cfg config.Config, clientset *kuber
 // operator edits the config's peer list and signals the kubelet to add/remove
 // peers and routes in place, with no restart and no disruption to local Pod
 // attachments.
-func setupMesh(ctx context.Context, cfg config.Config, configPath string) (func(), error) {
+func setupMesh(ctx context.Context, cfg config.Config, configPath string) (*wireguard.Mesh, func(), error) {
 	if !cfg.Mesh.Enabled {
 		klog.InfoS("WireGuard mesh disabled; Pods are reachable only on their local node")
-		return func() {}, nil
+		return nil, func() {}, nil
 	}
 
 	ifc, err := cfg.MeshInterfaceConfig()
 	if err != nil {
-		return nil, fmt.Errorf("resolve mesh config: %w", err)
+		return nil, nil, fmt.Errorf("resolve mesh config: %w", err)
 	}
 	var meshOpts []wireguard.Option
 	if cfg.PrivilegedHelperSocket != "" {
@@ -276,7 +276,7 @@ func setupMesh(ctx context.Context, cfg config.Config, configPath string) (func(
 	}
 	mesh := wireguard.New(ifc, meshOpts...)
 	if err := mesh.Up(ctx); err != nil {
-		return nil, fmt.Errorf("bring up mesh interface %q: %w", ifc.Name, err)
+		return nil, nil, fmt.Errorf("bring up mesh interface %q: %w", ifc.Name, err)
 	}
 	klog.InfoS("WireGuard mesh up",
 		"interface", mesh.InterfaceName(),
@@ -292,7 +292,7 @@ func setupMesh(ctx context.Context, cfg config.Config, configPath string) (func(
 		klog.InfoS("mesh peer reload enabled; edit peers then `kill -HUP` the kubelet to reconcile", "config", configPath)
 	}
 
-	return func() {
+	return mesh, func() {
 		// Tear down with a fresh context: the root ctx is already cancelled by
 		// the time cleanup runs during shutdown.
 		if err := mesh.Down(context.Background()); err != nil {
@@ -399,10 +399,13 @@ func buildServingTLSConfig(cert tls.Certificate, clientCAFile string) (*tls.Conf
 // can reach it); it binds to the node's reachable address rather than all
 // interfaces when listenIP is known; and it warns loudly when left
 // unauthenticated so that exposure is a deliberate, network-restricted choice.
-func startKubeletServer(ctx context.Context, cfg config.Config, p *provider.Provider, listenIP string) (func(), error) {
+func startKubeletServer(ctx context.Context, cfg config.Config, p *provider.Provider, listenIP string, diagnostics http.Handler) (func(), error) {
 	if cfg.Node.ServingTLSCertFile == "" || cfg.Node.ServingTLSKeyFile == "" {
 		klog.InfoS("kubelet TLS serving disabled (no servingTLSCertFile/KeyFile); kubectl logs/exec will be unavailable")
-		return func() {}, nil
+		if diagnostics == nil {
+			return func() {}, nil
+		}
+		return startLocalDiagnosticsServer(ctx, cfg, diagnostics)
 	}
 
 	cert, err := tls.LoadX509KeyPair(cfg.Node.ServingTLSCertFile, cfg.Node.ServingTLSKeyFile)
@@ -420,7 +423,7 @@ func startKubeletServer(ctx context.Context, cfg config.Config, p *provider.Prov
 			"or set servingClientCAFile to require API-server mutual TLS.")
 	}
 
-	handler := vkapi.PodHandler(vkapi.PodHandlerConfig{
+	podHandler := vkapi.PodHandler(vkapi.PodHandlerConfig{
 		RunInContainer:        p.RunInContainer,
 		GetContainerLogs:      p.GetContainerLogs,
 		PortForward:           p.PortForward,
@@ -429,6 +432,17 @@ func startKubeletServer(ctx context.Context, cfg config.Config, p *provider.Prov
 		GetStatsSummary:       p.StatsSummary,
 		GetMetricsResource:    p.MetricsResource,
 	}, false)
+
+	// Mount the node health diagnostics on the same hardened endpoint (#56):
+	// /healthz/diagnostics returns the full report (?format=json for machine
+	// output) and answers 503 when the node is not ready for workloads. Logs/exec
+	// and everything else fall through to the pod handler.
+	mux := http.NewServeMux()
+	if diagnostics != nil {
+		mux.Handle("/healthz/diagnostics", diagnostics)
+	}
+	mux.Handle("/", podHandler)
+	handler := mux
 
 	// Bind to the node's reachable address when known, rather than all
 	// interfaces, to minimize the endpoint's exposure.
@@ -458,17 +472,53 @@ func startKubeletServer(ctx context.Context, cfg config.Config, p *provider.Prov
 	}, nil
 }
 
+func startLocalDiagnosticsServer(ctx context.Context, cfg config.Config, diagnostics http.Handler) (func(), error) {
+	port := fmt.Sprintf("%d", cfg.Node.KubeletPort)
+	addr := net.JoinHostPort("127.0.0.1", port)
+	listener, err := listenTCPWithRetry(ctx, addr, kubeletListenTimeout, kubeletListenRetry)
+	if err != nil {
+		return nil, fmt.Errorf("listen on %s: %w", addr, err)
+	}
+
+	mux := http.NewServeMux()
+	mux.Handle("/healthz/diagnostics", diagnostics)
+	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 30 * time.Second}
+	go func() {
+		if err := srv.Serve(listener); err != nil && err != http.ErrServerClosed && ctx.Err() == nil {
+			klog.ErrorS(err, "local diagnostics server stopped unexpectedly")
+		}
+	}()
+	klog.InfoS("local diagnostics endpoint listening", "addr", addr, "tls", false)
+
+	return func() {
+		_ = srv.Close()
+		_ = listener.Close()
+	}, nil
+}
+
 func listenKubeletTLS(ctx context.Context, addr string, tlsCfg *tls.Config) (net.Listener, error) {
 	return listenKubeletTLSWithRetry(ctx, addr, tlsCfg, kubeletListenTimeout, kubeletListenRetry)
 }
 
 func listenKubeletTLSWithRetry(ctx context.Context, addr string, tlsCfg *tls.Config, totalTimeout, retryDelay time.Duration) (net.Listener, error) {
+	return listenWithRetry(ctx, addr, totalTimeout, retryDelay, func() (net.Listener, error) {
+		return tls.Listen("tcp", addr, tlsCfg)
+	})
+}
+
+func listenTCPWithRetry(ctx context.Context, addr string, totalTimeout, retryDelay time.Duration) (net.Listener, error) {
+	return listenWithRetry(ctx, addr, totalTimeout, retryDelay, func() (net.Listener, error) {
+		return net.Listen("tcp", addr)
+	})
+}
+
+func listenWithRetry(ctx context.Context, addr string, totalTimeout, retryDelay time.Duration, listen func() (net.Listener, error)) (net.Listener, error) {
 	deadlineCtx, cancel := context.WithTimeout(ctx, totalTimeout)
 	defer cancel()
 
 	var lastErr error
 	for {
-		ln, err := tls.Listen("tcp", addr, tlsCfg)
+		ln, err := listen()
 		if err == nil {
 			return ln, nil
 		}

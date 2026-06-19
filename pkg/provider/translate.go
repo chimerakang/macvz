@@ -16,9 +16,10 @@ import (
 // which is the strictest constraint apple/container and Kubernetes share.
 const maxWorkloadIDLen = 63
 
-// workloadIDPrefix namespaces every workload this node creates, so MacVz
-// workloads are easy to distinguish from anything else on the host.
-const workloadIDPrefix = "macvz"
+// WorkloadPrefix namespaces every workload this node creates, so MacVz
+// workloads are easy to distinguish from anything else on the host. Node
+// drain/cleanup tooling (#57) matches on it to find micro-VMs this node owns.
+const WorkloadPrefix = "macvz"
 
 // translatePod validates that a Pod is a shape MacVz can run in the MVP and
 // translates its single container into a runtime ContainerSpec. Unsupported
@@ -48,7 +49,7 @@ func translatePod(ctx context.Context, pod *corev1.Pod, policy VolumePolicy, dns
 	if env != nil {
 		spec.Env = env
 	}
-	spec.Name = workloadID(pod.Namespace, pod.Name, c.Name)
+	spec.Name = WorkloadID(pod.Namespace, pod.Name, c.Name)
 	spec.Mounts = vols.mounts
 	spec.DNS, spec.DNSSearch, spec.DNSOptions = resolveDNS(pod, dns)
 	return spec, vols, nil
@@ -143,12 +144,14 @@ func translateContainer(pod *corev1.Pod, c corev1.Container) types.ContainerSpec
 	return spec
 }
 
-// workloadID derives a stable, DNS-safe (RFC 1123 label) workload name from the
+// WorkloadID derives a stable, DNS-safe (RFC 1123 label) workload name from the
 // Pod's identity. The same namespace/name/container always yields the same ID;
 // when the joined name would exceed the label limit it is truncated and made
-// unique with a short hash of the full identity.
-func workloadID(namespace, podName, containerName string) string {
-	id := sanitizeDNSLabel(strings.Join([]string{workloadIDPrefix, namespace, podName, containerName}, "-"))
+// unique with a short hash of the full identity. Drain/cleanup tooling (#57)
+// reuses it to map a live Pod's containers back to the micro-VM names that
+// should exist, so anything else under WorkloadPrefix is an orphan.
+func WorkloadID(namespace, podName, containerName string) string {
+	id := sanitizeDNSLabel(strings.Join([]string{WorkloadPrefix, namespace, podName, containerName}, "-"))
 	if len(id) <= maxWorkloadIDLen {
 		return id
 	}

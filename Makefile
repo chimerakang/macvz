@@ -32,6 +32,11 @@ bench: ## Build the density/RAM benchmark harness into bin/mvz-bench
 	@mkdir -p $(BIN_DIR)
 	go build -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/mvz-bench ./cmd/mvz-bench
 
+.PHONY: mesh
+mesh: ## Build the mesh key/config helper into bin/macvz-mesh
+	@mkdir -p $(BIN_DIR)
+	go build -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/macvz-mesh ./cmd/macvz-mesh
+
 .PHONY: test
 test: ## Run unit tests
 	go test ./...

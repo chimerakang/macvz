@@ -30,6 +30,13 @@ import (
 const envRuntimeBinary = "MACVZ_CONTAINER_BIN"
 
 func main() {
+	// Subcommands (doctor/bootstrap) are dispatched before flag parsing so the
+	// node join workflow (#54) shares this binary without disturbing the default
+	// `macvz-kubelet --config ...` invocation.
+	if handled, code := dispatchSubcommand(os.Args[1:]); handled {
+		os.Exit(code)
+	}
+
 	var (
 		configPath    string
 		runtimeBinary string
@@ -199,7 +206,7 @@ func run(ctx context.Context, configPath, runtimeBinary string) error {
 			"policyEnforced", st.PolicyEnforced, "allow", st.AllowedCommands, "uptime", st.Uptime)
 	}
 
-	stopMesh, err := setupMesh(ctx, cfg, configPath)
+	mesh, stopMesh, err := setupMesh(ctx, cfg, configPath)
 	if err != nil {
 		return fmt.Errorf("setup mesh: %w", err)
 	}
@@ -272,8 +279,13 @@ func run(ctx context.Context, configPath, runtimeBinary string) error {
 	}
 	defer stopPods()
 
+	// Aggregate node health across runtime, control-plane, and data-plane so the
+	// kubelet's /healthz/diagnostics endpoint can explain why the node is or is
+	// not ready for workloads (#56). Built from the live components.
+	diagnostics := newDiagnosticsCollector(cfg, driver, clientset, mesh, podNetRouter)
+
 	// Start the kubelet API server for kubectl logs/exec (no-op without certs).
-	stopServer, err := startKubeletServer(ctx, cfg, p, internalIP)
+	stopServer, err := startKubeletServer(ctx, cfg, p, internalIP, diagnostics)
 	if err != nil {
 		return fmt.Errorf("start kubelet server: %w", err)
 	}

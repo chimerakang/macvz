@@ -109,6 +109,32 @@ func TestRenderIsDeterministic(t *testing.T) {
 	}
 }
 
+func TestConfigBlockRendersStandalonePeer(t *testing.T) {
+	p := Peer{
+		Name:                "mac-02",
+		PublicKey:           testKey(t),
+		Endpoint:            "192.168.1.20:51820",
+		AllowedIPs:          []string{"10.244.2.0/24", "10.99.0.2/32"},
+		PersistentKeepalive: 25,
+	}
+	out := p.ConfigBlock()
+	if !strings.HasPrefix(out, "[Peer]\n") {
+		t.Errorf("ConfigBlock must start with [Peer], got:\n%s", out)
+	}
+	for _, want := range []string{"# mac-02", "PublicKey = " + p.PublicKey.String(), "Endpoint = 192.168.1.20:51820", "AllowedIPs = 10.244.2.0/24, 10.99.0.2/32", "PersistentKeepalive = 25"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("ConfigBlock missing %q\n---\n%s", want, out)
+		}
+	}
+
+	// A peer behind NAT (no endpoint, no keepalive) omits those keys.
+	nat := Peer{Name: "nat", PublicKey: testKey(t), AllowedIPs: []string{"10.244.9.0/24"}}
+	block := nat.ConfigBlock()
+	if strings.Contains(block, "Endpoint") || strings.Contains(block, "PersistentKeepalive") {
+		t.Errorf("NAT peer block must omit Endpoint/PersistentKeepalive:\n%s", block)
+	}
+}
+
 func TestRouteTargetsDedupesAndSorts(t *testing.T) {
 	c := testConfig(t)
 	c.Peers = append(c.Peers, Peer{

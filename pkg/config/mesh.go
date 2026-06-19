@@ -44,15 +44,15 @@ type MeshPeerConfig struct {
 	PublicKey string `yaml:"publicKey"`
 	// Endpoint is the peer's reachable "host:port". May be empty for a peer that
 	// initiates the connection from behind NAT.
-	Endpoint string `yaml:"endpoint"`
+	Endpoint string `yaml:"endpoint,omitempty"`
 	// PodCIDR is the peer's Kubernetes-assigned Pod CIDR, routed through the
 	// tunnel so traffic to its Pods is encrypted and delivered to that node.
 	PodCIDR string `yaml:"podCIDR"`
 	// Address is the peer's mesh address in CIDR form (e.g. "10.99.0.2/32"),
 	// also routed through the tunnel.
-	Address string `yaml:"address"`
+	Address string `yaml:"address,omitempty"`
 	// PersistentKeepalive, in seconds, keeps NAT mappings alive (0 disables it).
-	PersistentKeepalive int `yaml:"persistentKeepalive"`
+	PersistentKeepalive int `yaml:"persistentKeepalive,omitempty"`
 }
 
 // DefaultMeshListenPort is the standard WireGuard UDP port, used when a mesh is

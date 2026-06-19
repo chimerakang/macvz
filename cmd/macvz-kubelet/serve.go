@@ -4,16 +4,19 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"os"
 	"path"
+	"syscall"
 	"time"
 
 	"github.com/chimerakang/macvz/pkg/config"
 	"github.com/chimerakang/macvz/pkg/network"
 	"github.com/chimerakang/macvz/pkg/network/podnet"
+	"github.com/chimerakang/macvz/pkg/network/svcroute"
 	"github.com/chimerakang/macvz/pkg/network/wireguard"
 	"github.com/chimerakang/macvz/pkg/provider"
 	vknode "github.com/virtual-kubelet/virtual-kubelet/node"
@@ -36,6 +39,62 @@ const informerResync = time.Minute
 // podCIDRWaitTimeout bounds how long startup waits for Kubernetes to assign this
 // node a Pod CIDR before continuing without coordinated IPAM.
 const podCIDRWaitTimeout = 30 * time.Second
+
+const (
+	apiReachabilityTimeout = 30 * time.Second
+	apiReachabilityProbe   = 5 * time.Second
+	apiReachabilityRetry   = time.Second
+	kubeletListenTimeout   = 10 * time.Second
+	kubeletListenRetry     = 250 * time.Millisecond
+)
+
+// waitForAPIServer verifies the Kubernetes API is reachable after the host data
+// plane has finished mutating routes. This keeps route churn failures in the
+// startup path, before Virtual Kubelet starts its long-lived controllers.
+func waitForAPIServer(ctx context.Context, clientset kubernetes.Interface) error {
+	return waitForAPIServerWithTimeout(ctx, clientset, apiReachabilityTimeout, apiReachabilityProbe, apiReachabilityRetry)
+}
+
+func waitForAPIServerWithTimeout(ctx context.Context, clientset kubernetes.Interface, totalTimeout, probeTimeout, retryDelay time.Duration) error {
+	deadlineCtx, cancel := context.WithTimeout(ctx, totalTimeout)
+	defer cancel()
+
+	var lastErr error
+	for {
+		errCh := make(chan error, 1)
+		go func() {
+			_, err := clientset.Discovery().ServerVersion()
+			errCh <- err
+		}()
+
+		select {
+		case err := <-errCh:
+			if err == nil {
+				klog.InfoS("Kubernetes API reachable after data-plane setup")
+				return nil
+			}
+			lastErr = err
+			klog.ErrorS(err, "Kubernetes API reachability probe failed; retrying")
+		case <-time.After(probeTimeout):
+			lastErr = fmt.Errorf("API probe timed out after %s", probeTimeout)
+			klog.ErrorS(lastErr, "Kubernetes API reachability probe failed; retrying")
+		case <-deadlineCtx.Done():
+			if lastErr == nil {
+				lastErr = deadlineCtx.Err()
+			}
+			return fmt.Errorf("API did not answer within %s: %w", totalTimeout, lastErr)
+		}
+
+		select {
+		case <-deadlineCtx.Done():
+			if lastErr == nil {
+				lastErr = deadlineCtx.Err()
+			}
+			return fmt.Errorf("API did not answer within %s: %w", totalTimeout, lastErr)
+		case <-time.After(retryDelay):
+		}
+	}
+}
 
 // setupIPAM enables coordinated Pod IPAM for this node. The address range is the
 // node's Kubernetes-assigned Spec.PodCIDR (or cfg.Node.PodCIDR when set as an
@@ -158,7 +217,12 @@ func startPodController(ctx context.Context, cfg config.Config, clientset *kuber
 // cleanup func that tears it back down. The mesh encrypts and routes cross-host
 // Pod traffic (issue #21); each peer's Pod CIDR becomes a route through the
 // tunnel. When the mesh is disabled it is a no-op returning a no-op cleanup.
-func setupMesh(ctx context.Context, cfg config.Config) (func(), error) {
+//
+// When configPath is set, it also starts a SIGHUP-driven reconciler (#42): an
+// operator edits the config's peer list and signals the kubelet to add/remove
+// peers and routes in place, with no restart and no disruption to local Pod
+// attachments.
+func setupMesh(ctx context.Context, cfg config.Config, configPath string) (func(), error) {
 	if !cfg.Mesh.Enabled {
 		klog.InfoS("WireGuard mesh disabled; Pods are reachable only on their local node")
 		return func() {}, nil
@@ -168,7 +232,11 @@ func setupMesh(ctx context.Context, cfg config.Config) (func(), error) {
 	if err != nil {
 		return nil, fmt.Errorf("resolve mesh config: %w", err)
 	}
-	mesh := wireguard.New(ifc)
+	var meshOpts []wireguard.Option
+	if cfg.PrivilegedHelperSocket != "" {
+		meshOpts = append(meshOpts, wireguard.WithHelperSocket(cfg.PrivilegedHelperSocket))
+	}
+	mesh := wireguard.New(ifc, meshOpts...)
 	if err := mesh.Up(ctx); err != nil {
 		return nil, fmt.Errorf("bring up mesh interface %q: %w", ifc.Name, err)
 	}
@@ -178,6 +246,13 @@ func setupMesh(ctx context.Context, cfg config.Config) (func(), error) {
 		"peers", mesh.Peers(),
 		"routes", mesh.InstalledRoutes(),
 	)
+
+	// Reconcile peers on SIGHUP so nodes can join/leave without a restart (#42).
+	// Requires the config path to reload; with no --config it is skipped.
+	if configPath != "" {
+		go watchMeshReload(ctx, mesh, configPath, cfg.PrivilegedHelperSocket)
+		klog.InfoS("mesh peer reload enabled; edit peers then `kill -HUP` the kubelet to reconcile", "config", configPath)
+	}
 
 	return func() {
 		// Tear down with a fresh context: the root ctx is already cancelled by
@@ -192,25 +267,63 @@ func setupMesh(ctx context.Context, cfg config.Config) (func(), error) {
 // it to the provider so each micro-VM is reachable at its Pod IP across the mesh
 // (#22). It returns a cleanup func that flushes the host rules. When disabled it
 // is a no-op returning a no-op cleanup.
-func setupPodNetwork(ctx context.Context, cfg config.Config, p *provider.Provider) (func(), error) {
+func setupPodNetwork(ctx context.Context, cfg config.Config, p *provider.Provider) (*podnet.Router, func(), error) {
 	if !cfg.PodNetwork.Enabled {
 		klog.InfoS("Pod network path disabled; Pods keep the runtime host-only address")
-		return func() {}, nil
+		return nil, func() {}, nil
 	}
 
-	router := podnet.New(cfg.PodNetworkRouterConfig())
+	var pnOpts []podnet.Option
+	if cfg.PrivilegedHelperSocket != "" {
+		pnOpts = append(pnOpts, podnet.WithHelperSocket(cfg.PrivilegedHelperSocket))
+	}
+	router := podnet.New(cfg.PodNetworkRouterConfig(), pnOpts...)
 	if err := router.Start(ctx); err != nil {
-		return nil, fmt.Errorf("start pod network path: %w", err)
+		return nil, nil, fmt.Errorf("start pod network path: %w", err)
 	}
 	p.SetPodNetwork(router)
 	klog.InfoS("Pod network path started", "interface", cfg.PodNetwork.Interface)
 
-	return func() {
+	return router, func() {
 		if err := router.Stop(context.Background()); err != nil {
 			klog.ErrorS(err, "failed to stop pod network path")
 		}
 	}, nil
 }
+
+// startServiceController runs the ClusterIP Service route controller (#37). It
+// watches Services and EndpointSlices cluster-wide and programs the podnet
+// anchor with rdr DNAT rules so micro-VMs can reach Service ClusterIPs. It is a
+// no-op (nil router) when the Pod network path is disabled — without it there is
+// nothing to program. Returns a cleanup that stops the controller.
+func startServiceController(ctx context.Context, cfg config.Config, clientset *kubernetes.Clientset, router *podnet.Router) func() {
+	if router == nil {
+		klog.InfoS("ClusterIP service routing disabled (Pod network path is off)")
+		return func() {}
+	}
+	factory := informers.NewSharedInformerFactory(clientset, informerResync)
+	ctrl := svcroute.New(router, factory)
+
+	ctlCtx, cancel := context.WithCancel(ctx)
+	factory.Start(ctlCtx.Done())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if err := ctrl.Run(ctlCtx, serviceControllerWorkers); err != nil && ctlCtx.Err() == nil {
+			klog.ErrorS(err, "service route controller stopped unexpectedly")
+		}
+	}()
+	klog.InfoS("ClusterIP service routing enabled", "interface", cfg.PodNetwork.Interface)
+	// Wait for the controller to drain on cleanup so no reconcile races the
+	// router's Stop (the Pod network path is torn down right after this).
+	return func() {
+		cancel()
+		<-done
+	}
+}
+
+// serviceControllerWorkers is the concurrency of the service route controller.
+const serviceControllerWorkers = 2
 
 // buildServingTLSConfig assembles the TLS config for the kubelet HTTPS server.
 // When clientCAFile is set, the server requires and verifies a client
@@ -288,7 +401,7 @@ func startKubeletServer(ctx context.Context, cfg config.Config, p *provider.Prov
 	} else {
 		klog.InfoS("kubelet endpoint binding to all interfaces (no internal IP resolved); consider setting node.internalIP", "port", port)
 	}
-	listener, err := tls.Listen("tcp", addr, tlsCfg)
+	listener, err := listenKubeletTLS(ctx, addr, tlsCfg)
 	if err != nil {
 		return nil, fmt.Errorf("listen on %s: %w", addr, err)
 	}
@@ -305,4 +418,36 @@ func startKubeletServer(ctx context.Context, cfg config.Config, p *provider.Prov
 		_ = srv.Close()
 		_ = listener.Close()
 	}, nil
+}
+
+func listenKubeletTLS(ctx context.Context, addr string, tlsCfg *tls.Config) (net.Listener, error) {
+	return listenKubeletTLSWithRetry(ctx, addr, tlsCfg, kubeletListenTimeout, kubeletListenRetry)
+}
+
+func listenKubeletTLSWithRetry(ctx context.Context, addr string, tlsCfg *tls.Config, totalTimeout, retryDelay time.Duration) (net.Listener, error) {
+	deadlineCtx, cancel := context.WithTimeout(ctx, totalTimeout)
+	defer cancel()
+
+	var lastErr error
+	for {
+		ln, err := tls.Listen("tcp", addr, tlsCfg)
+		if err == nil {
+			return ln, nil
+		}
+		if !isAddrInUse(err) {
+			return nil, err
+		}
+		lastErr = err
+		klog.ErrorS(err, "kubelet API port still in use; retrying", "addr", addr)
+
+		select {
+		case <-deadlineCtx.Done():
+			return nil, fmt.Errorf("address still in use after %s: %w", totalTimeout, lastErr)
+		case <-time.After(retryDelay):
+		}
+	}
+}
+
+func isAddrInUse(err error) bool {
+	return errors.Is(err, syscall.EADDRINUSE)
 }

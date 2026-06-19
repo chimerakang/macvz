@@ -20,6 +20,7 @@ const (
 	defaultWireGuardGo = "wireguard-go"
 	defaultIfconfig    = "ifconfig"
 	defaultRoute       = "route"
+	defaultPkill       = "pkill"
 )
 
 // tools names the external binaries the Mesh drives.
@@ -28,6 +29,7 @@ type tools struct {
 	wireguardGo string
 	ifconfig    string
 	route       string
+	pkill       string
 }
 
 // Mesh manages this node's WireGuard interface and the host routes that steer
@@ -75,7 +77,7 @@ func WithTools(wg, wireguardGo, ifconfig, route string) Option {
 func New(cfg InterfaceConfig, opts ...Option) *Mesh {
 	m := &Mesh{
 		run:    cliRunner{},
-		tools:  tools{wg: defaultWG, wireguardGo: defaultWireGuardGo, ifconfig: defaultIfconfig, route: defaultRoute},
+		tools:  tools{wg: defaultWG, wireguardGo: defaultWireGuardGo, ifconfig: defaultIfconfig, route: defaultRoute, pkill: defaultPkill},
 		cfg:    cfg,
 		routes: map[string]bool{},
 	}
@@ -83,6 +85,16 @@ func New(cfg InterfaceConfig, opts ...Option) *Mesh {
 		opt(m)
 	}
 	return m
+}
+
+// WithPkillTool overrides the process-kill binary used to stop wireguard-go on
+// teardown. Empty keeps the default.
+func WithPkillTool(pkill string) Option {
+	return func(m *Mesh) {
+		if pkill != "" {
+			m.tools.pkill = pkill
+		}
+	}
 }
 
 // InterfaceName returns the managed interface name.
@@ -193,13 +205,22 @@ func (m *Mesh) Down(ctx context.Context) error {
 	if _, err := m.runTolerating(ctx, command{Name: m.tools.ifconfig, Args: []string{m.cfg.Name, "down"}}, errInterfaceMissing); err != nil {
 		klog.ErrorS(err, "wireguard: failed to bring interface down", "interface", m.cfg.Name)
 	}
-	// wireguard-go installs the utun; remove it so the name is reusable.
-	if _, err := m.runTolerating(ctx, command{Name: m.tools.ifconfig, Args: []string{m.cfg.Name, "destroy"}}, errInterfaceMissing); err != nil {
+	// wireguard-go owns the utun lifecycle. macOS refuses SIOCIFDESTROY for these
+	// interfaces while the process is alive, so stop the matching userspace
+	// process first, then keep ifconfig destroy as a best-effort fallback.
+	if _, err := m.runTolerating(ctx, m.killWireGuardGoCmd(), errNoMatchingProcess); err != nil {
+		klog.ErrorS(err, "wireguard: failed to stop wireguard-go", "interface", m.cfg.Name)
+	}
+	if _, err := m.runTolerating(ctx, command{Name: m.tools.ifconfig, Args: []string{m.cfg.Name, "destroy"}}, errInterfaceMissing, errDestroyInvalid); err != nil {
 		klog.ErrorS(err, "wireguard: failed to destroy interface", "interface", m.cfg.Name)
 	}
 	m.up = false
 	klog.InfoS("wireguard mesh down", "interface", m.cfg.Name)
 	return nil
+}
+
+func (m *Mesh) killWireGuardGoCmd() command {
+	return command{Name: m.tools.pkill, Args: []string{"-f", "wireguard-go " + m.cfg.Name}}
 }
 
 // InstalledRoutes returns the route targets currently installed, sorted. It
@@ -282,11 +303,13 @@ func (m *Mesh) runTolerating(ctx context.Context, c command, benign ...string) (
 
 // Benign stderr fragments that make operations idempotent across re-runs.
 const (
-	errInterfaceExists  = "already exists"
-	errInterfaceMissing = "does not exist"
-	errAddressExists    = "already in list"
-	errRouteExists      = "file exists"
-	errRouteMissing     = "not in table"
+	errInterfaceExists   = "already exists"
+	errInterfaceMissing  = "does not exist"
+	errDestroyInvalid    = "invalid argument"
+	errAddressExists     = "already in list"
+	errRouteExists       = "file exists"
+	errRouteMissing      = "not in table"
+	errNoMatchingProcess = "no matching processes"
 )
 
 // addressIP extracts the bare IP from a CIDR mesh address.

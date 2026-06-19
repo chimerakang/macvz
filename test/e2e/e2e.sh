@@ -20,6 +20,14 @@
 #   MACVZ_E2E_NAMESPACE   Namespace for test objects. Default: macvz-e2e.
 #   MACVZ_E2E_DIAG_DIR    Directory for failure diagnostics. Default: a mktemp dir.
 #   MACVZ_E2E_TIMEOUT     Per-wait timeout (seconds). Default: 120.
+#   MACVZ_E2E_DIAG_SSH    Command template to reach a node for privileged
+#                         node-level network diagnostics (#43), with the literal
+#                         token {node} replaced by the node name. Example:
+#                           export MACVZ_E2E_DIAG_SSH='ssh -o ConnectTimeout=5 admin@{node}.local'
+#                         When the local host IS a target node it is collected
+#                         locally (sudo). Unset and not-local nodes are skipped
+#                         with a note. The collector (collect-node-diag.sh) is
+#                         read-only and masks secrets before output.
 set -uo pipefail
 
 KUBECTL="${KUBECTL:-kubectl}"
@@ -288,17 +296,82 @@ wait_endpoints() {
 }
 
 # --- diagnostics + teardown --------------------------------------------------
+# Path to the self-contained node-level collector (resolved next to this script).
+DIAG_COLLECTOR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/collect-node-diag.sh"
+
+# redact masks any secret material (wg keys, tokens, kubeconfig key-data,
+# passwords) in a stream so the kube-level bundle is safe to attach to an issue.
+# It reuses the collector's filter mode so redaction lives in exactly one place.
+redact() {
+	if [ -r "$DIAG_COLLECTOR" ]; then
+		bash "$DIAG_COLLECTOR" redact
+	else
+		cat
+	fi
+}
+
+# dump_diagnostics captures cluster-side state: node readiness/PodCIDRs, Pods,
+# the EndpointSlices that decide Service membership, and recent events. This is
+# always available from the control machine (no node access needed) and tells
+# endpoint/kube-proxy issues apart from data-plane ones.
 dump_diagnostics() {
-	log "Capturing diagnostics to $DIAG_DIR"
+	log "Capturing cluster diagnostics to $DIAG_DIR"
 	{
 		echo "### nodes"; k get nodes -o wide
-		local n; for n in "${NODES[@]}"; do echo "### describe node $n"; k describe "node/$n"; done
+		local n
+		for n in "${NODES[@]}"; do
+			echo "### describe node $n"; k describe "node/$n"
+			echo "### node $n PodCIDR(s)"
+			k get node "$n" -o jsonpath='{.spec.podCIDR}{"\n"}{.spec.podCIDRs}{"\n"}' 2>/dev/null
+		done
 		echo "### pods"; k -n "$NS" get pods -o wide
 		echo "### describe pods"; k -n "$NS" describe pods
-		echo "### endpoints"; k -n "$NS" get endpoints,endpointslices -o wide
+		echo "### endpoints"; k -n "$NS" get endpoints -o wide
+		echo "### endpointslices (yaml)"; k -n "$NS" get endpointslices -o yaml
 		echo "### events"; k -n "$NS" get events --sort-by=.lastTimestamp
-	} >"$DIAG_DIR/diagnostics.txt" 2>&1
-	log "Diagnostics written: $DIAG_DIR/diagnostics.txt"
+	} 2>&1 | redact >"$DIAG_DIR/diagnostics.txt"
+	log "Cluster diagnostics written: $DIAG_DIR/diagnostics.txt"
+
+	collect_node_diagnostics
+}
+
+# collect_node_diagnostics gathers per-node privileged network state (WireGuard
+# handshakes, routes, pf anchor rules, forwarding sysctl, bridge) by running the
+# read-only collector on each node — locally when this host is the node, else via
+# the MACVZ_E2E_DIAG_SSH hook. Each node's bundle lands in node-<name>.txt.
+collect_node_diagnostics() {
+	if [ ! -r "$DIAG_COLLECTOR" ]; then
+		log "Node collector not found at $DIAG_COLLECTOR; skipping node-level diagnostics"
+		return
+	fi
+	local self n out
+	self="$(hostname -s 2>/dev/null || hostname 2>/dev/null)"
+	for n in "${NODES[@]}"; do
+		out="$DIAG_DIR/node-$n.txt"
+		if [ "$n" = "$self" ]; then
+			log "Collecting node diagnostics locally for $n"
+			if [ "$(id -u)" -eq 0 ]; then
+				bash "$DIAG_COLLECTOR" >"$out" 2>&1
+			else
+				# The redirect is intentionally the user's (DIAG_DIR is user-owned);
+				# only the collector itself needs root.
+				# shellcheck disable=SC2024
+				sudo -n bash "$DIAG_COLLECTOR" >"$out" 2>&1 ||
+					echo "local collection needs root; re-run e2e as root or with passwordless sudo" >"$out"
+			fi
+			log "Node diagnostics: $out"
+		elif [ -n "${MACVZ_E2E_DIAG_SSH:-}" ]; then
+			local sshcmd="${MACVZ_E2E_DIAG_SSH//\{node\}/$n}"
+			log "Collecting node diagnostics for $n via: $sshcmd"
+			# Pipe the collector over ssh so nothing needs pre-staging on the node.
+			# The collector already redacts before printing.
+			$sshcmd sudo bash -s <"$DIAG_COLLECTOR" >"$out" 2>&1 ||
+				echo "remote collection via '$sshcmd' failed (exit $?); check the hook and node sudo access" >>"$out"
+			log "Node diagnostics: $out"
+		else
+			log "No diagnostics hook for node $n (set MACVZ_E2E_DIAG_SSH='ssh user@{node}' to enable); skipping"
+		fi
+	done
 }
 
 teardown() {

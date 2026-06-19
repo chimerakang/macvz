@@ -35,6 +35,16 @@ type ContainerSpec struct {
 	// they should be applied. The runtime realizes each as a VirtioFS share (or a
 	// guest tmpfs); the provider is responsible for validating sources.
 	Mounts []Mount
+
+	// DNS are nameserver IPs written into the micro-VM's resolv.conf (passed as
+	// `--dns`). Empty leaves the image's baked DNS in place. Cluster DNS lets the
+	// guest resolve Service names (#37).
+	DNS []string
+	// DNSSearch are resolv.conf search domains (passed as `--dns-search`).
+	DNSSearch []string
+	// DNSOptions are resolv.conf options such as "ndots:5" (passed as
+	// `--dns-option`).
+	DNSOptions []string
 }
 
 // Mount describes one filesystem mount inside the micro-VM. A bind mount shares

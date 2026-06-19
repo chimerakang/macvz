@@ -17,6 +17,7 @@ import (
 
 	"github.com/chimerakang/macvz/internal/version"
 	"github.com/chimerakang/macvz/pkg/config"
+	"github.com/chimerakang/macvz/pkg/network/privhelper"
 	"github.com/chimerakang/macvz/pkg/provider"
 	"github.com/chimerakang/macvz/pkg/runtime/container"
 	vknode "github.com/virtual-kubelet/virtual-kubelet/node"
@@ -93,14 +94,12 @@ func run(ctx context.Context, configPath, runtimeBinary string) error {
 		klog.InfoS("apple/container runtime is ready")
 	}
 
-	// Build the Kubernetes client from kubeconfig / in-cluster config.
+	// Resolve Kubernetes client config now, but delay constructing the clientset
+	// until after the data plane has mutated host routes. That avoids carrying a
+	// client-go transport across WireGuard/vmnet route changes on remote-API nodes.
 	restCfg, err := cfg.RestConfig()
 	if err != nil {
 		return fmt.Errorf("kubernetes client config: %w", err)
-	}
-	clientset, err := kubernetes.NewForConfig(restCfg)
-	if err != nil {
-		return fmt.Errorf("build kubernetes client: %w", err)
 	}
 
 	internalIP := cfg.Node.InternalIP
@@ -115,6 +114,10 @@ func run(ctx context.Context, configPath, runtimeBinary string) error {
 		provider.WithVolumePolicy(provider.VolumePolicy{
 			Root:                    cfg.Node.Volumes.Root,
 			HostPathAllowedPrefixes: cfg.Node.Volumes.HostPathAllowedPrefixes,
+		}),
+		provider.WithDNS(provider.DNSConfig{
+			ClusterDNS:    cfg.Node.ClusterDNS,
+			ClusterDomain: cfg.Node.ClusterDomain,
 		}),
 	)
 
@@ -171,6 +174,51 @@ func run(ctx context.Context, configPath, runtimeBinary string) error {
 		vknode.WithNodeStatusUpdateInterval(statusInterval),
 		vknode.WithNodeStatusUpdateErrorHandler(statusErrHandler),
 	}
+	// Bring the host data plane up BEFORE the node controller connects to the API
+	// server. The mesh/route changes perturb host routing, and doing them after the
+	// long-lived API (HTTP/2) connection is established severs it on a node whose
+	// API server is remote — client-go then wedges on "no route to host" and the
+	// node flaps NotReady. Establishing the API connection over the final routing
+	// avoids that (the data plane needs only static config, not registration).
+	if cfg.PrivilegedHelperSocket != "" && (cfg.Mesh.Enabled || cfg.PodNetwork.Enabled) {
+		hc := privhelper.NewClient(cfg.PrivilegedHelperSocket)
+		st, err := hc.Status(ctx)
+		if err != nil {
+			return fmt.Errorf("privileged network helper not reachable at %s (start macvz-netd as root): %w", cfg.PrivilegedHelperSocket, err)
+		}
+		// Confirm the exec path itself works (the socket may answer status while the
+		// daemon lacks the privileges to run commands).
+		if err := hc.Ping(ctx); err != nil {
+			return fmt.Errorf("privileged network helper at %s answered status but cannot run commands: %w", cfg.PrivilegedHelperSocket, err)
+		}
+		if !st.PolicyEnforced {
+			return fmt.Errorf("privileged network helper at %s is running without per-request policy validation; start macvz-netd with --config", cfg.PrivilegedHelperSocket)
+		}
+		klog.InfoS("privileged network helper reachable",
+			"socket", cfg.PrivilegedHelperSocket, "version", st.Version, "protocol", st.Protocol,
+			"policyEnforced", st.PolicyEnforced, "allow", st.AllowedCommands, "uptime", st.Uptime)
+	}
+
+	stopMesh, err := setupMesh(ctx, cfg, configPath)
+	if err != nil {
+		return fmt.Errorf("setup mesh: %w", err)
+	}
+	defer stopMesh()
+
+	podNetRouter, stopPodNet, err := setupPodNetwork(ctx, cfg, p)
+	if err != nil {
+		return fmt.Errorf("setup pod network: %w", err)
+	}
+	defer stopPodNet()
+
+	clientset, err := kubernetes.NewForConfig(restCfg)
+	if err != nil {
+		return fmt.Errorf("build kubernetes client after data-plane setup: %w", err)
+	}
+	if err := waitForAPIServer(ctx, clientset); err != nil {
+		return fmt.Errorf("kubernetes API not reachable after data-plane setup: %w", err)
+	}
+
 	if cfg.Node.EnableLease {
 		// The Lease in kube-node-lease is the modern node heartbeat; Kubernetes
 		// marks the node NotReady if it is not renewed within the lease duration.
@@ -211,21 +259,11 @@ func run(ctx context.Context, configPath, runtimeBinary string) error {
 		return fmt.Errorf("setup pod IPAM: %w", err)
 	}
 
-	// Bring up the cross-host WireGuard mesh (if enabled) so remote Pod CIDRs are
-	// routed through encrypted tunnels before Pods start landing on this node.
-	stopMesh, err := setupMesh(ctx, cfg)
-	if err != nil {
-		return fmt.Errorf("setup mesh: %w", err)
-	}
-	defer stopMesh()
-
-	// Start the host Pod network path so each micro-VM is reachable at its Pod IP
-	// across the mesh, and attach it to the provider before Pods are reconciled.
-	stopPodNet, err := setupPodNetwork(ctx, cfg, p)
-	if err != nil {
-		return fmt.Errorf("setup pod network: %w", err)
-	}
-	defer stopPodNet()
+	// Program ClusterIP Service routing into the Pod network anchor so micro-VMs
+	// can reach Services (#37). The Pod network path was brought up before node
+	// registration (see above); the router is reused here. No-op when disabled.
+	stopSvc := startServiceController(ctx, cfg, clientset, podNetRouter)
+	defer stopSvc()
 
 	// Start the Pod lifecycle controller so scheduled Pods become micro-VMs.
 	stopPods, err := startPodController(ctx, cfg, clientset, p, runtime.NumCPU())

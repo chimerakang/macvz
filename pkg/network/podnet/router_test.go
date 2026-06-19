@@ -79,6 +79,9 @@ func TestStartEnablesForwardingAndPF(t *testing.T) {
 	if !contains(cmds, "pfctl -a macvz/pods -f -") {
 		t.Errorf("Start did not load a baseline anchor\nran: %v", cmds)
 	}
+	if !contains(cmds, "route -q -n delete -inet default -interface bridge100") {
+		t.Errorf("Start did not remove vmnet default route\nran: %v", cmds)
+	}
 }
 
 func TestStartToleratesPFAlreadyEnabled(t *testing.T) {
@@ -87,6 +90,24 @@ func TestStartToleratesPFAlreadyEnabled(t *testing.T) {
 	rt := newTestRouter(fr)
 	if err := rt.Start(context.Background()); err != nil {
 		t.Fatalf("Start should tolerate 'pf already enabled', got: %v", err)
+	}
+}
+
+func TestStartToleratesMissingVMNetDefaultRoute(t *testing.T) {
+	fr := newFakeRunner()
+	fr.failOn["route -q -n delete -inet default -interface bridge100"] = "route: writing to routing socket: not in table"
+	rt := newTestRouter(fr)
+	if err := rt.Start(context.Background()); err != nil {
+		t.Fatalf("Start should tolerate missing vmnet default route, got: %v", err)
+	}
+}
+
+func TestStartFailsWhenVMNetDefaultRouteCleanupFails(t *testing.T) {
+	fr := newFakeRunner()
+	fr.failOn["route -q -n delete -inet default -interface bridge100"] = "route: permission denied"
+	rt := newTestRouter(fr)
+	if err := rt.Start(context.Background()); err == nil {
+		t.Fatal("Start should fail when vmnet default route cleanup fails")
 	}
 }
 
@@ -108,6 +129,9 @@ func TestAttachInstallsBinatRule(t *testing.T) {
 	if err := rt.Attach(ctx, ep); err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
+	if got := countContaining(fr.strings(), "route -q -n delete -inet default -interface bridge100"); got < 2 {
+		t.Errorf("Attach should re-remove vmnet default route after VM start; got %d cleanup calls", got)
+	}
 	rules, ok := fr.lastAnchorLoad()
 	if !ok {
 		t.Fatal("no anchor load recorded")
@@ -119,6 +143,16 @@ func TestAttachInstallsBinatRule(t *testing.T) {
 	if eps := rt.Endpoints(); len(eps) != 1 || eps[0].PodKey != "default/web" {
 		t.Errorf("Endpoints = %v, want [default/web]", eps)
 	}
+}
+
+func countContaining(haystack []string, sub string) int {
+	n := 0
+	for _, s := range haystack {
+		if strings.Contains(s, sub) {
+			n++
+		}
+	}
+	return n
 }
 
 func TestAttachValidatesEndpoint(t *testing.T) {

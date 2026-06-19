@@ -22,7 +22,7 @@ const workloadIDPrefix = "macvz"
 // translates its single container into a runtime ContainerSpec. Unsupported
 // shapes return a clear error so the caller can surface a Kubernetes-facing
 // Failed status rather than silently running a partial workload.
-func translatePod(pod *corev1.Pod, policy VolumePolicy) (types.ContainerSpec, resolvedVolumes, error) {
+func translatePod(pod *corev1.Pod, policy VolumePolicy, dns DNSConfig) (types.ContainerSpec, resolvedVolumes, error) {
 	if reasons := unsupportedReasons(pod); len(reasons) > 0 {
 		return types.ContainerSpec{}, resolvedVolumes{}, fmt.Errorf("unsupported Pod spec: %s", strings.Join(reasons, "; "))
 	}
@@ -34,6 +34,7 @@ func translatePod(pod *corev1.Pod, policy VolumePolicy) (types.ContainerSpec, re
 	spec := translateContainer(pod, c)
 	spec.Name = workloadID(pod.Namespace, pod.Name, c.Name)
 	spec.Mounts = vols.mounts
+	spec.DNS, spec.DNSSearch, spec.DNSOptions = resolveDNS(pod, dns)
 	return spec, vols, nil
 }
 

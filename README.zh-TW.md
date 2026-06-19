@@ -130,4 +130,5 @@ macvz/
 - **密度受限於 RAM，而非容器式的 kernel 共享。** 每個 micro-VM 自帶 kernel 與固定記憶體下限。請在階段一就驗證單機實際的並發 VM 上限與每 VM 開銷——這決定專案的實用容量。
 - **映像架構。** Guest 為 arm64。拉取 amd64 映像需使用 arm64 variant 或 Rosetta-for-Linux 支援；應向使用者明確說明。
 - **安全。** `macvz-kubelet` ↔ API server 的通道必須使用叢集既有的 mTLS/RBAC。不要對外公開 runtime 服務或節點埠口。映像倉庫憑證與任何機密均來自 Kubernetes Secrets／環境變數，絕不硬編碼。
+- **特權網路需要 root 工具，但 kubelet 以你的使用者身分執行。** 跨 Mac 資料平面（WireGuard 網格 + pf／route／sysctl）需要 root，但 `apple/container` 拒絕以 root 執行——因此 `macvz-kubelet` 以使用者身分執行，並透過 unix socket 將特權命令委派給 `macvz-netd` 輔助常駐程式。輔助程式只需用 `sudo` 安裝一次；日常啟動 kubelet 不需提權。完整的安裝與復原手冊見 [docs/PRIVILEGED_NETWORKING.md](docs/PRIVILEGED_NETWORKING.md)。
 - **Entitlement 與簽章。** `macvz-kubelet` 以常駐行程執行，需要虛擬化 entitlement，並須正確簽章（對外分發還需 notarization）。

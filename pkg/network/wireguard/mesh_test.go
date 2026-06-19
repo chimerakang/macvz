@@ -181,6 +181,73 @@ func TestSyncAddsAndRemovesPeersAndRoutes(t *testing.T) {
 	}
 }
 
+func TestSyncIsIdempotent(t *testing.T) {
+	fr := newFakeRunner()
+	cfg := testConfig(t)
+	m := New(cfg, WithRunner(fr))
+	ctx := context.Background()
+	if err := m.Up(ctx); err != nil {
+		t.Fatalf("Up: %v", err)
+	}
+	routesAfterUp := append([]string(nil), m.InstalledRoutes()...)
+	mark := len(fr.strings())
+
+	// Re-applying the identical peer set must not add or delete any route.
+	for i := 0; i < 2; i++ {
+		if err := m.Sync(ctx, cfg.Peers); err != nil {
+			t.Fatalf("Sync #%d: %v", i, err)
+		}
+	}
+	for _, c := range fr.strings()[mark:] {
+		if strings.Contains(c, "route -q -n add") || strings.Contains(c, "route -q -n delete") {
+			t.Errorf("idempotent Sync issued a route change: %q", c)
+		}
+	}
+	if got := m.InstalledRoutes(); len(got) != len(routesAfterUp) {
+		t.Errorf("routes changed after idempotent sync: %v -> %v", routesAfterUp, got)
+	}
+	if names := m.Peers(); len(names) != 1 || names[0] != "mac-02" {
+		t.Errorf("Peers = %v, want [mac-02]", names)
+	}
+}
+
+func TestSyncAddingPeerPreservesExisting(t *testing.T) {
+	fr := newFakeRunner()
+	cfg := testConfig(t)
+	m := New(cfg, WithRunner(fr))
+	ctx := context.Background()
+	if err := m.Up(ctx); err != nil {
+		t.Fatalf("Up: %v", err)
+	}
+	mark := len(fr.strings())
+
+	// Add a second peer while keeping the original. Adding a node must never tear
+	// down an existing peer's route (which is what a local Pod attachment relies
+	// on), so no `route delete` may run.
+	extra := Peer{Name: "mac-09", PublicKey: testKey(t), AllowedIPs: []string{"10.244.9.0/24"}}
+	next := append(append([]Peer(nil), cfg.Peers...), extra)
+	if err := m.Sync(ctx, next); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	for _, c := range fr.strings()[mark:] {
+		if strings.Contains(c, "route -q -n delete") {
+			t.Errorf("adding a peer must not delete existing routes: %q", c)
+		}
+	}
+	if !contains(fr.strings(), "route -q -n add -inet 10.244.9.0/24 -interface utun7") {
+		t.Errorf("new peer's route was not added\nran: %v", fr.strings())
+	}
+	routes := map[string]bool{}
+	for _, r := range m.InstalledRoutes() {
+		routes[r] = true
+	}
+	for _, want := range []string{"10.244.2.0/24", "10.99.0.2/32", "10.244.9.0/24"} {
+		if !routes[want] {
+			t.Errorf("route %q missing after add (have %v)", want, m.InstalledRoutes())
+		}
+	}
+}
+
 func TestSyncBeforeUpFails(t *testing.T) {
 	m := New(testConfig(t), WithRunner(newFakeRunner()))
 	if err := m.Sync(context.Background(), nil); err == nil {
@@ -205,6 +272,9 @@ func TestDownRemovesRoutesAndInterface(t *testing.T) {
 	if !contains(cmds, "ifconfig utun7 destroy") {
 		t.Errorf("Down did not destroy the interface\nran: %v", cmds)
 	}
+	if !contains(cmds, "pkill -f wireguard-go utun7") {
+		t.Errorf("Down did not stop wireguard-go\nran: %v", cmds)
+	}
 	if got := m.InstalledRoutes(); len(got) != 0 {
 		t.Errorf("routes remain after Down: %v", got)
 	}
@@ -219,6 +289,7 @@ func TestDownIsBestEffort(t *testing.T) {
 	}
 	// Even if teardown commands fail, Down must not error (cleanup is best-effort).
 	fr.failOn["ifconfig utun7 destroy"] = "some unexpected failure"
+	fr.failOn["pkill -f wireguard-go utun7"] = "pkill: no matching processes were found"
 	if err := m.Down(ctx); err != nil {
 		t.Fatalf("Down should be best-effort, got: %v", err)
 	}

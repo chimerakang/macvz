@@ -104,6 +104,41 @@ func TestMeshInterfaceConfigTranslates(t *testing.T) {
 	}
 }
 
+func TestMeshPeersResolvesForReconcile(t *testing.T) {
+	c := Default()
+	c.Mesh = enabledMesh(t, filepath.Join(t.TempDir(), "wg.key"))
+
+	peers, err := c.MeshPeers()
+	if err != nil {
+		t.Fatalf("MeshPeers: %v", err)
+	}
+	if len(peers) != 1 {
+		t.Fatalf("peers = %d, want 1", len(peers))
+	}
+	p := peers[0]
+	if p.Name != "mac-02" || p.Endpoint != "192.168.1.20:51820" {
+		t.Errorf("peer fields not resolved: %+v", p)
+	}
+	want := map[string]bool{"10.244.2.0/24": true, "10.99.0.2/32": true}
+	if len(p.AllowedIPs) != 2 {
+		t.Fatalf("AllowedIPs = %v, want pod CIDR + address", p.AllowedIPs)
+	}
+	for _, a := range p.AllowedIPs {
+		if !want[a] {
+			t.Errorf("unexpected AllowedIP %q", a)
+		}
+	}
+	// The peer set MeshPeers returns must match what MeshInterfaceConfig embeds,
+	// so a reload reconciles to the same desired state Up established.
+	ifc, err := c.MeshInterfaceConfig()
+	if err != nil {
+		t.Fatalf("MeshInterfaceConfig: %v", err)
+	}
+	if len(ifc.Peers) != len(peers) || ifc.Peers[0].PublicKey != p.PublicKey {
+		t.Errorf("MeshPeers and MeshInterfaceConfig disagree on peers")
+	}
+}
+
 func TestMeshInterfaceConfigDefaultsPort(t *testing.T) {
 	c := Default()
 	m := enabledMesh(t, filepath.Join(t.TempDir(), "wg.key"))

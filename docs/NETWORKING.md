@@ -7,7 +7,14 @@ This document describes MacVz cross-host networking (P3):
 - [Micro-VM network attach (MVP)](#micro-vm-network-attach-mvp) — issue #22.
 - [Pod status & Service resolution (MVP)](#pod-status--service-resolution-mvp) — issue #23.
 - [Port-forward (MVP)](#port-forward-mvp) — issue #24.
+- [Privileged network helper (`macvz-netd`)](#privileged-network-helper-macvz-netd) — issues #38–#40.
 - [End-to-end: a Service across two Macs](#end-to-end-a-service-across-two-macs).
+
+For the operator runbook that ties these layers into one ordered setup +
+verification + recovery procedure (issue #44), see
+[PRIVILEGED_NETWORKING.md](PRIVILEGED_NETWORKING.md). This document explains how
+each layer works; that one is the step-by-step guide to standing it up on a fresh
+Mac and recovering it when routes, pf rules, or the helper go stale.
 
 Together these give a Pod on one Mac an L3 path to a Pod hosted on another Mac:
 IPAM assigns the address, the mesh routes the CIDR between hosts, the network
@@ -99,8 +106,8 @@ installed through the interface so the kernel forwards Pod-bound packets into th
 tunnel.
 
 macOS has no in-kernel WireGuard, so MacVz drives the userspace toolchain from
-Homebrew's `wireguard-tools` (`wg`, `wireguard-go`) plus the system `route` and
-`ifconfig`. Bring-up runs, in order:
+Homebrew's `wireguard-tools` (`wg`, `wireguard-go`) plus the system `route`,
+`ifconfig`, and `pkill`. Bring-up runs, in order:
 
 1. `wireguard-go <iface>` — create the userspace `utun` interface.
 2. `wg setconf <iface> /dev/stdin` — apply keys and peers (config via stdin, no
@@ -112,6 +119,16 @@ Homebrew's `wireguard-tools` (`wg`, `wireguard-go`) plus the system `route` and
 Interface creation and route installation tolerate "already exists" / "File
 exists", so bring-up is **idempotent** and safe to re-run.
 
+Teardown removes peer routes, brings the interface down, then stops only the
+matching `wireguard-go <iface>` process before attempting a best-effort
+`ifconfig <iface> destroy`. Stopping the process is required on macOS because
+userspace WireGuard owns the `utun` lifecycle.
+
+`macvz-kubelet` builds its Kubernetes clientset only after this data-plane
+bring-up and the Pod-network route cleanup complete, then probes
+`/version` before starting the Virtual Kubelet controllers. That keeps transient
+host-route churn from poisoning a long-lived client-go transport.
+
 ### Reconcile without restart
 
 When nodes join or leave, `Mesh.Sync` re-applies the peer set with
@@ -119,6 +136,36 @@ When nodes join or leave, `Mesh.Sync` re-applies the peer set with
 affected host routes — the interface is never torn down, so unrelated peers keep
 their tunnels. `Mesh.Down` removes routes and destroys the interface on shutdown
 (best-effort).
+
+#### Adding or removing a node (operator workflow, #42)
+
+A running `macvz-kubelet` reconciles its mesh peers from the config on **SIGHUP**,
+so adding or removing a MacVz node needs no restart and never disturbs Pods
+already running on this host:
+
+1. Edit the `mesh.peers` list in this node's config — add the joining node's
+   `publicKey` / `endpoint` / `podCIDR`, or delete a departing node's entry.
+2. Signal the kubelet to reload: `kill -HUP <macvz-kubelet pid>`.
+
+On the signal the kubelet reloads the config and calls `Mesh.Sync` with the new
+peer set. Expectations:
+
+- **Adding a peer** installs its WireGuard entry and Pod-CIDR route; existing
+  peers' tunnels and routes, and the local Pod network attachments (the `pf`
+  anchor is a separate subsystem the mesh never touches), are left untouched —
+  no Pod loses connectivity.
+- **Removing a peer** removes its WireGuard entry and its route.
+- **Reconciliation is idempotent** — a SIGHUP with no peer changes re-applies the
+  same config and installs/removes nothing.
+- The reload is validated and **fails safe**: an invalid config, an unparseable
+  peer key, or a config that disables the mesh is rejected with a logged error
+  and the **running peer set is kept**. (Disabling the mesh entirely still
+  requires a restart.) Set `mesh.peers` to empty to drop all peers.
+
+This requires the kubelet to have been started with `--config <path>` (the path
+it reloads); without it the mesh comes up once and the SIGHUP reconciler is not
+started. The same private key and interface are reused, so peer changes never
+rotate this node's identity.
 
 ### Peer identity & keys
 
@@ -246,6 +293,12 @@ vmnet interface. The result satisfies the acceptance criteria: each Pod is
 addressed by its **MacVz Pod IP** (not an opaque host-only address), and a Pod
 on one Mac reaches a Pod hosted on another Mac at **L3**.
 
+`apple/container` may also install a host IPv4 `default` route through the vmnet
+bridge when a micro-VM starts. MacVz removes `default` on `podNetwork.interface`
+when the Pod network starts and again whenever a VM is attached, so the vmnet
+bridge cannot capture the Mac's normal outbound route or sever the kubelet's API
+connection.
+
 The provider observes the VM's host-only address from the runtime once the guest
 has acquired DHCP, then attaches the mapping; it detaches on Pod deletion. The
 anchor ruleset is regenerated wholesale and loaded atomically (`pfctl -a
@@ -283,11 +336,13 @@ backing the micro-VMs (commonly `bridge100`) with `ifconfig` and set it as
 | `podNetwork.interface` | vmnet interface the micro-VMs attach to (e.g. `bridge100`). |
 | `podNetwork.anchor` | pf anchor to manage (default `macvz/pods`). |
 | `podNetwork.enableForwarding` | Enable IPv4 forwarding (default `true`). |
+| `podNetwork.vmNetCIDRs` | Host-only vmnet CIDRs local micro-VMs may receive; used by `macvz-netd` to validate pf targets (default `192.168.64.0/24`). |
 
 ```yaml
 podNetwork:
   enabled: true
   interface: bridge100
+  vmNetCIDRs: ["192.168.64.0/24"]
 ```
 
 ### Verifying
@@ -352,14 +407,37 @@ error yields `Ready=False` with reason `RuntimeStatusError`. This guarantees the
 EndpointSlice controller never adds an unreachable Pod to a Service, so traffic
 is only sent to Pods that can actually receive it.
 
-### DNS / service discovery
+### ClusterIP Services and DNS
 
-No MacVz-specific work is needed: once Pods report correct `podIPs` and `Ready`
-conditions, the in-cluster EndpointSlice controller, kube-proxy, and CoreDNS
-treat MacVz-backed Pods like any other. A `ClusterIP` Service's DNS name resolves
-to the Service IP, and kube-proxy load-balances to the ready Pod IPs — which the
-[mesh](#wireguard-mesh-mvp) and [network attach](#micro-vm-network-attach-mvp)
-make reachable across Macs.
+Control-plane discovery needs no MacVz-specific work: once Pods report correct
+`podIPs` and `Ready` conditions, the in-cluster EndpointSlice controller and
+CoreDNS treat MacVz-backed Pods like any other, so a `ClusterIP` Service's
+EndpointSlice lists the ready MacVz Pod IPs.
+
+The **data path**, however, does need MacVz work, because **kube-proxy cannot run
+on a MacVz node**: a node is a macOS host (not Linux), and the kube-proxy Pod
+spec — `restartPolicy: Always`, `hostNetwork`, privileged `securityContext` — is
+rejected by the provider. Without kube-proxy nothing would translate a Service
+ClusterIP for a micro-VM. MacVz fills this gap itself (#37, `pkg/network/svcroute`):
+
+- A controller watches Services and their EndpointSlices and programs the
+  `macvz/pods` pf anchor with `rdr` (DNAT) rules: `ClusterIP:port -> backend`.
+- A backend Pod on **this** node is redirected to its micro-VM's host-only
+  address (directly attached to the vmnet interface, so no extra route is
+  needed); a backend on **another** Mac is redirected to its Pod IP, reached over
+  the [mesh](#wireguard-mesh-mvp) route. Multiple backends become a `round-robin`
+  pool.
+- DNS resolution from inside a micro-VM is enabled by injecting the cluster DNS
+  server (`node.clusterDNS`, the CoreDNS ClusterIP) and the standard
+  `<ns>.svc.<domain>` search list into the guest's resolv.conf via the runtime's
+  `--dns`/`--dns-search` flags. CoreDNS itself is reached through the same
+  ClusterIP `rdr` path, so the cluster DNS Service must have a MacVz-reachable
+  ready endpoint (e.g. a CoreDNS replica on a MacVz node, or its Pod IP routed
+  over the mesh) for in-guest name resolution to resolve.
+
+`pfctl`, `sysctl`, and route changes require elevated privileges, so this path is
+exercised with `podNetwork.enabled: true` on a privileged run; see
+[E2E.md](E2E.md) and `test/e2e/two-node/`.
 
 ### Status tests
 
@@ -416,6 +494,134 @@ kill %1                            # closing the forward cleans up cleanly
 - `pkg/provider/portforward_test.go` — byte proxying through a loopback target,
   clean return on stream close and on context cancellation (no goroutine leak),
   and the unknown-Pod / non-running / bad-port / nothing-listening error paths.
+
+## Privileged network helper (`macvz-netd`)
+
+The cross-host data plane needs root tools — `pfctl`, `route`, `sysctl`,
+`ifconfig`, `wg`, `wireguard-go`, `pkill` — but `macvz-kubelet` must run as the operator's
+user because `apple/container` is a per-user service that refuses to run as root.
+`macvz-netd` bridges the two: a small root daemon runs a fixed allowlist of
+network commands on behalf of the user-run kubelet, which connects over a unix
+socket (issues #38/#39). The kubelet never needs `sudo`, and root is confined to
+the allowlisted commands rather than the whole process.
+
+Enable it by pointing the kubelet at the socket in `config.yaml`:
+
+```yaml
+privilegedHelperSocket: /var/run/macvz-netd.sock
+```
+
+When unset, the privileged commands run in-process — which then requires the
+kubelet itself to be root, and is incompatible with `apple/container`.
+
+### Confining the helper to this node's config (#41)
+
+The command allowlist alone stops the helper from running *arbitrary* binaries,
+but not from driving an allowlisted binary against arbitrary targets — a
+foreign pf anchor, a default-route hijack, an attacker-controlled WireGuard
+peer. Passing `--config` closes that gap: the daemon loads the same
+`config.yaml` the kubelet uses and validates every request against it.
+
+```sh
+sudo macvz-netd serve --socket /var/run/macvz-netd.sock --config /etc/macvz/config.yaml
+```
+
+With a config loaded, each request must match a fixed per-command grammar whose
+values are pinned to this node's configuration:
+
+- **pf anchors** — only `podNetwork.anchor` (default `macvz/pods`) may be loaded
+  or flushed; the main ruleset and any other anchor are refused. A loaded
+  ruleset may contain only `binat`/`rdr` rules on the configured
+  `podNetwork.interface`, and translated targets must stay inside configured
+  Pod CIDRs or `podNetwork.vmNetCIDRs`.
+- **interfaces/processes** — `route`, `ifconfig`, `wg`, `wireguard-go`, and the
+  teardown `pkill` may only touch `mesh.interface`; the assigned address and MTU
+  must equal `mesh.address` / `mesh.mtu`.
+- **routes / AllowedIPs** — must fall within a configured peer's Pod CIDR or
+  mesh address (`mesh.peers[].podCIDR` / `.address`). A `0.0.0.0/0` route or an
+  unlisted CIDR is refused. The only default-route operation allowed is deleting
+  IPv4 `default` from `podNetwork.interface`, which prevents vmnet from hijacking
+  the host's outbound traffic.
+- **WireGuard peers** — a `wg setconf`/`syncconf` payload may only name peer
+  public keys listed in `mesh.peers[].publicKey`.
+- **sysctl** — only the IPv4-forwarding toggle (and only when a Pod network is
+  configured) plus the read-only `kern.ostype` health probe.
+
+Invalid or out-of-scope requests fail closed with a clear error and an audit
+line in the log; no command runs. Without `--config`, the daemon refuses to
+start unless `--allow-unsafe-no-config` is explicitly passed for local
+development. The same config flag works on `install`, baking the config path into
+the LaunchDaemon plist:
+
+```sh
+sudo macvz-netd install --socket /var/run/macvz-netd.sock --config /etc/macvz/config.yaml
+```
+
+### Running the helper
+
+The helper can run in the foreground for a quick test:
+
+```sh
+sudo macvz-netd serve --socket /var/run/macvz-netd.sock --config /etc/macvz/config.yaml
+```
+
+Launched via `sudo`, it chowns the socket to `$SUDO_UID:$SUDO_GID` so the
+invoking (non-root) user can connect and no other user can.
+
+### Install as a LaunchDaemon (#40)
+
+For day-to-day use, install it once as a system LaunchDaemon so it starts at boot
+and restarts on crash — no manual `sudo` on every kubelet start:
+
+```sh
+sudo macvz-netd install --socket /var/run/macvz-netd.sock --config /etc/macvz/config.yaml
+```
+
+`install` (run under `sudo`) does four things:
+
+1. Copies the running binary to `/usr/local/sbin/macvz-netd` (a stable,
+   root-owned path the plist can point at).
+2. Captures the invoking user from `$SUDO_UID:$SUDO_GID` (override with
+   `--owner uid:gid`) and bakes it into the plist's `--owner` flag — launchd has
+   no `SUDO_UID` at boot, so the socket owner must be recorded at install time.
+3. Writes `/Library/LaunchDaemons/com.github.chimerakang.macvz-netd.plist` with
+   `RunAtLoad` and `KeepAlive` true.
+4. Bootstraps the job (`launchctl bootstrap system …`) so it starts immediately.
+
+Manage the installed job:
+
+```sh
+macvz-netd status                 # install + run state (no sudo needed to read)
+sudo macvz-netd unload            # stop the job, keep it installed
+sudo macvz-netd load              # start an installed-but-stopped job
+sudo macvz-netd uninstall         # stop and remove plist, binary, and socket
+```
+
+`status` reports whether the plist, binary, and socket are present and whether
+launchd has the job loaded (via `launchctl print system/…`).
+
+### Upgrading
+
+Re-running `sudo macvz-netd install` from a newer binary is the upgrade path. The
+binary is written to a temp file and atomically renamed (so a crash never leaves
+a half-written binary), and `install` boots out any previously loaded job before
+bootstrapping the new plist, so the new binary takes effect. The label and paths
+are stable across versions, so an upgrade replaces in place — there is no need to
+`uninstall` first.
+
+### Logs
+
+The LaunchDaemon writes to:
+
+- `/var/log/macvz-netd.log` — stdout (klog info, including the listening socket
+  and the active allowlist on start).
+- `/var/log/macvz-netd.err.log` — stderr.
+
+A refused command — whether non-allowlisted or out-of-scope for the loaded
+config (`request not permitted: …`) — is logged here, which is the first place
+to look if a privileged operation is unexpectedly failing. Applied privileged
+changes are logged at info level as an audit trail. When run in the foreground,
+the same output goes to the terminal instead.
 
 ## End-to-end: a Service across two Macs
 

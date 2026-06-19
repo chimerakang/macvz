@@ -46,6 +46,9 @@ command execution. It is hardened in three ways:
   call it.
 - **Bind address.** When `node.internalIP` is set (or auto-detected), the server
   binds to that address rather than all interfaces, shrinking exposure.
+- **Restart tolerance.** If a fast restart races the old process releasing
+  `kubeletPort`, startup retries `EADDRINUSE` briefly instead of failing
+  immediately.
 - **Loud default.** With no client CA configured, macvz-kubelet logs a prominent
   warning at startup that the endpoint is unauthenticated.
 

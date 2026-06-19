@@ -67,6 +67,13 @@ node:
   servingTLSCertFile: ""     # e.g. /etc/macvz/pki/kubelet.crt
   servingTLSKeyFile: ""      # e.g. /etc/macvz/pki/kubelet.key
 
+  # Cluster DNS injected into micro-VMs so Pods using the ClusterFirst DNS
+  # policy resolve Service names in-guest (#37). Set to the cluster's CoreDNS/
+  # kube-dns ClusterIP. Empty leaves each micro-VM with the DNS baked into its
+  # image. Pairs with podNetwork to give working ClusterIP Service access.
+  clusterDNS: []             # e.g. ["10.96.0.10"]
+  clusterDomain: ""          # defaults to cluster.local when clusterDNS is set
+
 # Cross-host WireGuard mesh. Disabled by default; see docs/NETWORKING.md for a
 # complete two-node setup and pf anchor requirements.
 mesh:
@@ -91,3 +98,6 @@ podNetwork:
   interface: bridge100
   anchor: macvz/pods
   enableForwarding: true
+  # Host-only vmnet CIDRs local micro-VMs may receive. The privileged helper uses
+  # these to validate pf rdr/binat targets. Omit to use the common default below.
+  vmNetCIDRs: ["192.168.64.0/24"]

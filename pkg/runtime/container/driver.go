@@ -224,6 +224,18 @@ func (d *Driver) Create(ctx context.Context, spec types.ContainerSpec) (string, 
 		args = append(args, "--env", k+"="+spec.Env[k])
 	}
 
+	// DNS: inject cluster DNS so the guest resolves Service names (#37). Order is
+	// preserved (resolver precedence is significant).
+	for _, ns := range spec.DNS {
+		args = append(args, "--dns", ns)
+	}
+	for _, s := range spec.DNSSearch {
+		args = append(args, "--dns-search", s)
+	}
+	for _, o := range spec.DNSOptions {
+		args = append(args, "--dns-option", o)
+	}
+
 	// CPU request: apple/container allocates whole vCPUs. Round milli-cores up
 	// to the next whole core, with at least one when a request is given.
 	if spec.CPUMillis > 0 {

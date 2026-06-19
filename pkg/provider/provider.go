@@ -57,6 +57,10 @@ type Provider struct {
 	// micro-VMs and where ephemeral storage is backed (#26). The zero value is
 	// safe: hostPath disabled, no ephemeral root.
 	volumes VolumePolicy
+
+	// dns is the cluster DNS injected into micro-VMs so in-guest Service name
+	// resolution works (#37). The zero value injects nothing.
+	dns DNSConfig
 }
 
 // Option configures a Provider at construction time.
@@ -84,6 +88,13 @@ func WithHostIP(ip string) Option {
 // rejected for want of a root.
 func WithVolumePolicy(policy VolumePolicy) Option {
 	return func(p *Provider) { p.volumes = policy }
+}
+
+// WithDNS sets the cluster DNS injected into micro-VMs (#37) so Pods using the
+// ClusterFirst DNS policy can resolve Service names. Without it, micro-VMs keep
+// the DNS baked into their image.
+func WithDNS(dns DNSConfig) Option {
+	return func(p *Provider) { p.dns = dns }
 }
 
 // podState tracks one Pod and the runtime workloads backing its containers.

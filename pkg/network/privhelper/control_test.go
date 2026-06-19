@@ -89,6 +89,33 @@ func TestStatusReportsPolicyEnforced(t *testing.T) {
 	}
 }
 
+func TestReloadPolicyUpdatesValidation(t *testing.T) {
+	allowEn0 := false
+	loader := func() (Policy, error) {
+		if allowEn0 {
+			return Policy{MeshInterface: "en0"}, nil
+		}
+		return Policy{MeshInterface: "utun7"}, nil
+	}
+	srv, err := NewServerWithPolicyLoader(tmpSock(t), loader)
+	if err != nil {
+		t.Fatalf("NewServerWithPolicyLoader: %v", err)
+	}
+	srv.exec = okExec
+	c := startControlServer(t, srv)
+
+	if _, _, _, err := c.Run(context.Background(), "ifconfig", []string{"en0", "up"}, ""); err == nil {
+		t.Fatal("en0 should be refused before policy reload")
+	}
+	allowEn0 = true
+	if err := c.ReloadPolicy(context.Background()); err != nil {
+		t.Fatalf("ReloadPolicy: %v", err)
+	}
+	if _, _, code, err := c.Run(context.Background(), "ifconfig", []string{"en0", "up"}, ""); err != nil || code != 0 {
+		t.Fatalf("en0 should pass after policy reload: code=%d err=%v", code, err)
+	}
+}
+
 // TestUnsupportedProtocolRejected verifies a client speaking a future protocol
 // is refused with a structured error rather than silently misinterpreted.
 func TestUnsupportedProtocolRejected(t *testing.T) {

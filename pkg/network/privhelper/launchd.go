@@ -54,6 +54,10 @@ type LaunchdConfig struct {
 	// Empty installs a daemon with argument validation disabled (name-allowlist
 	// only).
 	ConfigPath string
+	// AllowUnsafeNoConfig explicitly permits installing without ConfigPath. This
+	// exists for local development only; production helpers should always enforce
+	// config-derived request policy.
+	AllowUnsafeNoConfig bool
 	// OwnerUID/OwnerGID is the user the socket is chowned to so the (non-root)
 	// kubelet can connect. -1 leaves the socket root-owned.
 	OwnerUID int
@@ -120,6 +124,9 @@ func (c LaunchdConfig) Validate() error {
 	if c.ConfigPath != "" && !filepath.IsAbs(c.ConfigPath) {
 		return fmt.Errorf("launchd config: configPath %q must be absolute", c.ConfigPath)
 	}
+	if c.ConfigPath == "" && !c.AllowUnsafeNoConfig {
+		return fmt.Errorf("launchd config: configPath is required unless allowUnsafeNoConfig is set")
+	}
 	if (c.OwnerUID < 0) != (c.OwnerGID < 0) {
 		return fmt.Errorf("launchd config: owner uid/gid must both be set or both unset")
 	}
@@ -150,6 +157,9 @@ var plistTemplate = template.Must(template.New("plist").Parse(`<?xml version="1.
 		<string>--config</string>
 		<string>{{.ConfigPath}}</string>
 {{- end}}
+{{- if .AllowUnsafeNoConfig}}
+		<string>--allow-unsafe-no-config</string>
+{{- end}}
 {{- if .Owner}}
 		<string>--owner</string>
 		<string>{{.Owner}}</string>
@@ -178,14 +188,16 @@ func (c LaunchdConfig) Render() (string, error) {
 	var buf bytes.Buffer
 	err := plistTemplate.Execute(&buf, struct {
 		Label, BinaryPath, SocketPath, ConfigPath, Owner, StdoutPath, StderrPath string
+		AllowUnsafeNoConfig                                                      bool
 	}{
-		Label:      c.Label,
-		BinaryPath: c.BinaryPath,
-		SocketPath: c.SocketPath,
-		ConfigPath: c.ConfigPath,
-		Owner:      c.ownerSpec(),
-		StdoutPath: c.StdoutPath,
-		StderrPath: c.StderrPath,
+		Label:               c.Label,
+		BinaryPath:          c.BinaryPath,
+		SocketPath:          c.SocketPath,
+		ConfigPath:          c.ConfigPath,
+		AllowUnsafeNoConfig: c.AllowUnsafeNoConfig,
+		Owner:               c.ownerSpec(),
+		StdoutPath:          c.StdoutPath,
+		StderrPath:          c.StderrPath,
 	})
 	if err != nil {
 		return "", fmt.Errorf("render plist: %w", err)

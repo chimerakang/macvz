@@ -66,9 +66,13 @@ connection, mirroring `exec.Command`).
     The reply carries `stdout`, `stderr`, and `exitCode` (a non-zero exit is a
     normal command result, not an API error).
   - `status` — the helper reports `version`, `protocol`, `allowedCommands`,
-    `policyEnforced` (whether #41 per-request validation is on), `pid`,
-    `startedAt`, and `uptime`. No command runs. The kubelet calls this at startup
-    and logs it, then issues a `sysctl` probe to confirm the exec path works.
+    `policyEnforced` (whether #41 per-request validation is on),
+    `policyReloadable`, `pid`, `startedAt`, and `uptime`. No command runs. The
+    kubelet calls this at startup and logs it, then issues a `sysctl` probe to
+    confirm the exec path works.
+  - `reloadPolicy` — the helper reloads its config-derived policy before a
+    SIGHUP mesh-peer reconciliation, so newly configured peer keys and CIDRs are
+    permitted without restarting `macvz-netd`.
 - **Structured errors**: a refusal sets `errorCode` to one of
   `unsupported_protocol`, `malformed` (undecodable or over the 1 MiB request
   cap), `not_allowed` (command off the allowlist), `not_permitted` (allowlisted
@@ -194,6 +198,7 @@ podNetwork:
   interface: bridge100        # the vmnet bridge apple/container attaches VMs to
   anchor: macvz/pods          # default; the only anchor the helper will touch
   enableForwarding: true      # default; flips net.inet.ip.forwarding to 1
+  vmNetCIDRs: ["192.168.64.0/24"] # default; adjust if your vmnet range differs
 ```
 
 **Selecting the bridge.** `apple/container` attaches each micro-VM to a
@@ -262,7 +267,7 @@ sudo macvz-netd install \
 `install` copies the binary to `/usr/local/sbin/macvz-netd`, records the invoking
 user (`$SUDO_UID:$SUDO_GID`) as the socket owner, writes the plist with
 `RunAtLoad`/`KeepAlive`, and bootstraps the job. Always pass `--config` — without
-it the daemon falls back to the command allowlist only and logs a warning.
+it the daemon refuses to start because per-request policy would be disabled.
 
 Confirm it is up:
 
@@ -417,7 +422,12 @@ sudo pfctl -a macvz/pods -F all        # flush all rules in the macvz anchor onl
 #    podNetwork.interface equals the live vmnet bridge (see step 4 of setup),
 #    fix the config, and restart.
 
-# 4. If NO rules ever appear, pf is not evaluating the anchor. Confirm the hooks
+# 4. If the host default route points at the vmnet bridge, the kubelet removes it
+#    at podNetwork start and whenever a Pod attaches. If it reappears, check
+#    macvz-netd logs for a refused route delete on podNetwork.interface.
+netstat -rn -f inet | grep '^default'
+
+# 5. If NO rules ever appear, pf is not evaluating the anchor. Confirm the hooks
 #    and that pf is enabled:
 grep 'macvz/pods' /etc/pf.conf         # the four anchor lines must be present
 sudo pfctl -s info | grep Status       # must read: Status: Enabled
@@ -443,9 +453,10 @@ tail -n 50 /var/log/macvz-netd.err.log # stderr
 
 # 3. "request not permitted" means the request is out-of-scope for the loaded
 #    --config: a CIDR/interface/peer/anchor not pinned in THIS node's config.
-#    Reconcile the config with the request (e.g. add the peer's podCIDR), then
-#    re-run install so the daemon reloads it:
-sudo macvz-netd install --socket /var/run/macvz-netd.sock --config /etc/macvz/macvz-a.yaml
+#    Reconcile the config with the request (e.g. add the peer's podCIDR). A
+#    kubelet SIGHUP reload asks macvz-netd to refresh policy before applying
+#    mesh changes; otherwise restart macvz-netd to reload manually:
+sudo macvz-netd unload && sudo macvz-netd load
 
 # 4. Socket permission denied from the kubelet: the socket owner was recorded at
 #    install time from $SUDO_UID. If you now run the kubelet as a different user,
@@ -455,9 +466,8 @@ sudo macvz-netd install --socket /var/run/macvz-netd.sock --config /etc/macvz/ma
 sudo macvz-netd unload && sudo macvz-netd load
 ```
 
-If `--config` was omitted at install, the daemon logs a warning at start and
-enforces only the command allowlist — reinstall with `--config` to restore
-config-pinned validation.
+If `--config` was omitted at install, the daemon refuses to start. Reinstall with
+`--config` so config-pinned validation is active.
 
 ## Teardown
 

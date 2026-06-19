@@ -31,6 +31,9 @@ const (
 	// OpStatus asks the helper to report its identity and health (no command is
 	// run); the reply carries Response.Status. Used by startup diagnostics.
 	OpStatus = "status"
+	// OpReloadPolicy asks the helper to reload its config-derived policy, when a
+	// policy loader was configured. It is idempotent and runs no host command.
+	OpReloadPolicy = "reloadPolicy"
 )
 
 // Structured error codes returned in Response.ErrorCode so callers can map a
@@ -50,6 +53,8 @@ const (
 	CodeExecError = "exec_error"
 	// CodeUnknownOp: the Request's Op is not a recognised operation.
 	CodeUnknownOp = "unknown_op"
+	// CodePolicyReloadFailed: the helper could not refresh its policy.
+	CodePolicyReloadFailed = "policy_reload_failed"
 )
 
 // Request is one operation the kubelet asks the helper to perform as root.
@@ -98,6 +103,9 @@ type HelperStatus struct {
 	AllowedCommands []string `json:"allowedCommands"`
 	// PolicyEnforced reports whether per-request argument validation (#41) is on.
 	PolicyEnforced bool `json:"policyEnforced"`
+	// PolicyReloadable reports whether the helper can refresh its config-derived
+	// policy without restarting.
+	PolicyReloadable bool `json:"policyReloadable"`
 	// PID is the helper process id.
 	PID int `json:"pid"`
 	// StartedAt is when the helper began listening.

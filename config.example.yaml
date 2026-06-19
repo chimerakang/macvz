@@ -98,3 +98,6 @@ podNetwork:
   interface: bridge100
   anchor: macvz/pods
   enableForwarding: true
+  # Host-only vmnet CIDRs local micro-VMs may receive. The privileged helper uses
+  # these to validate pf rdr/binat targets. Omit to use the common default below.
+  vmNetCIDRs: ["192.168.64.0/24"]

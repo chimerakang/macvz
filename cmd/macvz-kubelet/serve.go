@@ -192,7 +192,7 @@ func setupMesh(ctx context.Context, cfg config.Config, configPath string) (func(
 	// Reconcile peers on SIGHUP so nodes can join/leave without a restart (#42).
 	// Requires the config path to reload; with no --config it is skipped.
 	if configPath != "" {
-		go watchMeshReload(ctx, mesh, configPath)
+		go watchMeshReload(ctx, mesh, configPath, cfg.PrivilegedHelperSocket)
 		klog.InfoS("mesh peer reload enabled; edit peers then `kill -HUP` the kubelet to reconcile", "config", configPath)
 	}
 

@@ -16,6 +16,7 @@ import (
 const (
 	defaultPfctl  = "pfctl"
 	defaultSysctl = "sysctl"
+	defaultRoute  = "route"
 )
 
 // DefaultAnchor is the pf anchor MacVz owns. The operator must reference it from
@@ -70,6 +71,7 @@ type Router struct {
 	cfg    Config
 	pfctl  string
 	sysctl string
+	route  string
 
 	mu        sync.Mutex
 	started   bool
@@ -105,6 +107,7 @@ func New(cfg Config, opts ...Option) *Router {
 		cfg:       cfg,
 		pfctl:     defaultPfctl,
 		sysctl:    defaultSysctl,
+		route:     defaultRoute,
 		endpoints: map[string]Endpoint{},
 		services:  map[string][]ServiceRule{},
 	}
@@ -112,6 +115,15 @@ func New(cfg Config, opts ...Option) *Router {
 		opt(rt)
 	}
 	return rt
+}
+
+// WithRouteTool overrides the route binary name. Empty keeps the default.
+func WithRouteTool(route string) Option {
+	return func(rt *Router) {
+		if route != "" {
+			rt.route = route
+		}
+	}
 }
 
 // Start prepares the host: it enables IPv4 forwarding (when configured), ensures
@@ -132,6 +144,9 @@ func (rt *Router) Start(ctx context.Context) error {
 	if _, err := rt.runTolerating(ctx, command{Name: rt.pfctl, Args: []string{"-e"}}, pfAlreadyEnabled); err != nil {
 		return fmt.Errorf("enable pf: %w", err)
 	}
+	if err := rt.removeVMNetDefaultRouteLocked(ctx); err != nil {
+		return err
+	}
 	rt.started = true
 	if err := rt.loadAnchorLocked(ctx); err != nil {
 		return err
@@ -151,11 +166,30 @@ func (rt *Router) Attach(ctx context.Context, ep Endpoint) error {
 	if !rt.started {
 		return fmt.Errorf("podnet: Attach %q before Start", ep.PodKey)
 	}
+	if err := rt.removeVMNetDefaultRouteLocked(ctx); err != nil {
+		return fmt.Errorf("remove vmnet default route before attach %q: %w", ep.PodKey, err)
+	}
 	rt.endpoints[ep.PodKey] = ep
 	if err := rt.loadAnchorLocked(ctx); err != nil {
 		return fmt.Errorf("attach %q (%s -> %s): %w", ep.PodKey, ep.PodIP, ep.VMIP, err)
 	}
 	klog.InfoS("attached pod to network path", "pod", ep.PodKey, "podIP", ep.PodIP, "vmIP", ep.VMIP)
+	return nil
+}
+
+// removeVMNetDefaultRouteLocked removes apple/container's occasional
+// "default -> <vmnet bridge>" route. That route can capture the host's outbound
+// traffic and sever the kubelet's API connection. Deleting it is idempotent and
+// safe: the route is scoped to the vmnet interface and Pod reachability uses
+// explicit Pod/mesh routes plus pf binat/rdr, not a host default route.
+func (rt *Router) removeVMNetDefaultRouteLocked(ctx context.Context) error {
+	_, err := rt.runTolerating(ctx, command{
+		Name: rt.route,
+		Args: []string{"-q", "-n", "delete", "-inet", "default", "-interface", rt.cfg.Interface},
+	}, errRouteMissing, errRouteNotFound)
+	if err != nil {
+		return fmt.Errorf("remove vmnet default route on %s: %w", rt.cfg.Interface, err)
+	}
 	return nil
 }
 
@@ -267,3 +301,8 @@ func (rt *Router) runTolerating(ctx context.Context, c command, benign ...string
 
 // pfAlreadyEnabled is the stderr pfctl prints when pf is already on.
 const pfAlreadyEnabled = "pf already enabled"
+
+const (
+	errRouteMissing  = "not in table"
+	errRouteNotFound = "not found"
+)

@@ -11,6 +11,7 @@ func TestPrivilegedHelperPolicyFromConfig(t *testing.T) {
 	c := Default()
 	c.Mesh = enabledMesh(t, filepath.Join(t.TempDir(), "wg.key"))
 	c.PodNetwork = PodNetworkConfig{Enabled: true, Interface: "bridge100"}
+	c.Node.PodCIDR = "10.244.101.0/24"
 
 	p, err := c.PrivilegedHelperPolicy()
 	if err != nil {
@@ -34,6 +35,14 @@ func TestPrivilegedHelperPolicyFromConfig(t *testing.T) {
 		if !p.RouteCIDRs[want] {
 			t.Errorf("RouteCIDRs missing %q (have %v)", want, p.RouteCIDRs)
 		}
+	}
+	for _, want := range []string{"10.244.101.0/24", "10.244.2.0/24"} {
+		if !p.PodCIDRs[want] {
+			t.Errorf("PodCIDRs missing %q (have %v)", want, p.PodCIDRs)
+		}
+	}
+	if !p.VMNetCIDRs[DefaultVMNetCIDR] {
+		t.Errorf("VMNetCIDRs missing default %q (have %v)", DefaultVMNetCIDR, p.VMNetCIDRs)
 	}
 	// The peer's public key is the only configured peer.
 	pub := c.Mesh.Peers[0].PublicKey
@@ -72,5 +81,21 @@ func TestPrivilegedHelperPolicyCustomAnchor(t *testing.T) {
 	}
 	if p.Anchor != "macvz/custom" {
 		t.Errorf("Anchor = %q, want macvz/custom", p.Anchor)
+	}
+}
+
+func TestPrivilegedHelperPolicyCustomVMNetCIDRs(t *testing.T) {
+	c := Default()
+	c.PodNetwork = PodNetworkConfig{
+		Enabled:    true,
+		Interface:  "bridge100",
+		VMNetCIDRs: []string{"172.31.0.0/24"},
+	}
+	p, err := c.PrivilegedHelperPolicy()
+	if err != nil {
+		t.Fatalf("PrivilegedHelperPolicy: %v", err)
+	}
+	if !p.VMNetCIDRs["172.31.0.0/24"] || p.VMNetCIDRs[DefaultVMNetCIDR] {
+		t.Errorf("VMNetCIDRs = %v, want only custom range", p.VMNetCIDRs)
 	}
 }

@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"k8s.io/klog/v2"
@@ -29,6 +30,10 @@ const maxRequestBytes = 1 << 20
 // is exported so other packages' tests can supply a fake executor without
 // touching the host.
 type ExecFunc func(ctx context.Context, name string, args []string, stdin string) (stdout, stderr string, exitCode int, err error)
+
+// PolicyLoader refreshes the per-request validation policy from the helper's
+// trusted local configuration.
+type PolicyLoader func() (Policy, error)
 
 // NewServerWithExec builds a Server with a custom command executor. The default
 // (NewServer) runs commands for real; this is for tests and embedding.
@@ -47,7 +52,9 @@ type Server struct {
 	// configured interfaces, CIDRs, peers, and pf anchor (#41). nil disables
 	// argument validation (name-allowlist only) — used by in-process callers and
 	// tests that already construct well-formed commands.
-	policy *Policy
+	policyMu     sync.RWMutex
+	policy       *Policy
+	policyLoader PolicyLoader
 
 	// version is the helper build version reported by an OpStatus request; set
 	// via SetVersion. Empty is reported as "dev".
@@ -73,6 +80,17 @@ func NewServer(socketPath string) *Server {
 // or peer outside the node's config is refused before any command runs.
 func NewServerWithPolicy(socketPath string, policy Policy) *Server {
 	return &Server{socketPath: socketPath, exec: realExec, policy: &policy}
+}
+
+// NewServerWithPolicyLoader builds a helper server whose policy can be reloaded
+// from config without restarting the daemon. The initial policy is loaded during
+// construction so startup fails loud when the config is invalid.
+func NewServerWithPolicyLoader(socketPath string, loader PolicyLoader) (*Server, error) {
+	policy, err := loader()
+	if err != nil {
+		return nil, err
+	}
+	return &Server{socketPath: socketPath, exec: realExec, policy: &policy, policyLoader: loader}, nil
 }
 
 // withExec overrides the command executor (tests).
@@ -161,6 +179,14 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 	case OpStatus:
 		s.writeResponse(conn, Response{Protocol: Protocol, Status: s.status()})
 		return
+	case OpReloadPolicy:
+		if err := s.reloadPolicy(); err != nil {
+			klog.ErrorS(err, "privileged helper failed to reload policy")
+			s.writeError(conn, CodePolicyReloadFailed, "reload policy: "+err.Error())
+			return
+		}
+		s.writeResponse(conn, Response{Protocol: Protocol})
+		return
 	case OpExec:
 		s.handleExec(ctx, conn, req)
 	default:
@@ -176,8 +202,8 @@ func (s *Server) handleExec(ctx context.Context, conn net.Conn, req Request) {
 		s.writeError(conn, CodeNotAllowed, "command not allowed: "+req.Name)
 		return
 	}
-	if s.policy != nil {
-		if err := s.policy.Validate(req); err != nil {
+	if policy := s.currentPolicy(); policy != nil {
+		if err := policy.Validate(req); err != nil {
 			// Audit every refusal: this is the signal that someone tried to drive
 			// the helper out of its configured scope.
 			klog.InfoS("privileged helper refused out-of-scope request",
@@ -202,6 +228,30 @@ func (s *Server) handleExec(ctx context.Context, conn net.Conn, req Request) {
 	s.writeResponse(conn, resp)
 }
 
+func (s *Server) currentPolicy() *Policy {
+	s.policyMu.RLock()
+	defer s.policyMu.RUnlock()
+	if s.policy == nil {
+		return nil
+	}
+	p := *s.policy
+	return &p
+}
+
+func (s *Server) reloadPolicy() error {
+	if s.policyLoader == nil {
+		return nil
+	}
+	p, err := s.policyLoader()
+	if err != nil {
+		return err
+	}
+	s.policyMu.Lock()
+	s.policy = &p
+	s.policyMu.Unlock()
+	return nil
+}
+
 // status builds the helper's self-report for an OpStatus request.
 func (s *Server) status() *HelperStatus {
 	version := s.version
@@ -209,13 +259,14 @@ func (s *Server) status() *HelperStatus {
 		version = "dev"
 	}
 	return &HelperStatus{
-		Protocol:        Protocol,
-		Version:         version,
-		AllowedCommands: AllowedCommands(),
-		PolicyEnforced:  s.policy != nil,
-		PID:             os.Getpid(),
-		StartedAt:       s.startedAt,
-		Uptime:          time.Since(s.startedAt).Round(time.Second).String(),
+		Protocol:         Protocol,
+		Version:          version,
+		AllowedCommands:  AllowedCommands(),
+		PolicyEnforced:   s.currentPolicy() != nil,
+		PolicyReloadable: s.policyLoader != nil,
+		PID:              os.Getpid(),
+		StartedAt:        s.startedAt,
+		Uptime:           time.Since(s.startedAt).Round(time.Second).String(),
 	}
 }
 

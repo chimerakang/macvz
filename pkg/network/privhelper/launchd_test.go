@@ -38,6 +38,7 @@ func testConfig(dir string) LaunchdConfig {
 		PlistDir:   filepath.Join(dir, "LaunchDaemons"),
 		BinaryPath: filepath.Join(dir, "sbin", "macvz-netd"),
 		SocketPath: filepath.Join(dir, "netd.sock"),
+		ConfigPath: "/etc/macvz/config.yaml",
 		OwnerUID:   501,
 		OwnerGID:   20,
 		StdoutPath: filepath.Join(dir, "out.log"),
@@ -56,6 +57,8 @@ func TestRenderPlist(t *testing.T) {
 		"<string>serve</string>",
 		"<string>--socket</string>",
 		"<string>" + cfg.SocketPath + "</string>",
+		"<string>--config</string>",
+		"<string>/etc/macvz/config.yaml</string>",
 		"<string>--owner</string>",
 		"<string>501:20</string>",
 		"<key>RunAtLoad</key>",
@@ -83,20 +86,10 @@ func TestRenderPlistOmitsOwnerWhenUnset(t *testing.T) {
 func TestRenderPlistConfigPath(t *testing.T) {
 	cfg := testConfig(t.TempDir())
 
-	// Omitted by default.
+	// Emitted in production mode.
 	out, err := cfg.Render()
 	if err != nil {
 		t.Fatalf("Render: %v", err)
-	}
-	if strings.Contains(out, "--config") {
-		t.Errorf("plist should omit --config when ConfigPath unset\n%s", out)
-	}
-
-	// Emitted when set.
-	cfg.ConfigPath = "/etc/macvz/config.yaml"
-	out, err = cfg.Render()
-	if err != nil {
-		t.Fatalf("Render with config: %v", err)
 	}
 	for _, want := range []string{"<string>--config</string>", "<string>/etc/macvz/config.yaml</string>"} {
 		if !strings.Contains(out, want) {
@@ -108,6 +101,25 @@ func TestRenderPlistConfigPath(t *testing.T) {
 	cfg.ConfigPath = "config.yaml"
 	if err := cfg.Validate(); err == nil {
 		t.Error("relative ConfigPath should fail validation")
+	}
+}
+
+func TestRenderPlistUnsafeNoConfigIsExplicit(t *testing.T) {
+	cfg := testConfig(t.TempDir())
+	cfg.ConfigPath = ""
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("missing ConfigPath should fail unless explicitly unsafe")
+	}
+	cfg.AllowUnsafeNoConfig = true
+	out, err := cfg.Render()
+	if err != nil {
+		t.Fatalf("Render unsafe: %v", err)
+	}
+	if strings.Contains(out, "--config") {
+		t.Errorf("unsafe no-config plist should omit --config\n%s", out)
+	}
+	if !strings.Contains(out, "--allow-unsafe-no-config") {
+		t.Errorf("unsafe no-config plist should include explicit flag\n%s", out)
 	}
 }
 

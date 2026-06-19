@@ -2,9 +2,14 @@ package config
 
 import (
 	"fmt"
+	"net"
 
 	"github.com/chimerakang/macvz/pkg/network/podnet"
 )
+
+// DefaultVMNetCIDR is apple/container's usual host-only vmnet range. Operators
+// with a different vmnet range should set podNetwork.vmNetCIDRs explicitly.
+const DefaultVMNetCIDR = "192.168.64.0/24"
 
 // PodNetworkConfig configures the host Pod network path that makes each
 // micro-VM reachable at its assigned Pod IP across the mesh (#22). It is opt-in:
@@ -27,6 +32,12 @@ type PodNetworkConfig struct {
 	// mesh interface and the vmnet interface. Defaults to true when enabled;
 	// set false only when forwarding is managed externally.
 	EnableForwarding *bool `yaml:"enableForwarding"`
+
+	// VMNetCIDRs are the host-only apple/container address ranges that local
+	// micro-VMs may receive on the vmnet interface. The privileged helper uses
+	// these to reject pf rules that redirect ClusterIP traffic outside the local
+	// vmnet and Pod networks. Defaults to 192.168.64.0/24 when omitted.
+	VMNetCIDRs []string `yaml:"vmNetCIDRs"`
 }
 
 // validatePodNetwork checks the Pod network fields when enabled.
@@ -37,6 +48,11 @@ func (c Config) validatePodNetwork() error {
 	}
 	if pn.Interface == "" {
 		return fmt.Errorf("podNetwork.interface is required when the Pod network is enabled")
+	}
+	for _, cidr := range pn.VMNetCIDRs {
+		if _, _, err := net.ParseCIDR(cidr); err != nil {
+			return fmt.Errorf("podNetwork.vmNetCIDRs entry %q is not a CIDR: %w", cidr, err)
+		}
 	}
 	return nil
 }

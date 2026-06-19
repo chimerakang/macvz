@@ -71,6 +71,20 @@ func (c *Client) Status(ctx context.Context) (*HelperStatus, error) {
 	return resp.Status, nil
 }
 
+// ReloadPolicy asks a reloadable helper to refresh its config-derived policy.
+// Helpers without a loader treat it as a no-op, so kubelet can call this before
+// mesh peer reconciliation without needing to know how netd was started.
+func (c *Client) ReloadPolicy(ctx context.Context) error {
+	resp, err := c.roundTrip(ctx, Request{Protocol: Protocol, Op: OpReloadPolicy})
+	if err != nil {
+		return err
+	}
+	if resp.Err != "" {
+		return &APIError{Code: resp.ErrorCode, Message: resp.Err}
+	}
+	return nil
+}
+
 // Run sends one command to the helper and returns its stdout, stderr, exit code,
 // and any transport error. A non-zero exitCode with a nil error is a normal
 // command failure (mirrors os/exec). A refusal or spawn failure is returned as

@@ -283,6 +283,12 @@ vmnet interface. The result satisfies the acceptance criteria: each Pod is
 addressed by its **MacVz Pod IP** (not an opaque host-only address), and a Pod
 on one Mac reaches a Pod hosted on another Mac at **L3**.
 
+`apple/container` may also install a host IPv4 `default` route through the vmnet
+bridge when a micro-VM starts. MacVz removes `default` on `podNetwork.interface`
+when the Pod network starts and again whenever a VM is attached, so the vmnet
+bridge cannot capture the Mac's normal outbound route or sever the kubelet's API
+connection.
+
 The provider observes the VM's host-only address from the runtime once the guest
 has acquired DHCP, then attaches the mapping; it detaches on Pod deletion. The
 anchor ruleset is regenerated wholesale and loaded atomically (`pfctl -a
@@ -320,11 +326,13 @@ backing the micro-VMs (commonly `bridge100`) with `ifconfig` and set it as
 | `podNetwork.interface` | vmnet interface the micro-VMs attach to (e.g. `bridge100`). |
 | `podNetwork.anchor` | pf anchor to manage (default `macvz/pods`). |
 | `podNetwork.enableForwarding` | Enable IPv4 forwarding (default `true`). |
+| `podNetwork.vmNetCIDRs` | Host-only vmnet CIDRs local micro-VMs may receive; used by `macvz-netd` to validate pf targets (default `192.168.64.0/24`). |
 
 ```yaml
 podNetwork:
   enabled: true
   interface: bridge100
+  vmNetCIDRs: ["192.168.64.0/24"]
 ```
 
 ### Verifying
@@ -514,23 +522,26 @@ values are pinned to this node's configuration:
 - **pf anchors** — only `podNetwork.anchor` (default `macvz/pods`) may be loaded
   or flushed; the main ruleset and any other anchor are refused. A loaded
   ruleset may contain only `binat`/`rdr` rules on the configured
-  `podNetwork.interface`.
+  `podNetwork.interface`, and translated targets must stay inside configured
+  Pod CIDRs or `podNetwork.vmNetCIDRs`.
 - **interfaces** — `route`, `ifconfig`, `wg`, and `wireguard-go` may only touch
   `mesh.interface`; the assigned address and MTU must equal `mesh.address` /
   `mesh.mtu`.
 - **routes / AllowedIPs** — must fall within a configured peer's Pod CIDR or
   mesh address (`mesh.peers[].podCIDR` / `.address`). A `0.0.0.0/0` route or an
-  unlisted CIDR is refused.
+  unlisted CIDR is refused. The only default-route operation allowed is deleting
+  IPv4 `default` from `podNetwork.interface`, which prevents vmnet from hijacking
+  the host's outbound traffic.
 - **WireGuard peers** — a `wg setconf`/`syncconf` payload may only name peer
   public keys listed in `mesh.peers[].publicKey`.
 - **sysctl** — only the IPv4-forwarding toggle (and only when a Pod network is
   configured) plus the read-only `kern.ostype` health probe.
 
 Invalid or out-of-scope requests fail closed with a clear error and an audit
-line in the log; no command runs. Without `--config`, the daemon falls back to
-the command allowlist only and logs a warning at start — so production installs
-should always pass it. The same flag works on `install`, baking the config path
-into the LaunchDaemon plist:
+line in the log; no command runs. Without `--config`, the daemon refuses to
+start unless `--allow-unsafe-no-config` is explicitly passed for local
+development. The same config flag works on `install`, baking the config path into
+the LaunchDaemon plist:
 
 ```sh
 sudo macvz-netd install --socket /var/run/macvz-netd.sock --config /etc/macvz/config.yaml
@@ -541,7 +552,7 @@ sudo macvz-netd install --socket /var/run/macvz-netd.sock --config /etc/macvz/co
 The helper can run in the foreground for a quick test:
 
 ```sh
-sudo macvz-netd serve --socket /var/run/macvz-netd.sock
+sudo macvz-netd serve --socket /var/run/macvz-netd.sock --config /etc/macvz/config.yaml
 ```
 
 Launched via `sudo`, it chowns the socket to `$SUDO_UID:$SUDO_GID` so the
@@ -553,7 +564,7 @@ For day-to-day use, install it once as a system LaunchDaemon so it starts at boo
 and restarts on crash — no manual `sudo` on every kubelet start:
 
 ```sh
-sudo macvz-netd install --socket /var/run/macvz-netd.sock
+sudo macvz-netd install --socket /var/run/macvz-netd.sock --config /etc/macvz/config.yaml
 ```
 
 `install` (run under `sudo`) does four things:

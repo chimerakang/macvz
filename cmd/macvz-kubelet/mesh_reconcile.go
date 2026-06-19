@@ -8,6 +8,7 @@ import (
 	"syscall"
 
 	"github.com/chimerakang/macvz/pkg/config"
+	"github.com/chimerakang/macvz/pkg/network/privhelper"
 	"github.com/chimerakang/macvz/pkg/network/wireguard"
 	"k8s.io/klog/v2"
 )
@@ -61,7 +62,7 @@ func loadMeshPeers(configPath string) ([]wireguard.Peer, error) {
 // the kubelet (`kill -HUP <pid>`) — no restart, no dropped Pod attachments. It
 // runs until ctx is done. A failed reconcile is logged and the current peer set
 // is kept, so a bad edit never takes the mesh down.
-func watchMeshReload(ctx context.Context, mesh *wireguard.Mesh, configPath string) {
+func watchMeshReload(ctx context.Context, mesh *wireguard.Mesh, configPath, helperSocket string) {
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGHUP)
 	defer signal.Stop(sig)
@@ -71,6 +72,12 @@ func watchMeshReload(ctx context.Context, mesh *wireguard.Mesh, configPath strin
 			return
 		case <-sig:
 			klog.InfoS("SIGHUP received; reconciling mesh peers from config", "config", configPath)
+			if helperSocket != "" {
+				if err := privhelper.NewClient(helperSocket).ReloadPolicy(ctx); err != nil {
+					klog.ErrorS(err, "privileged helper policy reload failed; keeping current mesh peers")
+					continue
+				}
+			}
 			if err := reconcileMeshPeers(ctx, mesh, configPath); err != nil {
 				klog.ErrorS(err, "mesh peer reconciliation failed; keeping current peers")
 			}

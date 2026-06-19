@@ -38,6 +38,12 @@ type Policy struct {
 	// RouteCIDRs is the normalised set of CIDRs the helper may add/delete host
 	// routes for, and the superset that WireGuard AllowedIPs must fall within.
 	RouteCIDRs map[string]bool
+	// PodCIDRs is the normalised set of local and peer Pod CIDRs that pf binat/rdr
+	// rules may expose as Pod IPs.
+	PodCIDRs map[string]bool
+	// VMNetCIDRs is the normalised set of apple/container host-only vmnet CIDRs
+	// that pf binat/rdr rules may reference for local micro-VM addresses.
+	VMNetCIDRs map[string]bool
 	// PeerPublicKeys is the set of base64 WireGuard public keys the helper may
 	// configure as peers (canonicalised to match the rendered wg config).
 	PeerPublicKeys map[string]bool
@@ -142,16 +148,141 @@ func (p Policy) lintAnchorRuleset(ruleset string) error {
 			continue
 		}
 		fields := strings.Fields(line)
-		// Every rule the router emits is "binat on <iface> ..." or
-		// "rdr on <iface> ...". Anything else is out of scope.
-		if len(fields) < 3 || (fields[0] != "binat" && fields[0] != "rdr") || fields[1] != "on" {
+		if len(fields) < 3 || fields[1] != "on" {
 			return fmt.Errorf("anchor rule %q is not a binat/rdr rule", line)
 		}
 		if fields[2] != p.VMNetInterface {
 			return fmt.Errorf("anchor rule on interface %q, not the managed vmnet interface %q", fields[2], p.VMNetInterface)
 		}
+		switch fields[0] {
+		case "binat":
+			if err := p.lintBinatRule(fields); err != nil {
+				return fmt.Errorf("anchor rule %q not permitted: %w", line, err)
+			}
+		case "rdr":
+			if err := p.lintRDRRule(fields); err != nil {
+				return fmt.Errorf("anchor rule %q not permitted: %w", line, err)
+			}
+		default:
+			return fmt.Errorf("anchor rule %q is not a binat/rdr rule", line)
+		}
 	}
 	return nil
+}
+
+func (p Policy) lintBinatRule(fields []string) error {
+	i := 3
+	if i < len(fields) && fields[i] == "inet" {
+		i++
+	}
+	if len(fields) != i+6 || fields[i] != "from" || fields[i+2] != "to" ||
+		fields[i+3] != "any" || fields[i+4] != "->" {
+		return fmt.Errorf("expected binat on <iface> [inet] from <vm-ip> to any -> <pod-ip>")
+	}
+	if err := p.checkIPInSet(fields[i+1], p.VMNetCIDRs, "vmnet CIDR"); err != nil {
+		return fmt.Errorf("source VM IP: %w", err)
+	}
+	if err := p.checkIPInSet(fields[i+5], p.PodCIDRs, "Pod CIDR"); err != nil {
+		return fmt.Errorf("translated Pod IP: %w", err)
+	}
+	return nil
+}
+
+func (p Policy) lintRDRRule(fields []string) error {
+	// rdr on <iface> inet proto <tcp|udp> from any to <cluster-ip> port <n> ->
+	//   <target> port <n>
+	// rdr on <iface> inet proto <tcp|udp> from any to <cluster-ip> port <n> ->
+	//   { <target>, <target> } port <n> round-robin
+	if len(fields) < 16 ||
+		fields[3] != "inet" || fields[4] != "proto" ||
+		(fields[5] != "tcp" && fields[5] != "udp") ||
+		fields[6] != "from" || fields[7] != "any" ||
+		fields[8] != "to" || fields[10] != "port" || fields[12] != "->" {
+		return fmt.Errorf("expected rdr on <iface> inet proto <tcp|udp> from any to <cluster-ip> port <n> -> <target> port <n>")
+	}
+	if net.ParseIP(fields[9]) == nil {
+		return fmt.Errorf("ClusterIP %q is not an IP", fields[9])
+	}
+	if _, err := strconv.Atoi(fields[11]); err != nil {
+		return fmt.Errorf("service port %q is not numeric", fields[11])
+	}
+
+	portIdx := -1
+	for i := 13; i < len(fields); i++ {
+		if fields[i] == "port" {
+			portIdx = i
+			break
+		}
+	}
+	if portIdx < 0 || portIdx+1 >= len(fields) {
+		return fmt.Errorf("missing target port")
+	}
+	if _, err := strconv.Atoi(fields[portIdx+1]); err != nil {
+		return fmt.Errorf("target port %q is not numeric", fields[portIdx+1])
+	}
+	if len(fields) != portIdx+2 && !(len(fields) == portIdx+3 && fields[portIdx+2] == "round-robin") {
+		return fmt.Errorf("unexpected trailing rdr tokens %v", fields[portIdx+2:])
+	}
+
+	targets, err := parseRDRTargets(fields[13:portIdx])
+	if err != nil {
+		return err
+	}
+	for _, target := range targets {
+		if p.ipInSet(target, p.PodCIDRs) || p.ipInSet(target, p.VMNetCIDRs) {
+			continue
+		}
+		return fmt.Errorf("redirect target %q is outside configured Pod/vmnet CIDRs", target)
+	}
+	return nil
+}
+
+func parseRDRTargets(fields []string) ([]string, error) {
+	if len(fields) == 0 {
+		return nil, fmt.Errorf("missing redirect target")
+	}
+	if fields[0] != "{" {
+		if len(fields) != 1 {
+			return nil, fmt.Errorf("unexpected redirect target tokens %v", fields)
+		}
+		if net.ParseIP(fields[0]) == nil {
+			return nil, fmt.Errorf("redirect target %q is not an IP", fields[0])
+		}
+		return []string{fields[0]}, nil
+	}
+	if len(fields) < 3 || fields[len(fields)-1] != "}" {
+		return nil, fmt.Errorf("malformed redirect target pool %v", fields)
+	}
+	out := make([]string, 0, len(fields)-2)
+	for _, f := range fields[1 : len(fields)-1] {
+		ip := strings.TrimSuffix(f, ",")
+		if ip == "" || net.ParseIP(ip) == nil {
+			return nil, fmt.Errorf("redirect target %q is not an IP", f)
+		}
+		out = append(out, ip)
+	}
+	return out, nil
+}
+
+func (p Policy) checkIPInSet(ip string, cidrs map[string]bool, desc string) error {
+	if !p.ipInSet(ip, cidrs) {
+		return fmt.Errorf("%q is outside configured %s", ip, desc)
+	}
+	return nil
+}
+
+func (p Policy) ipInSet(raw string, cidrs map[string]bool) bool {
+	ip := net.ParseIP(raw)
+	if ip == nil {
+		return false
+	}
+	for cidr := range cidrs {
+		_, ipnet, err := net.ParseCIDR(cidr)
+		if err == nil && ipnet.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 // validateRoute permits adding/deleting host routes only for configured CIDRs,
@@ -169,6 +300,9 @@ func (p Policy) validateRoute(req Request) error {
 	}
 	if req.Args[3] != "-inet" && req.Args[3] != "-inet6" {
 		return fmt.Errorf("route family %q not permitted", req.Args[3])
+	}
+	if req.Args[2] == "delete" && req.Args[3] == "-inet" && req.Args[4] == "default" {
+		return p.checkVMNetInterface(req.Args[6])
 	}
 	if err := p.checkMeshInterface(req.Args[6]); err != nil {
 		return err
@@ -291,6 +425,16 @@ func (p Policy) checkMeshInterface(iface string) error {
 	}
 	if iface != p.MeshInterface {
 		return fmt.Errorf("interface %q is not the managed mesh interface %q", iface, p.MeshInterface)
+	}
+	return nil
+}
+
+func (p Policy) checkVMNetInterface(iface string) error {
+	if p.VMNetInterface == "" {
+		return fmt.Errorf("no vmnet interface is configured; command refused")
+	}
+	if iface != p.VMNetInterface {
+		return fmt.Errorf("interface %q is not the managed vmnet interface %q", iface, p.VMNetInterface)
 	}
 	return nil
 }

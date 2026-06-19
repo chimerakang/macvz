@@ -19,6 +19,8 @@ func samplePolicy() Policy {
 		MeshAddressIP:  "10.99.0.1",
 		MTU:            1380,
 		RouteCIDRs:     NormalizeCIDRSet([]string{"10.244.1.0/24", "10.99.0.2/32"}),
+		PodCIDRs:       NormalizeCIDRSet([]string{"10.244.1.0/24"}),
+		VMNetCIDRs:     NormalizeCIDRSet([]string{"192.168.64.0/24"}),
 		PeerPublicKeys: map[string]bool{"PEERKEY00000000000000000000000000000000000=": true},
 	}
 }
@@ -57,6 +59,7 @@ func TestPolicyAllowsConfiguredCommands(t *testing.T) {
 		{"pfctl", "load managed anchor", Request{Name: "pfctl", Args: []string{"-a", "macvz/pods", "-f", "-"}, Stdin: validAnchorRuleset}},
 		{"route", "add configured pod CIDR", Request{Name: "route", Args: []string{"-q", "-n", "add", "-inet", "10.244.1.0/24", "-interface", "utun7"}}},
 		{"route", "delete configured mesh CIDR", Request{Name: "route", Args: []string{"-q", "-n", "delete", "-inet", "10.99.0.2/32", "-interface", "utun7"}}},
+		{"route", "delete vmnet default route", Request{Name: "route", Args: []string{"-q", "-n", "delete", "-inet", "default", "-interface", "bridge100"}}},
 		{"ifconfig", "assign mesh address", Request{Name: "ifconfig", Args: []string{"utun7", "inet", "10.99.0.1", "10.99.0.1", "alias"}}},
 		{"ifconfig", "set configured mtu", Request{Name: "ifconfig", Args: []string{"utun7", "mtu", "1380"}}},
 		{"ifconfig", "bring up", Request{Name: "ifconfig", Args: []string{"utun7", "up"}}},
@@ -90,9 +93,14 @@ func TestPolicyRefusesOutOfScopeCommands(t *testing.T) {
 		{"flush everything", Request{Name: "pfctl", Args: []string{"-F", "all"}}},
 		{"non-binat/rdr rule in anchor", Request{Name: "pfctl", Args: []string{"-a", "macvz/pods", "-f", "-"}, Stdin: "pass in all\n"}},
 		{"rule on foreign interface", Request{Name: "pfctl", Args: []string{"-a", "macvz/pods", "-f", "-"}, Stdin: "binat on en0 from 1.2.3.4 to any -> 5.6.7.8\n"}},
+		{"binat from foreign vmnet ip", Request{Name: "pfctl", Args: []string{"-a", "macvz/pods", "-f", "-"}, Stdin: "binat on bridge100 from 172.16.0.2 to any -> 10.244.1.5\n"}},
+		{"binat to foreign pod ip", Request{Name: "pfctl", Args: []string{"-a", "macvz/pods", "-f", "-"}, Stdin: "binat on bridge100 from 192.168.64.3 to any -> 10.250.1.5\n"}},
+		{"rdr to foreign ip", Request{Name: "pfctl", Args: []string{"-a", "macvz/pods", "-f", "-"}, Stdin: "rdr on bridge100 inet proto tcp from any to 10.96.0.1 port 80 -> 1.2.3.4 port 8080\n"}},
 
 		// route: only configured CIDRs through the managed interface.
 		{"default route hijack", Request{Name: "route", Args: []string{"-q", "-n", "add", "-inet", "0.0.0.0/0", "-interface", "utun7"}}},
+		{"default route add on vmnet", Request{Name: "route", Args: []string{"-q", "-n", "add", "-inet", "default", "-interface", "bridge100"}}},
+		{"default route delete on foreign interface", Request{Name: "route", Args: []string{"-q", "-n", "delete", "-inet", "default", "-interface", "en0"}}},
 		{"unconfigured CIDR", Request{Name: "route", Args: []string{"-q", "-n", "add", "-inet", "10.250.0.0/24", "-interface", "utun7"}}},
 		{"route via foreign interface", Request{Name: "route", Args: []string{"-q", "-n", "add", "-inet", "10.244.1.0/24", "-interface", "en0"}}},
 		{"route flush", Request{Name: "route", Args: []string{"-n", "flush"}}},
@@ -213,6 +221,14 @@ func TestLintAnchorRulesetIgnoresCommentsAndBlankLines(t *testing.T) {
 	}
 	if !strings.Contains(mustErr(t, func() error { return p.lintAnchorRuleset("pass in all\n") }), "binat/rdr") {
 		t.Error("error should explain the binat/rdr restriction")
+	}
+}
+
+func TestLintAnchorRulesetAllowsLocalVMServiceTarget(t *testing.T) {
+	p := samplePolicy()
+	rs := "rdr on bridge100 inet proto tcp from any to 10.96.0.1 port 80 -> 192.168.64.5 port 8080\n"
+	if err := p.lintAnchorRuleset(rs); err != nil {
+		t.Errorf("local VM service target should pass: %v", err)
 	}
 }
 

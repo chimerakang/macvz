@@ -220,9 +220,23 @@ MacVz logic bug**:
 
 ### MacVz findings worth fixing (filed as follow-ups)
 
-1. **vmnet default-route hijack.** `apple/container` installs a `default →
-   bridge100` route that can seed bad cloned routes / hijack host traffic; MacVz
-   should pin its control-plane/management routes or drop the vmnet default.
+1. **vmnet default-route hijack — CRITICAL (confirmed root cause).** Starting an
+   `apple/container` micro-VM installs a `default → bridge100` route that
+   **steals the host's IPv4 default route**, breaking *all* of the host's
+   outbound connectivity — not just the kubelet. On the test host this took down
+   unrelated production services (an `frpc` reverse-proxy tunnel and a GitHub
+   Actions runner reachable at `selene.itypes.me`, which returned to HTTP 200
+   only after the operator reset the route). This is also the **actual root
+   cause of the macvz-b NotReady flap** (earlier mis-attributed to BSD route
+   caching): the remote node's kubelet lost its API path whenever the bridge100
+   default won. **MacVz must not let a micro-VM hijack the host default route** —
+   e.g. detect and remove the vmnet `default` route at podNetwork start (the
+   helper already allowlists `route`) and/or keep it removed, and never run the
+   data plane on a host whose outbound traffic it would capture.
+   **Addressed after this run:** `pkg/network/podnet.Router` now deletes IPv4
+   `default` on `podNetwork.interface` at start and on every Pod attach; the
+   privileged helper policy only permits this default-route operation as a
+   delete scoped to the configured vmnet interface.
 2. **Mesh bring-up disrupts the kubelet's own API connection** on a node whose
    API is remote. Bringing the data plane up *before* node registration helps but
    is not sufficient; the kubelet's API transport should tolerate a transient

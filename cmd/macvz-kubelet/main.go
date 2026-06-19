@@ -201,7 +201,7 @@ func run(ctx context.Context, configPath, runtimeBinary string) error {
 			return fmt.Errorf("privileged network helper at %s answered status but cannot run commands: %w", cfg.PrivilegedHelperSocket, err)
 		}
 		if !st.PolicyEnforced {
-			klog.Warning("privileged network helper is running without per-request policy validation (#41); start macvz-netd with --config to confine it to this node's interfaces/CIDRs/peers/anchor")
+			return fmt.Errorf("privileged network helper at %s is running without per-request policy validation; start macvz-netd with --config", cfg.PrivilegedHelperSocket)
 		}
 		klog.InfoS("privileged network helper reachable",
 			"socket", cfg.PrivilegedHelperSocket, "version", st.Version, "protocol", st.Protocol,

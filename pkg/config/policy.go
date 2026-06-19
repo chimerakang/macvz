@@ -22,10 +22,22 @@ func (c Config) PrivilegedHelperPolicy() (privhelper.Policy, error) {
 		VMNetInterface: c.PodNetwork.Interface,
 		Anchor:         podnet.DefaultAnchor,
 		RouteCIDRs:     map[string]bool{},
+		PodCIDRs:       map[string]bool{},
+		VMNetCIDRs:     map[string]bool{},
 		PeerPublicKeys: map[string]bool{},
 	}
 	if c.PodNetwork.Anchor != "" {
 		p.Anchor = c.PodNetwork.Anchor
+	}
+	if c.Node.PodCIDR != "" {
+		p.PodCIDRs = privhelper.NormalizeCIDRSet([]string{c.Node.PodCIDR})
+	}
+	if c.PodNetwork.Enabled {
+		vmnet := c.PodNetwork.VMNetCIDRs
+		if len(vmnet) == 0 {
+			vmnet = []string{DefaultVMNetCIDR}
+		}
+		p.VMNetCIDRs = privhelper.NormalizeCIDRSet(vmnet)
 	}
 
 	if !c.Mesh.Enabled {
@@ -45,6 +57,15 @@ func (c Config) PrivilegedHelperPolicy() (privhelper.Policy, error) {
 	// AllowedIPs (Pod CIDR + mesh address), exactly what the mesh installs routes
 	// for and what its wg config advertises.
 	p.RouteCIDRs = privhelper.NormalizeCIDRSet(ifc.RouteTargets())
+	for _, peer := range c.Mesh.Peers {
+		if peer.PodCIDR != "" {
+			if norm := privhelper.NormalizeCIDRSet([]string{peer.PodCIDR}); len(norm) > 0 {
+				for cidr := range norm {
+					p.PodCIDRs[cidr] = true
+				}
+			}
+		}
+	}
 	for _, peer := range ifc.Peers {
 		p.PeerPublicKeys[peer.PublicKey.String()] = true
 	}

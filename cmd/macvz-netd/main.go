@@ -9,20 +9,20 @@
 //
 // Usage:
 //
-//	macvz-netd serve   [--socket PATH] [--owner uid:gid]   run the daemon (default)
-//	macvz-netd install [--socket PATH] [--owner uid:gid]   install + start the LaunchDaemon
+//	macvz-netd serve   [--socket PATH] --config PATH [--owner uid:gid]   run the daemon (default)
+//	macvz-netd install [--socket PATH] --config PATH [--owner uid:gid]   install + start the LaunchDaemon
 //	macvz-netd uninstall                                   stop + remove the LaunchDaemon
 //	macvz-netd load | unload                               (re)bootstrap an installed job
 //	macvz-netd status                                      report install/run state
 //
 // Run it directly once, as root, before the kubelet:
 //
-//	sudo macvz-netd serve --socket /var/run/macvz-netd.sock
+//	sudo macvz-netd serve --socket /var/run/macvz-netd.sock --config /etc/macvz/config.yaml
 //
 // Or install it as a LaunchDaemon so it starts at boot and the kubelet never
 // needs sudo (the installing user, captured via sudo, owns the socket):
 //
-//	sudo macvz-netd install --socket /var/run/macvz-netd.sock
+//	sudo macvz-netd install --socket /var/run/macvz-netd.sock --config /etc/macvz/config.yaml
 //
 // When launched via sudo `serve` chowns the socket to $SUDO_UID/$SUDO_GID so the
 // invoking (non-root) user can connect, and no other user can. Under launchd
@@ -90,20 +90,24 @@ func usage() {
 	fmt.Fprint(os.Stderr, `macvz-netd — MacVz privileged network helper daemon
 
 Commands:
-  serve      [--socket PATH] [--owner uid:gid]   run the daemon (default)
-  install    [--socket PATH] [--owner uid:gid]   install and start the LaunchDaemon (sudo)
+  serve      [--socket PATH] --config PATH [--owner uid:gid]   run the daemon (default)
+  install    [--socket PATH] --config PATH [--owner uid:gid]   install and start the LaunchDaemon (sudo)
   uninstall                                       stop and remove the LaunchDaemon (sudo)
   load                                            bootstrap an installed job (sudo)
   unload                                          boot out a running job (sudo)
   status                                          report install and run state
+
+Development only: pass --allow-unsafe-no-config with serve/install to skip
+config-derived request policy.
 `)
 }
 
 // cmdFlags holds the flags a subcommand parsed.
 type cmdFlags struct {
-	socket string
-	owner  string
-	config string
+	socket              string
+	owner               string
+	config              string
+	allowUnsafeNoConfig bool
 }
 
 // parseFlags builds and parses a FlagSet for a subcommand, wiring the shared
@@ -115,6 +119,7 @@ func parseFlags(name string, args []string, socket, owner bool) (cmdFlags, error
 		fs.StringVar(&f.socket, "socket", defaultSocket, "unix socket path to listen on")
 		// --config travels with --socket: both serve and install accept it.
 		fs.StringVar(&f.config, "config", "", "path to the MacVz config; restricts privileged commands to its interfaces, CIDRs, peers, and pf anchor (#41)")
+		fs.BoolVar(&f.allowUnsafeNoConfig, "allow-unsafe-no-config", false, "development only: allow helper startup without config-derived request policy")
 	}
 	if owner {
 		fs.StringVar(&f.owner, "owner", "", "uid:gid to own the socket (defaults to $SUDO_UID:$SUDO_GID)")
@@ -122,27 +127,38 @@ func parseFlags(name string, args []string, socket, owner bool) (cmdFlags, error
 	return f, fs.Parse(args)
 }
 
-// helperServer builds the helper server, enforcing a config-derived policy when
-// configPath is set and falling back to the name-allowlist-only server (with a
-// loud warning) when it is not.
-func helperServer(socket, configPath string) (*privhelper.Server, error) {
+// helperServer builds the helper server, enforcing a config-derived policy in
+// production and allowing name-allowlist-only mode only behind an explicit unsafe
+// development flag.
+func helperServer(socket, configPath string, allowUnsafeNoConfig bool) (*privhelper.Server, error) {
 	if configPath == "" {
-		klog.Warning("macvz-netd started without --config: privileged commands are restricted to the command allowlist only, not to this node's interfaces/CIDRs/peers/anchor. Pass --config <path> to enable per-request validation (#41).")
+		if !allowUnsafeNoConfig {
+			return nil, fmt.Errorf("macvz-netd requires --config to enforce per-request network policy; pass --allow-unsafe-no-config only for local development")
+		}
+		klog.Warning("macvz-netd started with --allow-unsafe-no-config: privileged commands are restricted to the command allowlist only, not to this node's interfaces/CIDRs/peers/anchor.")
 		return privhelper.NewServer(socket).SetVersion(version.Version), nil
 	}
-	cfg, err := config.Load(configPath)
-	if err != nil {
-		return nil, fmt.Errorf("load config %q: %w", configPath, err)
+	loader := func() (privhelper.Policy, error) {
+		cfg, err := config.Load(configPath)
+		if err != nil {
+			return privhelper.Policy{}, fmt.Errorf("load config %q: %w", configPath, err)
+		}
+		policy, err := cfg.PrivilegedHelperPolicy()
+		if err != nil {
+			return privhelper.Policy{}, fmt.Errorf("derive privileged helper policy from %q: %w", configPath, err)
+		}
+		klog.InfoS("macvz-netd enforcing request policy",
+			"config", configPath, "meshInterface", policy.MeshInterface,
+			"vmnetInterface", policy.VMNetInterface, "anchor", policy.Anchor,
+			"routeCIDRs", len(policy.RouteCIDRs), "podCIDRs", len(policy.PodCIDRs),
+			"vmNetCIDRs", len(policy.VMNetCIDRs), "peers", len(policy.PeerPublicKeys))
+		return policy, nil
 	}
-	policy, err := cfg.PrivilegedHelperPolicy()
+	srv, err := privhelper.NewServerWithPolicyLoader(socket, loader)
 	if err != nil {
-		return nil, fmt.Errorf("derive privileged helper policy from %q: %w", configPath, err)
+		return nil, err
 	}
-	klog.InfoS("macvz-netd enforcing request policy",
-		"config", configPath, "meshInterface", policy.MeshInterface,
-		"vmnetInterface", policy.VMNetInterface, "anchor", policy.Anchor,
-		"routeCIDRs", len(policy.RouteCIDRs), "peers", len(policy.PeerPublicKeys))
-	return privhelper.NewServerWithPolicy(socket, policy).SetVersion(version.Version), nil
+	return srv.SetVersion(version.Version), nil
 }
 
 // runServe runs the helper daemon until SIGINT/SIGTERM.
@@ -161,7 +177,7 @@ func runServe(args []string) error {
 		return err
 	}
 
-	srv, err := helperServer(f.socket, f.config)
+	srv, err := helperServer(f.socket, f.config, f.allowUnsafeNoConfig)
 	if err != nil {
 		return err
 	}
@@ -207,6 +223,7 @@ func runInstall(args []string) error {
 	cfg := privhelper.DefaultLaunchdConfig(f.socket)
 	cfg.OwnerUID, cfg.OwnerGID = uid, gid
 	cfg.ConfigPath = f.config
+	cfg.AllowUnsafeNoConfig = f.allowUnsafeNoConfig
 
 	if err := privhelper.NewInstaller(cfg).Install(context.Background(), self); err != nil {
 		return err
@@ -214,8 +231,8 @@ func runInstall(args []string) error {
 	klog.InfoS("macvz-netd installed and started",
 		"plist", cfg.PlistPath(), "binary", cfg.BinaryPath, "socket", cfg.SocketPath,
 		"config", cfg.ConfigPath, "owner", fmt.Sprintf("%d:%d", uid, gid), "logs", cfg.StdoutPath)
-	if cfg.ConfigPath == "" {
-		klog.Warning("installed without --config: per-request policy validation is disabled. Reinstall with --config <path> to confine the helper to this node's interfaces/CIDRs/peers/anchor (#41).")
+	if cfg.AllowUnsafeNoConfig {
+		klog.Warning("installed with --allow-unsafe-no-config: per-request policy validation is disabled. Reinstall with --config <path> to confine the helper to this node's interfaces/CIDRs/peers/anchor (#41).")
 	}
 	return nil
 }

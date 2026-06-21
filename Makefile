@@ -69,6 +69,10 @@ compat: ## Run the P6 workload compatibility fixture against a real cluster (iss
 soak: ## Run the long-duration P9 soak harness against a real cluster (issue #71)
 	./test/e2e/soak/run.sh
 
+.PHONY: cri-feasibility
+cri-feasibility: ## Probe apple/container surfaces for the CRI feasibility track
+	./scripts/cri-feasibility.sh
+
 .PHONY: release
 release: ## Build, sign, and package a darwin/arm64 release + install bundle into dist/ (see docs/RELEASE.md, docs/PACKAGING.md)
 	VERSION=$(VERSION) COMMIT=$(COMMIT) DATE=$(DATE) ./scripts/macos-release.sh

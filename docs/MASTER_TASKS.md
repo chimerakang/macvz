@@ -3,6 +3,11 @@
 Source of truth for the phased roadmap. Phases map to GitHub **Milestones**; tasks map to GitHub **Issues**. Regenerate with `/task-sync`.
 
 > **Strategy:** MacVz is a *node-layer* project — a Virtual Kubelet provider that runs OCI workloads as native micro-VMs on Apple Silicon via `apple/container`. We do **not** build a control plane. See [README](../README.md).
+>
+> **CRI feasibility:** A separate `develop` track is evaluating whether MacVz
+> can also become a CRI runtime path for kubelet/k3s. The current strategy does
+> not change until the Phase 0-2 risks are proven. See
+> [CRI_FEASIBILITY.md](CRI_FEASIBILITY.md).
 
 ## Phase Overview
 
@@ -31,6 +36,23 @@ Source of truth for the phased roadmap. Phases map to GitHub **Milestones**; tas
 - **P7** — A new Mac can join the MacVz node pool through a documented bootstrap flow; existing nodes can be drained, diagnosed, and removed without manual cleanup.
 - **P8** — At least one public Kubernetes application and one CBB-compatible subset run on MacVz and expose a browser-visible service.
 - **P9** — Long-running soak tests survive kubelet/helper restarts, orphan cleanup works, resource usage remains bounded, and release artifacts can be installed, upgraded, rolled back, and removed.
+
+## CRI Feasibility Track
+
+This track is intentionally separate from P0-P9 because it may change the main
+architecture from Virtual Kubelet provider to kubelet CRI runtime integration.
+
+| Phase | Title | Status |
+| --- | --- | --- |
+| CRI-P0 | Map `apple/container` and MacVz runtime surfaces to CRI, name hard blockers | ✅ Complete |
+| CRI-P1 | Build a minimal CRI server skeleton that answers kubelet `Status` | ⬜ Planned |
+| CRI-P2 | Spike Pod sandbox lifecycle over `apple/container` | ⬜ Planned |
+| CRI-P3 | Run a single-container Pod through kubelet and the CRI adapter | ⬜ Planned |
+| CRI-P4 | Implement CRI ImageService pull/list/status/remove | ⬜ Planned |
+| CRI-P5 | Integrate CNI/Pod networking lifecycle | ⬜ Planned |
+| CRI-P6 | Implement logs, exec, attach, port-forward, and stats surfaces | ⬜ Planned |
+| CRI-P7 | Validate volumes, projected data, probes, and restart recovery | ⬜ Planned |
+| CRI-P8 | Harden k3s compatibility, install, cleanup, and soak behavior | ⬜ Planned |
 
 ## Current Validation Snapshot
 

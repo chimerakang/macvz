@@ -273,6 +273,14 @@ supports kubelet's normal sandbox/container ordering.
 - produce the next tiny PoC issue for one runtime primitive, not a full runtime
   rewrite.
 
+R0 result: the architecture note is
+[CRI_RUNTIME_R0_ARCHITECTURE.md](CRI_RUNTIME_R0_ARCHITECTURE.md). The selected
+next primitive is guest-side hotplug device discovery for VZ USB mass-storage
+rootfs attachments. If the guest can reliably correlate a host attach request to
+a real block device and mount it, MacVz can design a real rootfs attachment
+manager. If not, the research should pivot to NBD or guest-side image
+pull/unpack.
+
 ### C5: Swift Helper Daemon Prototype
 
 Only if R0 later selects a LinuxPod-based bridge as a valid runtime building
@@ -336,6 +344,8 @@ The currently accepted position is:
   guest block path for LinuxPod rootfs hotplug.
 - Issue #92: runtime architecture research for a true Pod VM runtime instead of
   a thin limited LinuxPod wrapper.
+- [CRI_RUNTIME_R0_ARCHITECTURE.md](CRI_RUNTIME_R0_ARCHITECTURE.md): target Pod
+  VM runtime architecture and R1/R2 follow-up direction.
 - `vanchonlee/krust-cri`: public experimental macOS CRI runtime over
   Apple Containerization `LinuxPod`.
 - Kata Containers and firecracker-containerd: mature references for per-Pod VM,

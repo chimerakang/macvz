@@ -1087,6 +1087,10 @@ sandbox VM lifecycle, guest-agent contract, deterministic rootfs
 hotplug/device discovery, multi-container process lifecycle, Pod networking, CRI
 mapping, recovery, and the boundary between reusable `apple/containerization`
 pieces and MacVz-owned code. The shipped Virtual Kubelet path remains unchanged.
+The R0 design is in [CRI_RUNTIME_R0_ARCHITECTURE.md](CRI_RUNTIME_R0_ARCHITECTURE.md).
+It selects guest-side hotplug device discovery as the next smallest primitive:
+after VZ USB mass-storage attach, prove that the guest can reliably identify,
+mount, and unmount the requested ext4 rootfs without guessing a device path.
 
 ## CRI-P9 Follow-up (#86): Unblock Honest Multi-Container Pods
 

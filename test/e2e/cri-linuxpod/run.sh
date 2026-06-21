@@ -32,8 +32,13 @@ case "${PROBE}" in
     REPORT_TITLE="CRI LinuxPod C4 HotplugProvider Boundary Probe Report (#91)"
     WORK_DIR="${MACVZ_LINUXPOD_WORK_DIR:-/tmp/macvz-linuxpod-c4}"
     ;;
+  r1)
+    DEFAULT_REPORT_PATH="${ROOT_DIR}/docs/CRI_RUNTIME_R1_DEVICE_DISCOVERY_REPORT.md"
+    REPORT_TITLE="CRI-R1 Guest-Side Hotplug Device Discovery Report (#93)"
+    WORK_DIR="${MACVZ_LINUXPOD_WORK_DIR:-/tmp/macvz-runtime-r1}"
+    ;;
   *)
-    echo "unsupported MACVZ_LINUXPOD_PROBE=${PROBE}; expected c1, c2, or c4" >&2
+    echo "unsupported MACVZ_LINUXPOD_PROBE=${PROBE}; expected c1, c2, c4, or r1" >&2
     exit 1
     ;;
 esac
@@ -51,6 +56,7 @@ This gated Swift harness can run:
   - c1 (#88): pre-create two-container shared-namespace proof
   - c2 (#89): post-create addContainer kubelet-ordering probe
   - c4 (#91): consumer HotplugProvider boundary probe
+  - r1 (#93): guest-side hotplug block-device discovery probe
 
 Selected probe: ${PROBE}
 
@@ -73,6 +79,15 @@ C4 flow:
   3. attempt late-client after pod.create()
   4. record whether provider is installed, called, can attach rootfs, and can
      start the late container without guessing a guest block path
+
+R1 flow:
+  1. boot one LinuxPod with a predeclared utility container
+  2. record the guest /sys/block baseline
+  3. attach a second ext4 rootfs image as public VZ USB mass storage
+  4. have the guest detect a new block device, correlate it by sector count,
+     mount it read-only, verify busybox rootfs content, unmount, detach, and
+     verify the block device disappears without treating guessed /dev names as
+     success
 
 Set MACVZ_LINUXPOD_VMNET=1 to also attach a vmnet interface. The default
 keeps this C1 probe focused on LinuxPod shared-namespace behavior.
@@ -97,6 +112,7 @@ Run live:
   MACVZ_LINUXPOD_POC=1 make cri-linuxpod-poc
   MACVZ_LINUXPOD_POC=1 make cri-linuxpod-c2
   MACVZ_LINUXPOD_POC=1 make cri-linuxpod-c4
+  MACVZ_LINUXPOD_POC=1 make cri-linuxpod-r1
 EOF
   exit 0
 fi
@@ -194,7 +210,7 @@ else
 - [x] The fallback model is included in the JSON result.
 
 EOF
-  else
+  elif [[ "${PROBE}" == "c4" ]]; then
     cat >>"${REPORT_PATH}" <<EOF
 - [x] One LinuxPod was created.
 - [x] A custom VZInstanceExtension / HotplugProvider was installed or the failure was recorded.
@@ -203,6 +219,16 @@ EOF
 - [x] The post-create addContainer path recorded whether the provider was called.
 - [x] The report distinguishes provider install/call, public rootfs attach, guest path resolution, and late-container start.
 - [x] No guessed guest block path is counted as success.
+
+EOF
+  else
+    cat >>"${REPORT_PATH}" <<EOF
+- [x] One LinuxPod was created.
+- [x] A custom VZInstanceExtension configured an XHCI controller and captured the running VM instance.
+- [x] Guest /sys/block baseline was recorded before host attach.
+- [x] A second ext4 rootfs image was attached through public VZ USB mass storage or the attach failure was recorded.
+- [x] Guest-side discovery distinguishes observation, correlation by exact sector count, mount, marker verification, unmount, detach, and post-detach cleanup.
+- [x] No guessed /dev/sdX or /dev/vdX path is counted as success.
 
 EOF
   fi

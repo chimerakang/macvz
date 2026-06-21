@@ -22,6 +22,30 @@ k3s / kubelet
 If feasible, k3s or a regular kubelet would talk to MacVz through the standard
 CRI socket instead of scheduling to a Virtual Kubelet node.
 
+## Runtime Research Update
+
+The early CRI-P phases proved that an experimental CRI socket can satisfy
+kubelet lifecycle contracts for a restricted single-container model, but the
+Pod VM route still needs an honest multi-container sandbox/runtime primitive.
+
+The later LinuxPod/runtime research track now carries that evidence:
+
+- C1 (#88) proved one LinuxPod can run two predeclared containers with shared
+  loopback, logs, exec, stats, and stop-order isolation.
+- C2 (#89) proved post-create `LinuxPod.addContainer(...)` is not supported by
+  the default public path.
+- C4 (#91) proved a custom HotplugProvider can be installed/called and host-side
+  VZ USB mass-storage attach can succeed, but it cannot return a deterministic
+  guest block path.
+- R1 (#93) then tested the missing guest-side half directly. Host USB attach
+  succeeded, but the guest did not observe a new USB/SCSI/block device, so the
+  outcome is `guestCouldNotObserveNewDevice`.
+
+Conclusion: do not build the next runtime step on public VZ USB mass-storage
+hotplug for rootfs attachments. The active route should pivot to NBD or
+guest-side rootfs exposure/pull/unpack while keeping the shipped Virtual Kubelet
+provider unchanged.
+
 ## Phase Plan
 
 | Phase | Goal | Exit Criteria |

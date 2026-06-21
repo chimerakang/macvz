@@ -281,6 +281,29 @@ a real block device and mount it, MacVz can design a real rootfs attachment
 manager. If not, the research should pivot to NBD or guest-side image
 pull/unpack.
 
+### R1: Guest-Side Hotplug Device Discovery (#93)
+
+R1 completed on 2026-06-21 UTC. The probe booted one LinuxPod with a utility
+container, recorded the guest `/sys/block` baseline, attached a second ext4
+rootfs image through public VZ USB mass storage, and asked the guest to discover
+a new block device without guessing `/dev/sdX`.
+
+Result: **blocked before correlation**. Host attach succeeded, but the guest did
+not observe a new device. The diagnostic output showed:
+
+- baseline block devices: `vda` and `vdb`;
+- post-attach `/sys/block`: still only loop/ram plus `vda` and `vdb`;
+- `/sys/bus/usb/devices`: empty;
+- `/sys/class/scsi_disk`: empty;
+- outcome: `guestCouldNotObserveNewDevice`.
+
+The report is
+[CRI_RUNTIME_R1_DEVICE_DISCOVERY_REPORT.md](CRI_RUNTIME_R1_DEVICE_DISCOVERY_REPORT.md).
+This closes the C4/R0 USB-mass-storage question for the current environment:
+public host-side attach success is not enough to build an honest guest rootfs
+attachment primitive. The next route-C/runtime research should pivot to NBD or
+guest-side rootfs exposure/pull/unpack.
+
 ### C5: Swift Helper Daemon Prototype
 
 Only if R0 later selects a LinuxPod-based bridge as a valid runtime building

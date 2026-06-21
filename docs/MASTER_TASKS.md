@@ -65,7 +65,8 @@ architecture from Virtual Kubelet provider to kubelet CRI runtime integration.
 | CRI-C3 (#90) | Decide LinuxPod backend limits and next sandbox strategy | ✅ Complete (route C stays experimental; no helper daemon/full CRI claim until hotplug boundary is proven or a limited model is explicitly accepted) |
 | CRI-C4 (#91) | Probe LinuxPod HotplugProvider boundary on current apple/containerization | ✅ Complete (provider can be installed/called and USB mass-storage attach succeeds, but public APIs do not yield a deterministic guest block path for late rootfs mount) |
 | CRI-R0 (#92) | Research Pod VM runtime architecture for full kubelet semantics | ✅ Complete (thin LinuxPod wrapper rejected as main path; target Pod VM runtime architecture and R1 device-discovery PoC defined) |
-| CRI-R1 (#93) | Guest-side hotplug device discovery PoC for Pod VM rootfs attachments | ⬜ Planned |
+| CRI-R1 (#93) | Guest-side hotplug device discovery PoC for Pod VM rootfs attachments | ✅ Complete (host VZ USB attach succeeds, but guest observes no new USB/SCSI/block device; pivot to NBD or guest-side rootfs exposure) |
+| CRI-R2 (#94) | Evaluate NBD and guest-side rootfs exposure fallback for Pod VM runtime | ⬜ Planned |
 
 **CRI-P5 evidence (#77):** Pod networking is wired through the same primitives as
 the shipped provider — `network.PodIPAM` for Pod IPs and `podnet.Router` for the

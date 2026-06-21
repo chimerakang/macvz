@@ -23,6 +23,7 @@ make -C test/e2e/cri-linuxpod/containerization init
 MACVZ_LINUXPOD_POC=1 make cri-linuxpod-poc
 MACVZ_LINUXPOD_POC=1 make cri-linuxpod-c2
 MACVZ_LINUXPOD_POC=1 make cri-linuxpod-c4
+MACVZ_LINUXPOD_POC=1 make cri-linuxpod-r1
 ```
 
 Set `MACVZ_CONTAINERIZATION_DIR` if the checkout lives elsewhere. The default
@@ -32,14 +33,19 @@ container can be added after `pod.create()`, which maps to kubelet's
 `RunPodSandbox` before later `CreateContainer` ordering. C4 installs a custom
 `VZInstanceExtension` / `HotplugProvider` and records whether public APIs can
 turn a post-create rootfs hotplug request into a real late container start
-without guessing the guest block path. Set
+without guessing the guest block path. R1 boots a utility container, records the
+guest `/sys/block` baseline, attaches a second ext4 rootfs image through public
+VZ USB mass storage, and verifies whether the guest can discover, correlate,
+mount, validate, unmount, detach, and observe cleanup without treating a guessed
+`/dev/sdX` or `/dev/vdX` path as success. Set
 `MACVZ_LINUXPOD_VMNET=1` to include vmnet attachment as an additional host
 network probe.
 
 The C1 live run writes `docs/CRI_LINUXPOD_POC_REPORT.md`; C2 writes
 `docs/CRI_LINUXPOD_C2_REPORT.md`; C4 writes
-`docs/CRI_LINUXPOD_C4_REPORT.md` unless `MACVZ_LINUXPOD_REPORT` points to
-another path.
+`docs/CRI_LINUXPOD_C4_REPORT.md`; R1 writes
+`docs/CRI_RUNTIME_R1_DEVICE_DISCOVERY_REPORT.md` unless
+`MACVZ_LINUXPOD_REPORT` points to another path.
 
 ## What It Proves
 
@@ -60,5 +66,6 @@ another path.
 - CRI `PortForward`;
 - Service/CNI/multi-node routing;
 - daemon restart recovery.
+- production rootfs attachment management.
 
 Those remain later gates in `docs/CRI_LINUXPOD_FEASIBILITY.md`.

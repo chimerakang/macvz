@@ -182,9 +182,19 @@ The PoC should answer:
   content exists;
 - can the guest unmount and survive detach/retry without stale state.
 
-If this fails, the next research should pivot to NBD or guest-side pull/unpack.
-If it passes, MacVz can define a real rootfs attachment manager and guest-agent
-extension.
+R1 completed on 2026-06-21 UTC. The host configured an XHCI controller, captured
+the running VZ instance, and `VZUSBController.attach(device:)` returned success
+for a second ext4 rootfs image. The guest did not observe a new block device:
+`/sys/block` stayed at the baseline `vda/vdb`, `/sys/bus/usb/devices` was empty,
+and `/sys/class/scsi_disk` was empty. The R1 outcome is therefore
+`guestCouldNotObserveNewDevice`, not a mount/correlation success. See
+[CRI_RUNTIME_R1_DEVICE_DISCOVERY_REPORT.md](CRI_RUNTIME_R1_DEVICE_DISCOVERY_REPORT.md).
+
+This means public VZ USB mass-storage hotplug is not a reliable rootfs
+attachment primitive for the current Apple Containerization LinuxPod/vminitd
+environment. The next research should pivot to NBD or guest-side rootfs
+exposure/pull/unpack instead of building a rootfs attachment manager on USB
+block hotplug.
 
 ## CRI Mapping Implications
 
@@ -211,7 +221,8 @@ extension.
 
 ## Follow-Up Issues
 
-- **CRI-R1 (#93):** guest-side hotplug device discovery PoC for VZ USB mass-storage
-  rootfs attachments.
-- **CRI-R2:** NBD or guest-side rootfs exposure fallback study, only if R1 does
-  not produce a reliable mapping.
+- **CRI-R1 (#93):** guest-side hotplug device discovery PoC for VZ USB
+  mass-storage rootfs attachments. Complete: host attach succeeded, but the
+  guest did not observe a new USB/SCSI/block device.
+- **CRI-R2 (#94):** NBD or guest-side rootfs exposure fallback study. This is
+  now the active next primitive because R1 did not produce a reliable mapping.

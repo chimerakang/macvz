@@ -32,7 +32,7 @@ struct LinuxPodSharedNamespacePoC: AsyncParsableCommand {
     @Option(help: "TCP port inside the shared Pod namespace.")
     var port: Int = 18080
 
-    @Option(help: "Probe to run: c1 for pre-create two-container semantics, c2 for post-create addContainer ordering, c4 for HotplugProvider boundary.")
+    @Option(help: "Probe to run: c1 for pre-create two-container semantics, c2 for post-create addContainer ordering, c4 for HotplugProvider boundary, r1 for guest-side hotplug device discovery.")
     var probe: String = "c1"
 
     @Flag(help: "Enable Rosetta for linux/amd64 images.")
@@ -94,8 +94,19 @@ struct LinuxPodSharedNamespacePoC: AsyncParsableCommand {
             )
             return
         }
+        if probe == "r1" {
+            try await runRuntimeDeviceDiscoveryProbe(
+                imageStore: imageStore,
+                vmm: vmm,
+                logger: logger,
+                startedAt: startedAt,
+                logsURL: logsURL,
+                rootfsURL: rootfsURL
+            )
+            return
+        }
         guard probe == "c1" else {
-            throw ValidationError("unsupported probe \(probe); expected c1, c2, or c4")
+            throw ValidationError("unsupported probe \(probe); expected c1, c2, c4, or r1")
         }
 
         let podID = "macvz-poc-\(Int(startedAt.timeIntervalSince1970))"
@@ -543,6 +554,444 @@ struct LinuxPodSharedNamespacePoC: AsyncParsableCommand {
         return "unknown"
     }
 
+    private func runRuntimeDeviceDiscoveryProbe(
+        imageStore: ImageStore,
+        vmm: VZVirtualMachineManager,
+        logger: Logger,
+        startedAt: Date,
+        logsURL: URL,
+        rootfsURL: URL
+    ) async throws {
+        let podID = "macvz-r1-\(Int(startedAt.timeIntervalSince1970))"
+        let probeState = DeviceDiscoveryProbeState()
+        let r1Extension = DeviceDiscoveryProbeExtension(state: probeState)
+        let pod = try LinuxPod(podID, vmm: vmm, logger: logger) { config in
+            config.cpus = 2
+            config.memoryInBytes = 1024 * 1024 * 1024
+            config.hostname = "macvz-runtime-r1"
+            config.bootLog = .file(path: logsURL.appendingPathComponent("boot.log"))
+            config.extensions.append(r1Extension)
+        }
+
+        let baseImage = try await imageStore.get(reference: image, pull: true)
+        let utilityRootfs = try await unpackRootfs(baseImage, at: rootfsURL.appendingPathComponent("utility.ext4"))
+        let targetRootfs = try await unpackRootfs(baseImage, at: rootfsURL.appendingPathComponent("target-rootfs.ext4"))
+        let targetRootfsSize = try fileSize(at: URL(fileURLWithPath: targetRootfs.source))
+        let expectedSectors = targetRootfsSize / 512
+
+        let utilityLog = try FileLogWriter(path: logsURL.appendingPathComponent("utility.log"), stream: "stdout")
+        let utilityErr = try FileLogWriter(path: logsURL.appendingPathComponent("utility.log"), stream: "stderr")
+        let execLog = try FileLogWriter(path: logsURL.appendingPathComponent("exec.log"), stream: "stdout")
+
+        var podCreated = false
+        var utilityStarted = false
+        var attachedDevice: VZUSBMassStorageDevice?
+        var usbAttachSucceeded = false
+        var usbDetachSucceeded = false
+        var guestBaseline: [GuestBlockDevice] = []
+        var discoveredDevice: String?
+        var guestObservedNewDevice = false
+        var guestCorrelatedDevice = false
+        var guestMountSucceeded = false
+        var markerVerified = false
+        var guestUnmountSucceeded = false
+        var guestDeviceGoneAfterDetach = false
+        var errors: [String: String] = [:]
+        var discoveryOutput = ""
+        var detachOutput = ""
+
+        do {
+            try await pod.addContainer("utility", rootfs: utilityRootfs) { config in
+                config.process.arguments = ["/bin/sh", "-c", "exec sleep 300"]
+                config.process.environmentVariables = ["PATH=\(LinuxProcessConfiguration.defaultPath)"]
+                config.process.workingDirectory = "/"
+                config.process.stdout = utilityLog
+                config.process.stderr = utilityErr
+                config.useInit = true
+            }
+
+            try await pod.create()
+            podCreated = true
+            try await pod.startContainer("utility")
+            utilityStarted = true
+
+            let baseline = try await execCapture(
+                pod,
+                containerID: "utility",
+                processID: "r1-baseline",
+                script: blockDeviceListScript(),
+                log: execLog
+            )
+            if baseline.exitCode == 0 {
+                guestBaseline = parseBlockDevices(from: baseline.output)
+            } else {
+                errors["guestBaseline"] = "exit \(baseline.exitCode): \(baseline.output)"
+            }
+
+            do {
+                probeState.mark("usbAttachAttempted")
+                attachedDevice = try await attachUSBMassStorage(
+                    instance: probeState.requireInstance(),
+                    path: targetRootfs.source,
+                    readOnly: true
+                )
+                usbAttachSucceeded = true
+                probeState.mark("usbAttachSucceeded")
+            } catch {
+                errors["usbAttach"] = describe(error)
+            }
+
+            if usbAttachSucceeded {
+                let discovery = try await execCapture(
+                    pod,
+                    containerID: "utility",
+                    processID: "r1-discovery",
+                    script: deviceDiscoveryScript(
+                        baselineDeviceNames: guestBaseline.map(\.name),
+                        expectedSectors: expectedSectors
+                    ),
+                    log: execLog
+                )
+                discoveryOutput = discovery.output
+                let discoveryState = parseDiscoveryOutput(discovery.output)
+                discoveredDevice = discoveryState.device
+                guestObservedNewDevice = discoveryState.observedNewDevice
+                guestCorrelatedDevice = discoveryState.correlatedDevice
+                guestMountSucceeded = discoveryState.mountSucceeded
+                markerVerified = discoveryState.markerVerified
+                guestUnmountSucceeded = discoveryState.unmountSucceeded
+                if discovery.exitCode != 0 {
+                    errors["guestDiscovery"] = "exit \(discovery.exitCode): \(discovery.output)"
+                }
+            }
+
+            if let attachedDevice {
+                do {
+                    try await detachUSBMassStorage(instance: probeState.requireInstance(), device: attachedDevice)
+                    usbDetachSucceeded = true
+                    probeState.mark("usbDetachSucceeded")
+                } catch {
+                    errors["usbDetach"] = describe(error)
+                }
+            }
+
+            if usbDetachSucceeded, let discoveredDevice {
+                let detachProbe = try await execCapture(
+                    pod,
+                    containerID: "utility",
+                    processID: "r1-detach-probe",
+                    script: deviceDetachScript(device: discoveredDevice),
+                    log: execLog
+                )
+                detachOutput = detachProbe.output
+                guestDeviceGoneAfterDetach = detachProbe.exitCode == 0
+                if detachProbe.exitCode != 0 {
+                    errors["guestDetachObserve"] = "exit \(detachProbe.exitCode): \(detachProbe.output)"
+                }
+            }
+
+            if utilityStarted {
+                try? await pod.stopContainer("utility")
+            }
+            try await pod.stop()
+            try close(utilityLog, utilityErr, execLog)
+
+            let snapshot = probeState.snapshot()
+            let result = RuntimeDeviceDiscoverySummary(
+                podID: podID,
+                image: image,
+                kernel: kernel,
+                workDir: workDir,
+                durationSeconds: Date().timeIntervalSince(startedAt),
+                targetRootfs: targetRootfs.source,
+                targetRootfsBytes: targetRootfsSize,
+                expectedSectors: expectedSectors,
+                usbControllerConfigured: snapshot.usbControllerConfigured,
+                instanceCaptured: snapshot.instanceCaptured,
+                usbAttachAttempted: snapshot.usbAttachAttempted,
+                usbAttachSucceeded: usbAttachSucceeded,
+                guestBaseline: guestBaseline,
+                guestObservedNewDevice: guestObservedNewDevice,
+                guestCorrelatedDevice: guestCorrelatedDevice,
+                discoveredDevice: discoveredDevice,
+                guestMountSucceeded: guestMountSucceeded,
+                markerVerified: markerVerified,
+                guestUnmountSucceeded: guestUnmountSucceeded,
+                usbDetachSucceeded: usbDetachSucceeded,
+                guestDeviceGoneAfterDetach: guestDeviceGoneAfterDetach,
+                outcome: runtimeDeviceDiscoveryOutcome(
+                    instanceCaptured: snapshot.instanceCaptured,
+                    usbAttachSucceeded: usbAttachSucceeded,
+                    guestObservedNewDevice: guestObservedNewDevice,
+                    guestCorrelatedDevice: guestCorrelatedDevice,
+                    guestMountSucceeded: guestMountSucceeded,
+                    markerVerified: markerVerified,
+                    guestUnmountSucceeded: guestUnmountSucceeded,
+                    usbDetachSucceeded: usbDetachSucceeded,
+                    guestDeviceGoneAfterDetach: guestDeviceGoneAfterDetach
+                ),
+                discoveryMethod: "baseline /sys/block snapshot, new /sys/block entry, exact sector count match, read-only ext4 mount, busybox rootfs marker",
+                discoveryOutput: discoveryOutput,
+                detachOutput: detachOutput,
+                events: snapshot.events,
+                errors: errors,
+                logs: [
+                    "utility": logsURL.appendingPathComponent("utility.log").path,
+                    "exec": logsURL.appendingPathComponent("exec.log").path,
+                    "boot": logsURL.appendingPathComponent("boot.log").path,
+                ]
+            )
+            print(try result.jsonString())
+        } catch {
+            if let attachedDevice {
+                try? await detachUSBMassStorage(instance: probeState.requireInstance(), device: attachedDevice)
+            }
+            if utilityStarted {
+                try? await pod.stopContainer("utility")
+            }
+            if podCreated {
+                try? await pod.stop()
+            }
+            try? close(utilityLog, utilityErr, execLog)
+            throw error
+        }
+    }
+
+    private func runtimeDeviceDiscoveryOutcome(
+        instanceCaptured: Bool,
+        usbAttachSucceeded: Bool,
+        guestObservedNewDevice: Bool,
+        guestCorrelatedDevice: Bool,
+        guestMountSucceeded: Bool,
+        markerVerified: Bool,
+        guestUnmountSucceeded: Bool,
+        usbDetachSucceeded: Bool,
+        guestDeviceGoneAfterDetach: Bool
+    ) -> String {
+        if !instanceCaptured {
+            return "instanceNotCaptured"
+        }
+        if !usbAttachSucceeded {
+            return "usbAttachFailed"
+        }
+        if !guestObservedNewDevice {
+            return "guestCouldNotObserveNewDevice"
+        }
+        if !guestCorrelatedDevice {
+            return "guestObservedButCouldNotCorrelate"
+        }
+        if !guestMountSucceeded {
+            return "deviceCorrelatedButMountFailed"
+        }
+        if !markerVerified {
+            return "mountSucceededMarkerVerificationFailed"
+        }
+        if !guestUnmountSucceeded {
+            return "markerVerifiedButUnmountFailed"
+        }
+        if !usbDetachSucceeded {
+            return "unmountSucceededButDetachFailed"
+        }
+        if !guestDeviceGoneAfterDetach {
+            return "detachSucceededButGuestStillObservedDevice"
+        }
+        return "discoveryMountVerifyUnmountDetachSucceeded"
+    }
+
+    private func fileSize(at url: URL) throws -> Int64 {
+        let values = try url.resourceValues(forKeys: [.fileSizeKey])
+        guard let size = values.fileSize else {
+            throw ValidationError("could not read file size for \(url.path)")
+        }
+        return Int64(size)
+    }
+
+    private func execCapture(
+        _ pod: LinuxPod,
+        containerID: String,
+        processID: String,
+        script: String,
+        log: FileLogWriter
+    ) async throws -> ExecCaptureResult {
+        let buffer = BufferLogWriter()
+        let exec = try await pod.execInContainer(containerID, processID: processID) { config in
+            config.arguments = ["/bin/sh", "-c", script]
+            config.stdout = TeeLogWriter(writers: [buffer, log])
+            config.stderr = log
+        }
+        try await exec.start()
+        let status = try await exec.wait()
+        try await exec.delete()
+        return ExecCaptureResult(exitCode: status.exitCode, output: buffer.string())
+    }
+
+    private func blockDeviceListScript() -> String {
+        """
+        for path in /sys/block/*; do
+          dev="${path##*/}"
+          case "${dev}" in loop*|ram*|zram*) continue;; esac
+          size="$(cat "${path}/size" 2>/dev/null || echo 0)"
+          echo "${dev} ${size}"
+        done
+        """
+    }
+
+    private func deviceDiscoveryScript(baselineDeviceNames: [String], expectedSectors: Int64) -> String {
+        let baseline = baselineDeviceNames.joined(separator: " ")
+        return """
+        baseline=\(shellSingleQuoted(baseline))
+        expected=\(expectedSectors)
+        mountpoint=/tmp/macvz-r1-rootfs
+        errfile=/tmp/macvz-r1-mount.err
+        rm -f "${errfile}"
+        for i in $(seq 1 30); do
+          for path in /sys/block/*; do
+            dev="${path##*/}"
+            case "${dev}" in loop*|ram*|zram*) continue;; esac
+            case " ${baseline} " in *" ${dev} "*) continue;; esac
+            size="$(cat "${path}/size" 2>/dev/null || echo 0)"
+            echo "observed=${dev} size=${size}"
+            if [ "${size}" = "${expected}" ]; then
+              echo "correlated=${dev} method=sysfs-new-device-and-size size=${size}"
+              mkdir -p "${mountpoint}"
+              if mount -o ro -t ext4 "/dev/${dev}" "${mountpoint}" 2>"${errfile}"; then
+                echo "mounted=${dev}"
+                if [ -x "${mountpoint}/bin/busybox" ] || [ -e "${mountpoint}/bin/sh" ]; then
+                  echo "marker=busybox-rootfs"
+                  marker_ok=1
+                else
+                  echo "marker_missing=${dev}"
+                  marker_ok=0
+                fi
+                if umount "${mountpoint}"; then
+                  echo "unmounted=${dev}"
+                else
+                  echo "unmount_failed=${dev}"
+                  exit 15
+                fi
+                if [ "${marker_ok}" = "1" ]; then
+                  exit 0
+                fi
+                exit 14
+              fi
+              echo "mount_failed=${dev} error=$(cat "${errfile}" 2>/dev/null)"
+              exit 13
+            fi
+            echo "uncorrelated=${dev} expected=${expected} actual=${size}"
+          done
+          sleep 1
+        done
+        echo "diagnostic_usb_devices=$(ls /sys/bus/usb/devices 2>/dev/null | tr '\\n' ' ' || true)"
+        echo "diagnostic_scsi_disks=$(ls /sys/class/scsi_disk 2>/dev/null | tr '\\n' ' ' || true)"
+        echo "diagnostic_block_devices=$(ls /sys/block 2>/dev/null | tr '\\n' ' ' || true)"
+        echo "no_new_device"
+        exit 11
+        """
+    }
+
+    private func deviceDetachScript(device: String) -> String {
+        """
+        dev=\(shellSingleQuoted(device))
+        for i in $(seq 1 15); do
+          if [ ! -e "/sys/block/${dev}" ]; then
+            echo "detached=${dev}"
+            exit 0
+          fi
+          sleep 1
+        done
+        echo "still_present=${dev}"
+        exit 21
+        """
+    }
+
+    private func shellSingleQuoted(_ value: String) -> String {
+        "'\(value.replacingOccurrences(of: "'", with: "'\"'\"'"))'"
+    }
+
+    private func parseBlockDevices(from output: String) -> [GuestBlockDevice] {
+        output.split(whereSeparator: \.isNewline).compactMap { line in
+            let parts = line.split(separator: " ", maxSplits: 1).map(String.init)
+            guard parts.count == 2, let sectors = Int64(parts[1]) else {
+                return nil
+            }
+            return GuestBlockDevice(name: parts[0], sectors: sectors)
+        }
+    }
+
+    private func parseDiscoveryOutput(_ output: String) -> DiscoveryOutputState {
+        var state = DiscoveryOutputState()
+        for line in output.split(whereSeparator: \.isNewline).map(String.init) {
+            if line.hasPrefix("observed=") {
+                state.observedNewDevice = true
+            }
+            if line.hasPrefix("correlated=") {
+                state.correlatedDevice = true
+                state.device = line
+                    .dropFirst("correlated=".count)
+                    .split(separator: " ", maxSplits: 1)
+                    .first
+                    .map(String.init)
+            }
+            if line.hasPrefix("mounted=") {
+                state.mountSucceeded = true
+            }
+            if line.hasPrefix("marker=busybox-rootfs") {
+                state.markerVerified = true
+            }
+            if line.hasPrefix("unmounted=") {
+                state.unmountSucceeded = true
+            }
+        }
+        return state
+    }
+
+    private func attachUSBMassStorage(
+        instance: VZVirtualMachineInstance,
+        path: String,
+        readOnly: Bool
+    ) async throws -> VZUSBMassStorageDevice {
+        guard let controller = instance.vzVirtualMachine.usbControllers.first else {
+            throw HotplugProbeFailure(description: "no VZ USB controller is available on the running VM")
+        }
+        let attachment = try VZDiskImageStorageDeviceAttachment(
+            url: URL(fileURLWithPath: path),
+            readOnly: readOnly,
+            cachingMode: .cached,
+            synchronizationMode: .fsync
+        )
+        let configuration = VZUSBMassStorageDeviceConfiguration(attachment: attachment)
+        let device = VZUSBMassStorageDevice(configuration: configuration)
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            instance.vmQueue.async {
+                controller.attach(device: device) { error in
+                    if let error {
+                        continuation.resume(throwing: error)
+                    } else {
+                        continuation.resume(returning: ())
+                    }
+                }
+            }
+        }
+        return device
+    }
+
+    private func detachUSBMassStorage(instance: VZVirtualMachineInstance, device: VZUSBMassStorageDevice) async throws {
+        guard let controller = instance.vzVirtualMachine.usbControllers.first else {
+            return
+        }
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            instance.vmQueue.async {
+                controller.detach(device: device) { error in
+                    if let error {
+                        continuation.resume(throwing: error)
+                    } else {
+                        continuation.resume(returning: ())
+                    }
+                }
+            }
+        }
+    }
+
     private func waitForClientProbe(_ pod: LinuxPod, stdout: FileLogWriter) async throws {
         try await waitForClientProbe(pod, containerID: "client", stdout: stdout, timeoutSeconds: 90)
     }
@@ -645,6 +1094,62 @@ private struct HotplugProbeSummary: Encodable {
     }
 }
 
+private struct RuntimeDeviceDiscoverySummary: Encodable {
+    let podID: String
+    let image: String
+    let kernel: String
+    let workDir: String
+    let durationSeconds: TimeInterval
+    let targetRootfs: String
+    let targetRootfsBytes: Int64
+    let expectedSectors: Int64
+    let usbControllerConfigured: Bool
+    let instanceCaptured: Bool
+    let usbAttachAttempted: Bool
+    let usbAttachSucceeded: Bool
+    let guestBaseline: [GuestBlockDevice]
+    let guestObservedNewDevice: Bool
+    let guestCorrelatedDevice: Bool
+    let discoveredDevice: String?
+    let guestMountSucceeded: Bool
+    let markerVerified: Bool
+    let guestUnmountSucceeded: Bool
+    let usbDetachSucceeded: Bool
+    let guestDeviceGoneAfterDetach: Bool
+    let outcome: String
+    let discoveryMethod: String
+    let discoveryOutput: String
+    let detachOutput: String
+    let events: [String]
+    let errors: [String: String]
+    let logs: [String: String]
+
+    func jsonString() throws -> String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        return String(decoding: try encoder.encode(self), as: UTF8.self)
+    }
+}
+
+private struct GuestBlockDevice: Encodable {
+    let name: String
+    let sectors: Int64
+}
+
+private struct ExecCaptureResult {
+    let exitCode: Int32
+    let output: String
+}
+
+private struct DiscoveryOutputState {
+    var observedNewDevice = false
+    var correlatedDevice = false
+    var device: String?
+    var mountSucceeded = false
+    var markerVerified = false
+    var unmountSucceeded = false
+}
+
 private struct HotplugProbeSnapshot {
     let providerInstalled: Bool
     let providerCalled: Bool
@@ -702,6 +1207,73 @@ private final class HotplugProbeState: @unchecked Sendable {
     }
 }
 
+private struct DeviceDiscoveryProbeSnapshot {
+    let usbControllerConfigured: Bool
+    let instanceCaptured: Bool
+    let usbAttachAttempted: Bool
+    let usbAttachSucceeded: Bool
+    let usbDetachSucceeded: Bool
+    let events: [String]
+}
+
+private final class DeviceDiscoveryProbeState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var instanceValue: VZVirtualMachineInstance?
+    private var usbControllerConfiguredValue = false
+    private var usbAttachAttemptedValue = false
+    private var usbAttachSucceededValue = false
+    private var usbDetachSucceededValue = false
+    private var eventsValue: [String] = []
+
+    func setInstance(_ instance: VZVirtualMachineInstance) {
+        lock.lock()
+        instanceValue = instance
+        eventsValue.append("instanceCaptured")
+        lock.unlock()
+    }
+
+    func mark(_ event: String) {
+        lock.lock()
+        eventsValue.append(event)
+        switch event {
+        case "usbControllerConfigured":
+            usbControllerConfiguredValue = true
+        case "usbAttachAttempted":
+            usbAttachAttemptedValue = true
+        case "usbAttachSucceeded":
+            usbAttachSucceededValue = true
+        case "usbDetachSucceeded":
+            usbDetachSucceededValue = true
+        default:
+            break
+        }
+        lock.unlock()
+    }
+
+    func requireInstance() throws -> VZVirtualMachineInstance {
+        lock.lock()
+        let instance = instanceValue
+        lock.unlock()
+        guard let instance else {
+            throw HotplugProbeFailure(description: "VZVirtualMachineInstance was not captured by the R1 extension")
+        }
+        return instance
+    }
+
+    func snapshot() -> DeviceDiscoveryProbeSnapshot {
+        lock.lock()
+        defer { lock.unlock() }
+        return DeviceDiscoveryProbeSnapshot(
+            usbControllerConfigured: usbControllerConfiguredValue,
+            instanceCaptured: instanceValue != nil,
+            usbAttachAttempted: usbAttachAttemptedValue,
+            usbAttachSucceeded: usbAttachSucceededValue,
+            usbDetachSucceeded: usbDetachSucceededValue,
+            events: eventsValue
+        )
+    }
+}
+
 private struct HotplugProbeFailure: Error, CustomStringConvertible {
     let description: String
 }
@@ -726,6 +1298,28 @@ private final class ProbeHotplugExtension: VZInstanceExtension, @unchecked Senda
     func didCreate(_ instance: VZVirtualMachineInstance) throws {
         instance.hotplugProvider = ProbeHotplugProvider(instance: instance, state: state)
         state.mark("providerInstalled")
+    }
+}
+
+private final class DeviceDiscoveryProbeExtension: VZInstanceExtension, @unchecked Sendable {
+    private let state: DeviceDiscoveryProbeState
+
+    init(state: DeviceDiscoveryProbeState) {
+        self.state = state
+    }
+
+    func configureVZ(
+        _ config: inout VZVirtualMachineConfiguration,
+        allocator: any AddressAllocator<Character>,
+        storageDeviceCount: Int,
+        mountsByID: [String: [Containerization.Mount]]
+    ) throws {
+        config.usbControllers.append(VZXHCIControllerConfiguration())
+        state.mark("usbControllerConfigured")
+    }
+
+    func didCreate(_ instance: VZVirtualMachineInstance) throws {
+        state.setInstance(instance)
     }
 }
 
@@ -834,6 +1428,42 @@ private final class ProbeHotplugProvider: HotplugProvider, @unchecked Sendable {
             }
         }
     }
+}
+
+private final class BufferLogWriter: Writer, @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = ""
+
+    func write(_ data: Data) throws {
+        guard !data.isEmpty else { return }
+        lock.lock()
+        value += String(decoding: data, as: UTF8.self)
+        lock.unlock()
+    }
+
+    func string() -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+
+    func close() throws {}
+}
+
+private final class TeeLogWriter: Writer, @unchecked Sendable {
+    private let writers: [any Writer]
+
+    init(writers: [any Writer]) {
+        self.writers = writers
+    }
+
+    func write(_ data: Data) throws {
+        for writer in writers {
+            try writer.write(data)
+        }
+    }
+
+    func close() throws {}
 }
 
 private final class FileLogWriter: Writer, @unchecked Sendable {

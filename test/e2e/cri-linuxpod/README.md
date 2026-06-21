@@ -24,6 +24,7 @@ MACVZ_LINUXPOD_POC=1 make cri-linuxpod-poc
 MACVZ_LINUXPOD_POC=1 make cri-linuxpod-c2
 MACVZ_LINUXPOD_POC=1 make cri-linuxpod-c4
 MACVZ_LINUXPOD_POC=1 make cri-linuxpod-r1
+MACVZ_LINUXPOD_POC=1 make cri-linuxpod-r3
 ```
 
 Set `MACVZ_CONTAINERIZATION_DIR` if the checkout lives elsewhere. The default
@@ -37,7 +38,10 @@ without guessing the guest block path. R1 boots a utility container, records the
 guest `/sys/block` baseline, attaches a second ext4 rootfs image through public
 VZ USB mass storage, and verifies whether the guest can discover, correlate,
 mount, validate, unmount, detach, and observe cleanup without treating a guessed
-`/dev/sdX` or `/dev/vdX` path as success. Set
+`/dev/sdX` or `/dev/vdX` path as success. R3 serves two rootfs ext4 images over
+local NBD Unix sockets, uses those NBD URLs as pre-create LinuxPod rootfs
+sources, and verifies identity by reading each backing ext4 image after the
+containers write distinct markers. Set
 `MACVZ_LINUXPOD_VMNET=1` to include vmnet attachment as an additional host
 network probe.
 
@@ -46,6 +50,7 @@ The C1 live run writes `docs/CRI_LINUXPOD_POC_REPORT.md`; C2 writes
 `docs/CRI_LINUXPOD_C4_REPORT.md`; R1 writes
 `docs/CRI_RUNTIME_R1_DEVICE_DISCOVERY_REPORT.md` unless
 `MACVZ_LINUXPOD_REPORT` points to another path.
+R3 writes `docs/CRI_RUNTIME_R3_NBD_ROOTFS_REPORT.md`.
 
 ## What It Proves
 

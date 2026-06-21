@@ -322,6 +322,22 @@ the limited/predeclared LinuxPod research path, but it does not solve kubelet's
 normal `RunPodSandbox` before later `CreateContainer` ordering. Guest-side
 rootfs staging remains the longer-term design needed for a full Pod VM runtime.
 
+### R3: NBD Pre-Create Rootfs Identity (#95)
+
+R3 completed on 2026-06-21 UTC. The report is
+[CRI_RUNTIME_R3_NBD_ROOTFS_REPORT.md](CRI_RUNTIME_R3_NBD_ROOTFS_REPORT.md).
+
+Result: **pre-create NBD rootfs works**. The probe served two busybox rootfs
+ext4 images through NBD Unix sockets, registered both containers before
+`pod.create()`, and started both containers. Guest output showed the rootfs
+mounts came from virtio block devices (`/dev/vdb` and `/dev/vdc`), and host-side
+EXT4 reads confirmed each container wrote to its own backing image.
+
+Decision: keep NBD as a valid rootfs exposure building block for predeclared
+LinuxPod containers and for future Pod volume work. Do not treat it as the full
+CRI answer. The next phase should test guest-side rootfs staging inside an
+already-running Pod VM.
+
 ### C5: Swift Helper Daemon Prototype
 
 Only if R0 later selects a LinuxPod-based bridge as a valid runtime building

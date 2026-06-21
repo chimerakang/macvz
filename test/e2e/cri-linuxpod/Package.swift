@@ -11,6 +11,8 @@ let package = Package(
     dependencies: [
         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.7.0"),
         .package(url: "https://github.com/apple/swift-log.git", from: "1.10.1"),
+        .package(url: "https://github.com/apple/swift-nio.git", from: "2.80.0"),
+        .package(url: "https://github.com/apple/swift-system.git", from: "1.6.4"),
         .package(path: "containerization"),
     ],
     targets: [
@@ -23,6 +25,9 @@ let package = Package(
                 .product(name: "ContainerizationEXT4", package: "containerization"),
                 .product(name: "ContainerizationExtras", package: "containerization"),
                 .product(name: "ContainerizationOCI", package: "containerization"),
+                .product(name: "NIOCore", package: "swift-nio"),
+                .product(name: "NIOPosix", package: "swift-nio"),
+                .product(name: "SystemPackage", package: "swift-system"),
             ]
         )
     ]

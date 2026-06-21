@@ -60,6 +60,10 @@ cri-linuxpod-c4: ## Run the #91 LinuxPod HotplugProvider boundary probe (set MAC
 cri-linuxpod-r1: ## Run the #93 guest-side hotplug device discovery probe (set MACVZ_LINUXPOD_POC=1 to run live)
 	MACVZ_LINUXPOD_PROBE=r1 ./test/e2e/cri-linuxpod/run.sh
 
+.PHONY: cri-linuxpod-r3
+cri-linuxpod-r3: ## Run the #95 NBD-backed pre-create rootfs identity probe (set MACVZ_LINUXPOD_POC=1 to run live)
+	MACVZ_LINUXPOD_PROBE=r3 ./test/e2e/cri-linuxpod/run.sh
+
 .PHONY: bench
 bench: ## Build the density/RAM benchmark harness into bin/mvz-bench
 	@mkdir -p $(BIN_DIR)

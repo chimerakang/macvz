@@ -67,7 +67,8 @@ architecture from Virtual Kubelet provider to kubelet CRI runtime integration.
 | CRI-R0 (#92) | Research Pod VM runtime architecture for full kubelet semantics | ✅ Complete (thin LinuxPod wrapper rejected as main path; target Pod VM runtime architecture and R1 device-discovery PoC defined) |
 | CRI-R1 (#93) | Guest-side hotplug device discovery PoC for Pod VM rootfs attachments | ✅ Complete (host VZ USB attach succeeds, but guest observes no new USB/SCSI/block device; pivot to NBD or guest-side rootfs exposure) |
 | CRI-R2 (#94) | Evaluate NBD and guest-side rootfs exposure fallback for Pod VM runtime | ✅ Complete (NBD pre-create rootfs identity selected for the next tiny PoC; guest-side rootfs staging remains the long-term kubelet-ordering answer) |
-| CRI-R3 (#95) | NBD-backed pre-create rootfs identity PoC for LinuxPod containers | ⬜ Planned |
+| CRI-R3 (#95) | NBD-backed pre-create rootfs identity PoC for LinuxPod containers | ✅ Complete (two NBD-served rootfs images boot as predeclared LinuxPod containers; guest virtio-block mount evidence and host-side EXT4 marker reads confirm identity) |
+| CRI-R4 (#96) | Guest-side rootfs staging PoC for already-running Pod VM | ⬜ Planned |
 
 **CRI-P5 evidence (#77):** Pod networking is wired through the same primitives as
 the shipped provider — `network.PodIPAM` for Pod IPs and `podnet.Router` for the

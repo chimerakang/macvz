@@ -37,8 +37,13 @@ case "${PROBE}" in
     REPORT_TITLE="CRI-R1 Guest-Side Hotplug Device Discovery Report (#93)"
     WORK_DIR="${MACVZ_LINUXPOD_WORK_DIR:-/tmp/macvz-runtime-r1}"
     ;;
+  r3)
+    DEFAULT_REPORT_PATH="${ROOT_DIR}/docs/CRI_RUNTIME_R3_NBD_ROOTFS_REPORT.md"
+    REPORT_TITLE="CRI-R3 NBD-Backed Pre-Create Rootfs Identity Report (#95)"
+    WORK_DIR="${MACVZ_LINUXPOD_WORK_DIR:-/tmp/macvz-runtime-r3}"
+    ;;
   *)
-    echo "unsupported MACVZ_LINUXPOD_PROBE=${PROBE}; expected c1, c2, c4, or r1" >&2
+    echo "unsupported MACVZ_LINUXPOD_PROBE=${PROBE}; expected c1, c2, c4, r1, or r3" >&2
     exit 1
     ;;
 esac
@@ -57,6 +62,7 @@ This gated Swift harness can run:
   - c2 (#89): post-create addContainer kubelet-ordering probe
   - c4 (#91): consumer HotplugProvider boundary probe
   - r1 (#93): guest-side hotplug block-device discovery probe
+  - r3 (#95): NBD-backed pre-create rootfs identity probe
 
 Selected probe: ${PROBE}
 
@@ -89,6 +95,14 @@ R1 flow:
      verify the block device disappears without treating guessed /dev names as
      success
 
+R3 flow:
+  1. unpack two busybox rootfs ext4 images
+  2. serve each rootfs through a local NBD Unix socket
+  3. pre-register two LinuxPod containers using the NBD URLs as rootfs sources
+  4. start both containers, write distinct identity markers, verify virtio-block
+     rootfs mount evidence, and read the markers back from the host-side ext4
+     backing files
+
 Set MACVZ_LINUXPOD_VMNET=1 to also attach a vmnet interface. The default
 keeps this C1 probe focused on LinuxPod shared-namespace behavior.
 
@@ -113,6 +127,7 @@ Run live:
   MACVZ_LINUXPOD_POC=1 make cri-linuxpod-c2
   MACVZ_LINUXPOD_POC=1 make cri-linuxpod-c4
   MACVZ_LINUXPOD_POC=1 make cri-linuxpod-r1
+  MACVZ_LINUXPOD_POC=1 make cri-linuxpod-r3
 EOF
   exit 0
 fi
@@ -221,13 +236,24 @@ EOF
 - [x] No guessed guest block path is counted as success.
 
 EOF
-  else
+  elif [[ "${PROBE}" == "r1" ]]; then
     cat >>"${REPORT_PATH}" <<EOF
 - [x] One LinuxPod was created.
 - [x] A custom VZInstanceExtension configured an XHCI controller and captured the running VM instance.
 - [x] Guest /sys/block baseline was recorded before host attach.
 - [x] A second ext4 rootfs image was attached through public VZ USB mass storage or the attach failure was recorded.
 - [x] Guest-side discovery distinguishes observation, correlation by exact sector count, mount, marker verification, unmount, detach, and post-detach cleanup.
+- [x] No guessed /dev/sdX or /dev/vdX path is counted as success.
+
+EOF
+  else
+    cat >>"${REPORT_PATH}" <<EOF
+- [x] Two rootfs ext4 images were served through local NBD Unix sockets, or the setup failure was recorded.
+- [x] Two LinuxPod containers were pre-registered before pod.create() with NBD-backed rootfs mounts.
+- [x] The containers started or the failure boundary was recorded.
+- [x] Guest output records rootfs mount evidence from /proc/mounts.
+- [x] Host-side ext4 reads verify each container wrote to its own backing rootfs image.
+- [x] The report states that pre-create NBD rootfs does not solve post-create CreateContainer ordering.
 - [x] No guessed /dev/sdX or /dev/vdX path is counted as success.
 
 EOF

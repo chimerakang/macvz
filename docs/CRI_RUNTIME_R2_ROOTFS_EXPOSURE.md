@@ -111,3 +111,30 @@ Expected outcome: either `nbdRootfsPrecreateSucceeded` or a precise failure
 boundary such as `nbdServerFailed`, `vzNbdAttachmentFailed`,
 `guestRootfsMountFailed`, `containerStartFailed`, or
 `rootfsIdentityMismatch`.
+
+## R3 Result
+
+R3 completed on 2026-06-21 UTC. The live probe is published at
+[CRI_RUNTIME_R3_NBD_ROOTFS_REPORT.md](CRI_RUNTIME_R3_NBD_ROOTFS_REPORT.md).
+
+Outcome: `nbdRootfsPrecreateSucceeded`.
+
+The probe served two busybox rootfs ext4 images through local NBD Unix sockets,
+pre-registered two LinuxPod containers before `pod.create()`, and started both
+containers successfully. Guest evidence showed rootfs mounts through virtio
+block devices:
+
+- alpha: `/dev/vdb / ext4 ...`
+- beta: `/dev/vdc / ext4 ...`
+
+Each container wrote a distinct marker to its rootfs, and the host read those
+markers back from the corresponding ext4 backing images:
+
+- alpha backing image: `alpha-rootfs`
+- beta backing image: `beta-rootfs`
+
+This proves NBD can serve as a deterministic pre-create rootfs exposure building
+block for the LinuxPod research path. It still does not solve normal kubelet
+ordering, because the containers and rootfs attachments must be known before
+`pod.create()`. The next useful primitive is therefore guest-side rootfs staging
+inside an already-running Pod VM.

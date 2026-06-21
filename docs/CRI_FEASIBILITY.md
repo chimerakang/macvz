@@ -54,6 +54,14 @@ guest paths. It remains a partial answer only: it is pre-create configuration,
 so a full kubelet-compatible Pod VM runtime still needs guest-side rootfs
 staging or another explicit post-create mechanism.
 
+R3 (#95) proved that NBD-backed pre-create rootfs exposure works for LinuxPod:
+two NBD-served busybox rootfs images booted as two predeclared containers, guest
+mount evidence showed virtio block rootfs devices, and host-side EXT4 reads
+confirmed each container wrote to its own backing image. This strengthens NBD as
+a building block but keeps the main CRI gap unchanged: `CreateContainer` after
+`RunPodSandbox` still needs guest-side rootfs staging or another real
+post-create mechanism.
+
 ## Phase Plan
 
 | Phase | Goal | Exit Criteria |

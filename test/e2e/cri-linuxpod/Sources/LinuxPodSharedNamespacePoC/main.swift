@@ -3,8 +3,12 @@ import Containerization
 import ContainerizationEXT4
 import ContainerizationExtras
 import ContainerizationOCI
+import Darwin
 import Foundation
 import Logging
+import NIOCore
+import NIOPosix
+import SystemPackage
 @preconcurrency import Virtualization
 
 @main
@@ -32,7 +36,7 @@ struct LinuxPodSharedNamespacePoC: AsyncParsableCommand {
     @Option(help: "TCP port inside the shared Pod namespace.")
     var port: Int = 18080
 
-    @Option(help: "Probe to run: c1 for pre-create two-container semantics, c2 for post-create addContainer ordering, c4 for HotplugProvider boundary, r1 for guest-side hotplug device discovery.")
+    @Option(help: "Probe to run: c1 for pre-create two-container semantics, c2 for post-create addContainer ordering, c4 for HotplugProvider boundary, r1 for guest-side hotplug device discovery, r3 for NBD pre-create rootfs identity.")
     var probe: String = "c1"
 
     @Flag(help: "Enable Rosetta for linux/amd64 images.")
@@ -105,8 +109,19 @@ struct LinuxPodSharedNamespacePoC: AsyncParsableCommand {
             )
             return
         }
+        if probe == "r3" {
+            try await runNBDRootfsIdentityProbe(
+                imageStore: imageStore,
+                vmm: vmm,
+                logger: logger,
+                startedAt: startedAt,
+                logsURL: logsURL,
+                rootfsURL: rootfsURL
+            )
+            return
+        }
         guard probe == "c1" else {
-            throw ValidationError("unsupported probe \(probe); expected c1, c2, c4, or r1")
+            throw ValidationError("unsupported probe \(probe); expected c1, c2, c4, r1, or r3")
         }
 
         let podID = "macvz-poc-\(Int(startedAt.timeIntervalSince1970))"
@@ -992,6 +1007,312 @@ struct LinuxPodSharedNamespacePoC: AsyncParsableCommand {
         }
     }
 
+    private func runNBDRootfsIdentityProbe(
+        imageStore: ImageStore,
+        vmm: VZVirtualMachineManager,
+        logger: Logger,
+        startedAt: Date,
+        logsURL: URL,
+        rootfsURL: URL
+    ) async throws {
+        let podID = "macvz-r3-\(Int(startedAt.timeIntervalSince1970))"
+        let pod = try LinuxPod(podID, vmm: vmm, logger: logger) { config in
+            config.cpus = 2
+            config.memoryInBytes = 1024 * 1024 * 1024
+            config.hostname = "macvz-runtime-r3"
+            config.bootLog = .file(path: logsURL.appendingPathComponent("boot.log"))
+        }
+
+        let baseImage = try await imageStore.get(reference: image, pull: true)
+        let alphaDisk = rootfsURL.appendingPathComponent("alpha.ext4")
+        let betaDisk = rootfsURL.appendingPathComponent("beta.ext4")
+        let alphaRootfs = try await unpackRootfs(baseImage, at: alphaDisk)
+        let betaRootfs = try await unpackRootfs(baseImage, at: betaDisk)
+
+        let alphaLog = try FileLogWriter(path: logsURL.appendingPathComponent("alpha.log"), stream: "stdout")
+        let alphaErr = try FileLogWriter(path: logsURL.appendingPathComponent("alpha.log"), stream: "stderr")
+        let betaLog = try FileLogWriter(path: logsURL.appendingPathComponent("beta.log"), stream: "stdout")
+        let betaErr = try FileLogWriter(path: logsURL.appendingPathComponent("beta.log"), stream: "stderr")
+        let execLog = try FileLogWriter(path: logsURL.appendingPathComponent("exec.log"), stream: "stdout")
+
+        var podCreated = false
+        var alphaStarted = false
+        var betaStarted = false
+        var nbdServersStarted = false
+        var containerStartSucceeded = false
+        var rootfsMarkersVerified = false
+        var mountEvidenceVerified = false
+        var errors: [String: String] = [:]
+        var alphaOutput = ""
+        var betaOutput = ""
+        var alphaMarkerHost: String?
+        var betaMarkerHost: String?
+
+        let alphaServer: MiniNBDServer
+        let betaServer: MiniNBDServer
+        do {
+            alphaServer = try MiniNBDServer(
+                filePath: alphaRootfs.source,
+                socketPath: rootfsURL.appendingPathComponent("alpha.sock").path,
+                logger: logger
+            )
+            betaServer = try MiniNBDServer(
+                filePath: betaRootfs.source,
+                socketPath: rootfsURL.appendingPathComponent("beta.sock").path,
+                logger: logger
+            )
+            nbdServersStarted = true
+        } catch {
+            try? close(alphaLog, alphaErr, betaLog, betaErr, execLog)
+            let result = NBDRootfsIdentitySummary(
+                podID: podID,
+                image: image,
+                kernel: kernel,
+                workDir: workDir,
+                durationSeconds: Date().timeIntervalSince(startedAt),
+                nbdServersStarted: false,
+                podCreated: false,
+                containerStartSucceeded: false,
+                rootfsMarkersVerified: false,
+                mountEvidenceVerified: false,
+                alphaNBDURL: nil,
+                betaNBDURL: nil,
+                alphaOutput: "",
+                betaOutput: "",
+                alphaMarkerHost: nil,
+                betaMarkerHost: nil,
+                outcome: "nbdServerFailed",
+                note: "pre-create NBD rootfs identity does not solve post-create CreateContainer ordering",
+                errors: ["nbdServer": describe(error)],
+                logs: [
+                    "alpha": logsURL.appendingPathComponent("alpha.log").path,
+                    "beta": logsURL.appendingPathComponent("beta.log").path,
+                    "exec": logsURL.appendingPathComponent("exec.log").path,
+                    "boot": logsURL.appendingPathComponent("boot.log").path,
+                ]
+            )
+            print(try result.jsonString())
+            return
+        }
+        defer {
+            alphaServer.stop()
+            betaServer.stop()
+        }
+
+        do {
+            try await pod.addContainer("alpha", rootfs: nbdRootfs(from: alphaRootfs, nbdURL: alphaServer.url)) { config in
+                config.process.arguments = [
+                    "/bin/sh",
+                    "-c",
+                    """
+                    set -eu
+                    printf 'alpha-rootfs\\n' > /macvz-r3-identity
+                    sync
+                    grep ' / ' /proc/mounts
+                    cat /macvz-r3-identity
+                    """,
+                ]
+                config.process.environmentVariables = ["PATH=\(LinuxProcessConfiguration.defaultPath)"]
+                config.process.workingDirectory = "/"
+                config.process.stdout = alphaLog
+                config.process.stderr = alphaErr
+                config.useInit = true
+            }
+
+            try await pod.addContainer("beta", rootfs: nbdRootfs(from: betaRootfs, nbdURL: betaServer.url)) { config in
+                config.process.arguments = [
+                    "/bin/sh",
+                    "-c",
+                    """
+                    set -eu
+                    printf 'beta-rootfs\\n' > /macvz-r3-identity
+                    sync
+                    grep ' / ' /proc/mounts
+                    cat /macvz-r3-identity
+                    """,
+                ]
+                config.process.environmentVariables = ["PATH=\(LinuxProcessConfiguration.defaultPath)"]
+                config.process.workingDirectory = "/"
+                config.process.stdout = betaLog
+                config.process.stderr = betaErr
+                config.useInit = true
+            }
+
+            do {
+                try await pod.create()
+                podCreated = true
+            } catch {
+                errors["podCreate"] = describe(error)
+                throw error
+            }
+
+            do {
+                try await pod.startContainer("alpha")
+                alphaStarted = true
+                try await pod.startContainer("beta")
+                betaStarted = true
+
+                let alphaStatus = try await pod.waitContainer("alpha")
+                let betaStatus = try await pod.waitContainer("beta")
+                guard alphaStatus.exitCode == 0 else {
+                    errors["alphaStart"] = "exit \(alphaStatus.exitCode)"
+                    throw ValidationError("alpha exited with \(alphaStatus.exitCode)")
+                }
+                guard betaStatus.exitCode == 0 else {
+                    errors["betaStart"] = "exit \(betaStatus.exitCode)"
+                    throw ValidationError("beta exited with \(betaStatus.exitCode)")
+                }
+                containerStartSucceeded = true
+            } catch {
+                if errors["alphaStart"] == nil && errors["betaStart"] == nil {
+                    errors["containerStart"] = describe(error)
+                }
+                throw error
+            }
+
+            alphaOutput = try readTextFile(logsURL.appendingPathComponent("alpha.log"))
+            betaOutput = try readTextFile(logsURL.appendingPathComponent("beta.log"))
+            mountEvidenceVerified = alphaOutput.contains("/dev/vd")
+                && betaOutput.contains("/dev/vd")
+                && alphaOutput.contains("alpha-rootfs")
+                && betaOutput.contains("beta-rootfs")
+
+            alphaMarkerHost = try readExt4File(alphaDisk, path: "/macvz-r3-identity")
+            betaMarkerHost = try readExt4File(betaDisk, path: "/macvz-r3-identity")
+            rootfsMarkersVerified = alphaMarkerHost == "alpha-rootfs" && betaMarkerHost == "beta-rootfs"
+
+            try? await pod.stopContainer("alpha")
+            try? await pod.stopContainer("beta")
+            try await pod.stop()
+            try close(alphaLog, alphaErr, betaLog, betaErr, execLog)
+
+            let result = NBDRootfsIdentitySummary(
+                podID: podID,
+                image: image,
+                kernel: kernel,
+                workDir: workDir,
+                durationSeconds: Date().timeIntervalSince(startedAt),
+                nbdServersStarted: nbdServersStarted,
+                podCreated: podCreated,
+                containerStartSucceeded: containerStartSucceeded,
+                rootfsMarkersVerified: rootfsMarkersVerified,
+                mountEvidenceVerified: mountEvidenceVerified,
+                alphaNBDURL: alphaServer.url,
+                betaNBDURL: betaServer.url,
+                alphaOutput: alphaOutput,
+                betaOutput: betaOutput,
+                alphaMarkerHost: alphaMarkerHost,
+                betaMarkerHost: betaMarkerHost,
+                outcome: nbdRootfsOutcome(
+                    nbdServersStarted: nbdServersStarted,
+                    podCreated: podCreated,
+                    containerStartSucceeded: containerStartSucceeded,
+                    mountEvidenceVerified: mountEvidenceVerified,
+                    rootfsMarkersVerified: rootfsMarkersVerified
+                ),
+                note: "pre-create NBD rootfs identity does not solve post-create CreateContainer ordering",
+                errors: errors,
+                logs: [
+                    "alpha": logsURL.appendingPathComponent("alpha.log").path,
+                    "beta": logsURL.appendingPathComponent("beta.log").path,
+                    "exec": logsURL.appendingPathComponent("exec.log").path,
+                    "boot": logsURL.appendingPathComponent("boot.log").path,
+                ]
+            )
+            print(try result.jsonString())
+        } catch {
+            if alphaStarted {
+                try? await pod.stopContainer("alpha")
+            }
+            if betaStarted {
+                try? await pod.stopContainer("beta")
+            }
+            if podCreated {
+                try? await pod.stop()
+            }
+            try? close(alphaLog, alphaErr, betaLog, betaErr, execLog)
+
+            let result = NBDRootfsIdentitySummary(
+                podID: podID,
+                image: image,
+                kernel: kernel,
+                workDir: workDir,
+                durationSeconds: Date().timeIntervalSince(startedAt),
+                nbdServersStarted: nbdServersStarted,
+                podCreated: podCreated,
+                containerStartSucceeded: containerStartSucceeded,
+                rootfsMarkersVerified: rootfsMarkersVerified,
+                mountEvidenceVerified: mountEvidenceVerified,
+                alphaNBDURL: alphaServer.url,
+                betaNBDURL: betaServer.url,
+                alphaOutput: alphaOutput,
+                betaOutput: betaOutput,
+                alphaMarkerHost: alphaMarkerHost,
+                betaMarkerHost: betaMarkerHost,
+                outcome: nbdRootfsOutcome(
+                    nbdServersStarted: nbdServersStarted,
+                    podCreated: podCreated,
+                    containerStartSucceeded: containerStartSucceeded,
+                    mountEvidenceVerified: mountEvidenceVerified,
+                    rootfsMarkersVerified: rootfsMarkersVerified
+                ),
+                note: "pre-create NBD rootfs identity does not solve post-create CreateContainer ordering",
+                errors: errors.merging(["probe": describe(error)]) { current, _ in current },
+                logs: [
+                    "alpha": logsURL.appendingPathComponent("alpha.log").path,
+                    "beta": logsURL.appendingPathComponent("beta.log").path,
+                    "exec": logsURL.appendingPathComponent("exec.log").path,
+                    "boot": logsURL.appendingPathComponent("boot.log").path,
+                ]
+            )
+            print(try result.jsonString())
+        }
+    }
+
+    private func nbdRootfs(from rootfs: Containerization.Mount, nbdURL: String) -> Containerization.Mount {
+        .block(
+            format: rootfs.type,
+            source: nbdURL,
+            destination: rootfs.destination,
+            options: rootfs.options
+        )
+    }
+
+    private func nbdRootfsOutcome(
+        nbdServersStarted: Bool,
+        podCreated: Bool,
+        containerStartSucceeded: Bool,
+        mountEvidenceVerified: Bool,
+        rootfsMarkersVerified: Bool
+    ) -> String {
+        if !nbdServersStarted {
+            return "nbdServerFailed"
+        }
+        if !podCreated {
+            return "vzNbdAttachmentOrGuestRootfsMountFailed"
+        }
+        if !containerStartSucceeded {
+            return "containerStartFailed"
+        }
+        if !mountEvidenceVerified {
+            return "rootfsMountEvidenceMismatch"
+        }
+        if !rootfsMarkersVerified {
+            return "rootfsIdentityMismatch"
+        }
+        return "nbdRootfsPrecreateSucceeded"
+    }
+
+    private func readTextFile(_ url: URL) throws -> String {
+        String(decoding: try Data(contentsOf: url), as: UTF8.self)
+    }
+
+    private func readExt4File(_ diskURL: URL, path: String) throws -> String {
+        let reader = try EXT4.EXT4Reader(blockDevice: .init(diskURL.path))
+        let data = try reader.readFile(at: .init(path))
+        return String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     private func waitForClientProbe(_ pod: LinuxPod, stdout: FileLogWriter) async throws {
         try await waitForClientProbe(pod, containerID: "client", stdout: stdout, timeoutSeconds: 90)
     }
@@ -1121,6 +1442,35 @@ private struct RuntimeDeviceDiscoverySummary: Encodable {
     let discoveryOutput: String
     let detachOutput: String
     let events: [String]
+    let errors: [String: String]
+    let logs: [String: String]
+
+    func jsonString() throws -> String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        return String(decoding: try encoder.encode(self), as: UTF8.self)
+    }
+}
+
+private struct NBDRootfsIdentitySummary: Encodable {
+    let podID: String
+    let image: String
+    let kernel: String
+    let workDir: String
+    let durationSeconds: TimeInterval
+    let nbdServersStarted: Bool
+    let podCreated: Bool
+    let containerStartSucceeded: Bool
+    let rootfsMarkersVerified: Bool
+    let mountEvidenceVerified: Bool
+    let alphaNBDURL: String?
+    let betaNBDURL: String?
+    let alphaOutput: String
+    let betaOutput: String
+    let alphaMarkerHost: String?
+    let betaMarkerHost: String?
+    let outcome: String
+    let note: String
     let errors: [String: String]
     let logs: [String: String]
 
@@ -1464,6 +1814,322 @@ private final class TeeLogWriter: Writer, @unchecked Sendable {
     }
 
     func close() throws {}
+}
+
+private final class MiniNBDServer: @unchecked Sendable {
+    private let channel: Channel
+    private let group: EventLoopGroup
+    private let socketPath: String
+    let url: String
+
+    init(filePath: String, socketPath: String, logger: Logger? = nil) throws {
+        self.socketPath = socketPath
+        self.group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        try? FileManager.default.removeItem(atPath: socketPath)
+        self.channel = try ServerBootstrap(group: group)
+            .serverChannelOption(.socketOption(.so_reuseaddr), value: 1)
+            .childChannelInitializer { channel in
+                channel.eventLoop.makeCompletedFuture {
+                    try channel.pipeline.syncOperations.addHandler(
+                        MiniNBDConnectionHandler(filePath: filePath, logger: logger)
+                    )
+                }
+            }
+            .bind(unixDomainSocketPath: socketPath)
+            .wait()
+        self.url = "nbd+unix:///?socket=\(socketPath)"
+    }
+
+    func stop() {
+        try? channel.close().wait()
+        try? group.syncShutdownGracefully()
+        try? FileManager.default.removeItem(atPath: socketPath)
+    }
+}
+
+private final class MiniNBDConnectionHandler: ChannelInboundHandler {
+    typealias InboundIn = ByteBuffer
+    typealias OutboundOut = ByteBuffer
+
+    private static let magic: UInt64 = 0x4e42_444d_4147_4943
+    private static let ihaveopt: UInt64 = 0x4948_4156_454f_5054
+    private static let replyMagic: UInt64 = 0x3e88_9045_565a_9
+    private static let requestMagic: UInt32 = 0x2560_9513
+    private static let simpleReplyMagic: UInt32 = 0x6744_6698
+
+    private static let optExportName: UInt32 = 1
+    private static let optAbort: UInt32 = 2
+    private static let optInfo: UInt32 = 6
+    private static let optGo: UInt32 = 7
+
+    private static let cmdRead: UInt16 = 0
+    private static let cmdWrite: UInt16 = 1
+    private static let cmdDisc: UInt16 = 2
+    private static let cmdFlush: UInt16 = 3
+
+    private static let flagFixedNewstyle: UInt16 = 0x1
+    private static let flagNoZeroes: UInt16 = 0x2
+    private static let clientFlagFixedNewstyle: UInt32 = 0x1
+    private static let clientFlagNoZeroes: UInt32 = 0x2
+    private static let transmitHasFlags: UInt16 = 0x1
+    private static let transmitSendFlush: UInt16 = 0x4
+    private static let transmitSendFUA: UInt16 = 0x8
+
+    private static let repACK: UInt32 = 1
+    private static let repInfo: UInt32 = 3
+    private static let repErrUnsup: UInt32 = 0x8000_0001
+    private static let infoExport: UInt16 = 0
+    private static let infoBlockSize: UInt16 = 3
+
+    private static let errOK: UInt32 = 0
+    private static let errIO: UInt32 = 5
+    private static let errNotsup: UInt32 = 95
+
+    private let fileFD: Int32
+    private let fileSize: UInt64
+    private let logger: Logger?
+    private var buffer = ByteBuffer()
+    private var state: ConnectionState = .handshake
+
+    private enum ConnectionState {
+        case handshake
+        case options(noZeroes: Bool)
+        case transmission
+    }
+
+    init(filePath: String, logger: Logger?) {
+        self.fileFD = open(filePath, O_RDWR)
+        self.logger = logger
+        guard fileFD >= 0 else {
+            self.fileSize = 0
+            logger?.error("NBD server failed to open backing file", metadata: ["path": "\(filePath)", "errno": "\(errno)"])
+            return
+        }
+        var st = stat()
+        if fstat(fileFD, &st) == 0 {
+            self.fileSize = UInt64(st.st_size)
+        } else {
+            self.fileSize = 0
+        }
+    }
+
+    func channelActive(context: ChannelHandlerContext) {
+        guard fileFD >= 0 else {
+            context.close(promise: nil)
+            return
+        }
+        var buf = context.channel.allocator.buffer(capacity: 18)
+        buf.writeInteger(Self.magic)
+        buf.writeInteger(Self.ihaveopt)
+        buf.writeInteger(Self.flagFixedNewstyle | Self.flagNoZeroes)
+        context.writeAndFlush(wrapOutboundOut(buf), promise: nil)
+    }
+
+    func channelInactive(context: ChannelHandlerContext) {
+        if fileFD >= 0 {
+            close(fileFD)
+        }
+    }
+
+    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+        var incoming = unwrapInboundIn(data)
+        buffer.writeBuffer(&incoming)
+        processBuffer(context: context)
+    }
+
+    private func processBuffer(context: ChannelHandlerContext) {
+        while true {
+            switch state {
+            case .handshake:
+                guard buffer.readableBytes >= 4, let clientFlags = buffer.readInteger(as: UInt32.self) else {
+                    return
+                }
+                guard clientFlags & Self.clientFlagFixedNewstyle != 0 else {
+                    context.close(promise: nil)
+                    return
+                }
+                state = .options(noZeroes: clientFlags & Self.clientFlagNoZeroes != 0)
+
+            case .options(let noZeroes):
+                guard buffer.readableBytes >= 16 else {
+                    return
+                }
+                let readerIndex = buffer.readerIndex
+                guard let magic = buffer.getInteger(at: readerIndex, as: UInt64.self),
+                    let optType = buffer.getInteger(at: readerIndex + 8, as: UInt32.self),
+                    let dataLen = buffer.getInteger(at: readerIndex + 12, as: UInt32.self)
+                else {
+                    context.close(promise: nil)
+                    return
+                }
+                guard buffer.readableBytes >= 16 + Int(dataLen) else {
+                    return
+                }
+                buffer.moveReaderIndex(forwardBy: 16)
+                guard magic == Self.ihaveopt else {
+                    context.close(promise: nil)
+                    return
+                }
+
+                let transmitFlags = Self.transmitHasFlags | Self.transmitSendFlush | Self.transmitSendFUA
+                switch optType {
+                case Self.optExportName:
+                    if dataLen > 0 {
+                        buffer.moveReaderIndex(forwardBy: Int(dataLen))
+                    }
+                    var reply = context.channel.allocator.buffer(capacity: noZeroes ? 10 : 134)
+                    reply.writeInteger(fileSize)
+                    reply.writeInteger(transmitFlags)
+                    if !noZeroes {
+                        reply.writeRepeatingByte(0, count: 124)
+                    }
+                    context.writeAndFlush(wrapOutboundOut(reply), promise: nil)
+                    state = .transmission
+
+                case Self.optInfo, Self.optGo:
+                    let requestedBlockSize = consumeInfoRequest(dataLen: dataLen)
+                    var reply = context.channel.allocator.buffer(capacity: 64)
+                    writeOptReply(&reply, optType: optType, replyType: Self.repInfo, dataLen: 12)
+                    reply.writeInteger(Self.infoExport)
+                    reply.writeInteger(fileSize)
+                    reply.writeInteger(transmitFlags)
+                    if requestedBlockSize {
+                        writeOptReply(&reply, optType: optType, replyType: Self.repInfo, dataLen: 14)
+                        reply.writeInteger(Self.infoBlockSize)
+                        reply.writeInteger(UInt32(1))
+                        reply.writeInteger(UInt32(4096))
+                        reply.writeInteger(UInt32(4096 * 32))
+                    }
+                    writeOptReply(&reply, optType: optType, replyType: Self.repACK, dataLen: 0)
+                    context.writeAndFlush(wrapOutboundOut(reply), promise: nil)
+                    if optType == Self.optGo {
+                        state = .transmission
+                    }
+
+                case Self.optAbort:
+                    if dataLen > 0 {
+                        buffer.moveReaderIndex(forwardBy: Int(dataLen))
+                    }
+                    context.close(promise: nil)
+                    return
+
+                default:
+                    if dataLen > 0 {
+                        buffer.moveReaderIndex(forwardBy: Int(dataLen))
+                    }
+                    var reply = context.channel.allocator.buffer(capacity: 20)
+                    writeOptReply(&reply, optType: optType, replyType: Self.repErrUnsup, dataLen: 0)
+                    context.writeAndFlush(wrapOutboundOut(reply), promise: nil)
+                }
+
+            case .transmission:
+                guard buffer.readableBytes >= 28 else {
+                    return
+                }
+                let readerIndex = buffer.readerIndex
+                guard let magic = buffer.getInteger(at: readerIndex, as: UInt32.self),
+                    let cmdType = buffer.getInteger(at: readerIndex + 6, as: UInt16.self),
+                    let cookie = buffer.getInteger(at: readerIndex + 8, as: UInt64.self),
+                    let offset = buffer.getInteger(at: readerIndex + 16, as: UInt64.self),
+                    let length = buffer.getInteger(at: readerIndex + 24, as: UInt32.self)
+                else {
+                    context.close(promise: nil)
+                    return
+                }
+                guard magic == Self.requestMagic else {
+                    context.close(promise: nil)
+                    return
+                }
+
+                switch cmdType {
+                case Self.cmdWrite:
+                    guard buffer.readableBytes >= 28 + Int(length) else {
+                        return
+                    }
+                    buffer.moveReaderIndex(forwardBy: 28)
+                    var writeData = [UInt8](repeating: 0, count: Int(length))
+                    buffer.readWithUnsafeReadableBytes { ptr in
+                        writeData.withUnsafeMutableBytes { dst in
+                            guard let dstBase = dst.baseAddress, let srcBase = ptr.baseAddress else {
+                                return
+                            }
+                            memcpy(dstBase, srcBase, Int(length))
+                        }
+                        return Int(length)
+                    }
+                    let n = pwrite(fileFD, &writeData, Int(length), off_t(offset))
+                    var reply = context.channel.allocator.buffer(capacity: 16)
+                    writeSimpleReply(&reply, cookie: cookie, error: n < 0 ? Self.errIO : Self.errOK)
+                    context.writeAndFlush(wrapOutboundOut(reply), promise: nil)
+
+                case Self.cmdRead:
+                    buffer.moveReaderIndex(forwardBy: 28)
+                    var readData = [UInt8](repeating: 0, count: Int(length))
+                    let n = pread(fileFD, &readData, Int(length), off_t(offset))
+                    var reply = context.channel.allocator.buffer(capacity: 16 + Int(length))
+                    writeSimpleReply(&reply, cookie: cookie, error: n < 0 ? Self.errIO : Self.errOK)
+                    if n >= 0 {
+                        reply.writeBytes(readData[0..<Int(length)])
+                    }
+                    context.writeAndFlush(wrapOutboundOut(reply), promise: nil)
+
+                case Self.cmdDisc:
+                    buffer.moveReaderIndex(forwardBy: 28)
+                    context.close(promise: nil)
+                    return
+
+                case Self.cmdFlush:
+                    buffer.moveReaderIndex(forwardBy: 28)
+                    fsync(fileFD)
+                    var reply = context.channel.allocator.buffer(capacity: 16)
+                    writeSimpleReply(&reply, cookie: cookie, error: Self.errOK)
+                    context.writeAndFlush(wrapOutboundOut(reply), promise: nil)
+
+                default:
+                    buffer.moveReaderIndex(forwardBy: 28)
+                    var reply = context.channel.allocator.buffer(capacity: 16)
+                    writeSimpleReply(&reply, cookie: cookie, error: Self.errNotsup)
+                    context.writeAndFlush(wrapOutboundOut(reply), promise: nil)
+                }
+            }
+        }
+    }
+
+    private func consumeInfoRequest(dataLen: UInt32) -> Bool {
+        var requestedBlockSize = false
+        if dataLen >= 6 {
+            let start = buffer.readerIndex
+            let nameLen = Int(buffer.getInteger(at: start, as: UInt32.self) ?? 0)
+            let infoOffset = start + 4 + nameLen
+            if infoOffset + 2 <= start + Int(dataLen) {
+                let numReqs = Int(buffer.getInteger(at: infoOffset, as: UInt16.self) ?? 0)
+                for i in 0..<numReqs {
+                    let reqOffset = infoOffset + 2 + i * 2
+                    if reqOffset + 2 <= start + Int(dataLen) {
+                        let infoType = buffer.getInteger(at: reqOffset, as: UInt16.self) ?? 0
+                        requestedBlockSize = requestedBlockSize || infoType == Self.infoBlockSize
+                    }
+                }
+            }
+        }
+        if dataLen > 0 {
+            buffer.moveReaderIndex(forwardBy: Int(dataLen))
+        }
+        return requestedBlockSize
+    }
+
+    private func writeOptReply(_ buffer: inout ByteBuffer, optType: UInt32, replyType: UInt32, dataLen: UInt32) {
+        buffer.writeInteger(Self.replyMagic)
+        buffer.writeInteger(optType)
+        buffer.writeInteger(replyType)
+        buffer.writeInteger(dataLen)
+    }
+
+    private func writeSimpleReply(_ buffer: inout ByteBuffer, cookie: UInt64, error: UInt32) {
+        buffer.writeInteger(Self.simpleReplyMagic)
+        buffer.writeInteger(error)
+        buffer.writeInteger(cookie)
+    }
 }
 
 private final class FileLogWriter: Writer, @unchecked Sendable {

@@ -252,7 +252,7 @@ func fallbackDiagnostics(ctx context.Context, cfg config.Config) ([]byte, error)
 		// aborting the whole report.
 		cs = nil
 	}
-	driver := container.New(container.Config{Binary: cfg.RuntimeBinary, Rosetta: cfg.RuntimeRosetta})
+	driver := container.New(container.Config{Binary: cfg.RuntimeBinary, Rosetta: cfg.RuntimeRosetta, DataRoot: cfg.RuntimeDataRoot})
 	collector := newDiagnosticsCollector(cfg, driver, cs, nilMesh(), nilRouter())
 	report := collector.Report(ctx)
 	return []byte(report.Text()), nil

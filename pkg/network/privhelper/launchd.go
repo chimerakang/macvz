@@ -35,6 +35,10 @@ const (
 	// DefaultStdoutPath and DefaultStderrPath are the daemon's log files.
 	DefaultStdoutPath = "/var/log/macvz-netd.log"
 	DefaultStderrPath = "/var/log/macvz-netd.err.log"
+	// DefaultDaemonPath is the PATH used by the root LaunchDaemon. launchd's
+	// default environment is sparse; include Homebrew locations so wg and
+	// wireguard-go resolve on Apple Silicon Macs.
+	DefaultDaemonPath = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 )
 
 // LaunchdConfig describes the LaunchDaemon to install. All paths are absolute so
@@ -65,20 +69,29 @@ type LaunchdConfig struct {
 	// StdoutPath/StderrPath are the daemon's log destinations.
 	StdoutPath string
 	StderrPath string
+	// NewsyslogPath is the newsyslog drop-in that rotates the daemon's logs so a
+	// long-running node does not grow them without bound (#69). Empty disables
+	// rotation management (the logs then grow until an external tool trims them).
+	NewsyslogPath string
+	// LogRotateCount/LogRotateSizeKB tune rotation: how many compressed archives
+	// to keep, and the size (KB) past which a log rotates. Zero uses the defaults.
+	LogRotateCount  int
+	LogRotateSizeKB int
 }
 
 // DefaultLaunchdConfig returns the standard system layout with the socket and
 // owner left to the caller (owner defaults to "unset").
 func DefaultLaunchdConfig(socketPath string) LaunchdConfig {
 	return LaunchdConfig{
-		Label:      DefaultLabel,
-		PlistDir:   DefaultPlistDir,
-		BinaryPath: DefaultBinaryPath,
-		SocketPath: socketPath,
-		OwnerUID:   -1,
-		OwnerGID:   -1,
-		StdoutPath: DefaultStdoutPath,
-		StderrPath: DefaultStderrPath,
+		Label:         DefaultLabel,
+		PlistDir:      DefaultPlistDir,
+		BinaryPath:    DefaultBinaryPath,
+		SocketPath:    socketPath,
+		OwnerUID:      -1,
+		OwnerGID:      -1,
+		StdoutPath:    DefaultStdoutPath,
+		StderrPath:    DefaultStderrPath,
+		NewsyslogPath: DefaultNewsyslogPath,
 	}
 }
 
@@ -123,6 +136,9 @@ func (c LaunchdConfig) Validate() error {
 	}
 	if c.ConfigPath != "" && !filepath.IsAbs(c.ConfigPath) {
 		return fmt.Errorf("launchd config: configPath %q must be absolute", c.ConfigPath)
+	}
+	if c.NewsyslogPath != "" && !filepath.IsAbs(c.NewsyslogPath) {
+		return fmt.Errorf("launchd config: newsyslogPath %q must be absolute", c.NewsyslogPath)
 	}
 	if c.ConfigPath == "" && !c.AllowUnsafeNoConfig {
 		return fmt.Errorf("launchd config: configPath is required unless allowUnsafeNoConfig is set")
@@ -171,6 +187,11 @@ var plistTemplate = template.Must(template.New("plist").Parse(`<?xml version="1.
 	<true/>
 	<key>ProcessType</key>
 	<string>Interactive</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>{{.Path}}</string>
+	</dict>
 	<key>StandardOutPath</key>
 	<string>{{.StdoutPath}}</string>
 	<key>StandardErrorPath</key>
@@ -187,8 +208,8 @@ func (c LaunchdConfig) Render() (string, error) {
 	}
 	var buf bytes.Buffer
 	err := plistTemplate.Execute(&buf, struct {
-		Label, BinaryPath, SocketPath, ConfigPath, Owner, StdoutPath, StderrPath string
-		AllowUnsafeNoConfig                                                      bool
+		Label, BinaryPath, SocketPath, ConfigPath, Owner, Path, StdoutPath, StderrPath string
+		AllowUnsafeNoConfig                                                            bool
 	}{
 		Label:               c.Label,
 		BinaryPath:          c.BinaryPath,
@@ -196,6 +217,7 @@ func (c LaunchdConfig) Render() (string, error) {
 		ConfigPath:          c.ConfigPath,
 		AllowUnsafeNoConfig: c.AllowUnsafeNoConfig,
 		Owner:               c.ownerSpec(),
+		Path:                DefaultDaemonPath,
 		StdoutPath:          c.StdoutPath,
 		StderrPath:          c.StderrPath,
 	})
@@ -268,6 +290,25 @@ func (i *Installer) Install(ctx context.Context, srcBinary string) error {
 	if err := os.WriteFile(i.Cfg.PlistPath(), []byte(plist), 0o644); err != nil {
 		return fmt.Errorf("write plist %q: %w", i.Cfg.PlistPath(), err)
 	}
+	for _, p := range []string{i.Cfg.StdoutPath, i.Cfg.StderrPath} {
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			return fmt.Errorf("create log dir for %q: %w", p, err)
+		}
+	}
+	// Install the newsyslog drop-in so the daemon's logs rotate from the first
+	// run (#69). Skipped when rotation management is disabled (empty path).
+	if i.Cfg.NewsyslogPath != "" {
+		rotate, err := i.Cfg.RenderNewsyslog()
+		if err != nil {
+			return err
+		}
+		if err := os.MkdirAll(i.Cfg.newsyslogDir(), 0o755); err != nil {
+			return fmt.Errorf("create newsyslog dir: %w", err)
+		}
+		if err := os.WriteFile(i.Cfg.NewsyslogPath, []byte(rotate), 0o644); err != nil {
+			return fmt.Errorf("write newsyslog config %q: %w", i.Cfg.NewsyslogPath, err)
+		}
+	}
 	// Replace any prior load so an upgrade picks up the new binary/plist.
 	_ = i.unload(ctx)
 	return i.load(ctx)
@@ -300,6 +341,11 @@ func (i *Installer) Uninstall(ctx context.Context) error {
 	}
 	if err := os.Remove(i.Cfg.SocketPath); err != nil && !os.IsNotExist(err) {
 		errs = append(errs, fmt.Sprintf("remove socket: %v", err))
+	}
+	if i.Cfg.NewsyslogPath != "" {
+		if err := os.Remove(i.Cfg.NewsyslogPath); err != nil && !os.IsNotExist(err) {
+			errs = append(errs, fmt.Sprintf("remove newsyslog config: %v", err))
+		}
 	}
 	if len(errs) > 0 {
 		return fmt.Errorf("uninstall: %s", strings.Join(errs, "; "))

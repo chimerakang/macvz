@@ -59,6 +59,16 @@ MACVZ_E2E=1 MACVZ_E2E_NODES=mac-a,mac-b go test -tags e2e -v -timeout 30m ./test
 MACVZ_E2E_NODES=mac-a,mac-b ./test/e2e/e2e.sh
 ```
 
+For the P9 long-duration gate, run the soak wrapper instead:
+
+```sh
+MACVZ_SOAK_NODES=mac-a,mac-b test/e2e/soak/run.sh --duration 8h
+```
+
+It reuses this suite in a loop and adds restart, node-churn, orphan-cleanup, and
+resource-snapshot phases when the host control hooks are configured. See
+[SOAK_TESTS.md](SOAK_TESTS.md).
+
 Configuration (environment):
 
 | Var | Default | Purpose |

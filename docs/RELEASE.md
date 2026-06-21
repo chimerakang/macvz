@@ -1,7 +1,11 @@
 # Release: Signing & Notarization
 
-How to build, sign, notarize, and publish `macvz-kubelet` for Apple Silicon
-macOS (issue #29). MacVz is darwin/arm64 only.
+How to build, sign, notarize, and publish the MacVz Apple Silicon macOS
+artifacts (issue #29). MacVz is darwin/arm64 only.
+
+> For installing/upgrading/rolling back/removing the built artifacts on a node,
+> see [PACKAGING.md](PACKAGING.md) (issue #70). `make release` produces both the
+> single-binary tarball and a self-contained install bundle.
 
 ## Signing identity & entitlements
 
@@ -33,10 +37,13 @@ make release
 ```
 
 `make release` runs [scripts/macos-release.sh](../scripts/macos-release.sh),
-which: builds the darwin/arm64 binary with version stamping → codesigns it
-(hardened runtime + entitlements) → verifies the signature → packages
-`dist/macvz-kubelet_<version>_darwin_arm64.tar.gz` with a `.sha256` → and, when
-notarization credentials are present, submits it with `notarytool --wait`.
+which: builds `macvz-kubelet` and `macvz-netd` for darwin/arm64 with version
+stamping → codesigns both (hardened runtime + entitlements for Developer ID
+builds) → verifies the signatures → packages the legacy
+`dist/macvz-kubelet_<version>_darwin_arm64.tar.gz` single-binary tarball plus
+the self-contained `dist/macvz_<version>_darwin_arm64.tar.gz` install bundle →
+and, when notarization credentials are present, submits the install bundle with
+`notarytool --wait`.
 
 Create a notarytool keychain profile once with:
 
@@ -64,10 +71,11 @@ make release   # CODESIGN_IDENTITY defaults to "-" (ad-hoc), notarization skippe
 
 [.github/workflows/release.yml](../.github/workflows/release.yml) runs on a
 `v*` tag push on a macos runner. It imports a Developer ID cert into a temporary
-keychain, runs the same release script, and attaches the tarball + checksum to
-the GitHub Release. Signing/notarization activate only when these repository
-secrets are set (otherwise it falls back to an ad-hoc artifact, so forks still
-build):
+keychain, runs the same release script, and attaches every `dist/*.tar.gz`
+artifact plus its checksum to the GitHub Release (single-binary tarball and
+install bundle). Signing/notarization activate only when these repository
+secrets are set (otherwise the workflow falls back to ad-hoc artifacts, so forks
+still build):
 
 | Secret | Purpose |
 | --- | --- |
@@ -85,6 +93,13 @@ git tag v0.4.0 && git push origin v0.4.0
 ## Install
 
 ```sh
+# Managed node install bundle (recommended):
+tar -xzf macvz_<version>_darwin_arm64.tar.gz
+shasum -a 256 -c macvz_<version>_darwin_arm64.tar.gz.sha256
+cd macvz_<version>_darwin_arm64
+sudo ./macvz-install.sh install --from . --config config.example.yaml
+
+# Legacy single-binary kubelet tarball:
 tar -xzf macvz-kubelet_<version>_darwin_arm64.tar.gz
 shasum -a 256 -c macvz-kubelet_<version>_darwin_arm64.tar.gz.sha256
 sudo install -m 0755 macvz-kubelet /usr/local/bin/macvz-kubelet
@@ -97,9 +112,11 @@ macvz-kubelet --version
 # Signature valid, hardened runtime present, and the signing authority:
 codesign --verify --strict --verbose=2 /usr/local/bin/macvz-kubelet
 codesign --display --verbose=2 /usr/local/bin/macvz-kubelet   # look for flags=…(runtime)
+codesign --verify --strict --verbose=2 /usr/local/sbin/macvz-netd
 
 # Gatekeeper assessment of a notarized executable:
 spctl --assess --type execute --verbose=4 /usr/local/bin/macvz-kubelet
+spctl --assess --type execute --verbose=4 /usr/local/sbin/macvz-netd
 
 # Notarization history for an artifact (with credentials):
 xcrun notarytool history --keychain-profile macvz-notary

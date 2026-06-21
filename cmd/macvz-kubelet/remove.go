@@ -97,7 +97,7 @@ func runRemove(args []string) int {
 // handled by the separate flush-pf step, so the Cleaner's own Flusher is left
 // nil here to avoid a double flush.
 func buildVMReaper(cfg config.Config, timeout time.Duration) noderemove.VMReaper {
-	driver := container.New(container.Config{Binary: cfg.RuntimeBinary, Rosetta: cfg.RuntimeRosetta})
+	driver := container.New(container.Config{Binary: cfg.RuntimeBinary, Rosetta: cfg.RuntimeRosetta, DataRoot: cfg.RuntimeDataRoot})
 	return &cleanerReaper{cleaner: &drain.Cleaner{Lister: driver, Reaper: driver, Timeout: timeout}}
 }
 

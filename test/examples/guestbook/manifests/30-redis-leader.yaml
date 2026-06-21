@@ -1,0 +1,88 @@
+# redis-leader: the write side of the guestbook data tier. A single replica of
+# the stock redis:7-alpine image (arm64 multi-arch, no custom build) running
+# inside a MacVz micro-VM. The frontend RPUSHes new entries here. AUTH is required
+# and the password comes from the guestbook-redis Secret as an env var (#47).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-leader
+  namespace: macvz-guestbook
+  labels:
+    app: redis
+    role: leader
+    app.kubernetes.io/part-of: macvz-guestbook
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+      role: leader
+  template:
+    metadata:
+      labels:
+        app: redis
+        role: leader
+        app.kubernetes.io/part-of: macvz-guestbook
+    spec:
+      # Land on a MacVz virtual node and tolerate its provider taint.
+      nodeSelector:
+        type: virtual-kubelet
+      tolerations:
+        - key: virtual-kubelet.io/provider
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          # The password is interpolated from the Secret-backed env var by the
+          # shell, never baked into the image or the manifest.
+          command:
+            - /bin/sh
+            - -c
+            - exec redis-server --requirepass "$REDIS_PASSWORD"
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: guestbook-redis
+                  key: redis-password
+          ports:
+            - name: redis
+              containerPort: 6379
+          readinessProbe:
+            exec:
+              command: ["/bin/sh", "-c", 'redis-cli -a "$REDIS_PASSWORD" --no-auth-warning ping | grep -q PONG']
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: redis
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: "100m"
+              memory: 128Mi
+            limits:
+              cpu: "500m"
+              memory: 256Mi
+---
+# ClusterIP Service for the leader. The frontend resolves `redis-leader` by
+# cluster DNS and the follower replicates from it by the same name (#37).
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-leader
+  namespace: macvz-guestbook
+  labels:
+    app: redis
+    role: leader
+    app.kubernetes.io/part-of: macvz-guestbook
+spec:
+  selector:
+    app: redis
+    role: leader
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis

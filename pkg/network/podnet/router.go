@@ -36,6 +36,10 @@ type Endpoint struct {
 	PodIP string
 	// VMIP is the micro-VM's apple/container host-only address.
 	VMIP string
+	// Interface is the vmnet bridge that routes to VMIP. It is resolved at
+	// Attach time because apple/container can allocate guests on bridge100,
+	// bridge101, and friends as its host-only ranges grow.
+	Interface string
 }
 
 func (e Endpoint) validate() error {
@@ -48,6 +52,9 @@ func (e Endpoint) validate() error {
 	if net.ParseIP(e.VMIP) == nil {
 		return fmt.Errorf("podnet: endpoint %q has invalid VMIP %q", e.PodKey, e.VMIP)
 	}
+	if e.Interface != "" && strings.TrimSpace(e.Interface) != e.Interface {
+		return fmt.Errorf("podnet: endpoint %q has invalid interface %q", e.PodKey, e.Interface)
+	}
 	return nil
 }
 
@@ -56,6 +63,10 @@ type Config struct {
 	// Interface is the host vmnet interface apple/container micro-VMs attach to
 	// (e.g. "bridge100"). It scopes the binat rules.
 	Interface string
+	// MeshInterface is the WireGuard interface used for cross-node Pod traffic.
+	// When set, local Pod binat rules are also installed on this interface so
+	// packets arriving from peers at a Pod IP are translated to the local VM IP.
+	MeshInterface string
 	// Anchor is the pf anchor to manage. Defaults to DefaultAnchor.
 	Anchor string
 	// EnableForwarding turns on IPv4 forwarding during Start. Disable only when
@@ -169,11 +180,24 @@ func (rt *Router) Attach(ctx context.Context, ep Endpoint) error {
 	if err := rt.removeVMNetDefaultRouteLocked(ctx); err != nil {
 		return fmt.Errorf("remove vmnet default route before attach %q: %w", ep.PodKey, err)
 	}
+	if ep.Interface == "" {
+		if iface, err := rt.resolveVMNetInterface(ctx, ep.VMIP); err == nil && iface != "" {
+			ep.Interface = iface
+		} else if err != nil {
+			klog.ErrorS(err, "failed to resolve vmnet interface for endpoint; using configured interface", "pod", ep.PodKey, "vmIP", ep.VMIP, "interface", rt.cfg.Interface)
+		}
+	}
+	if ep.Interface == "" {
+		ep.Interface = rt.cfg.Interface
+	}
+	if err := rt.removeVMNetDefaultRouteOnInterfaceLocked(ctx, ep.Interface); err != nil {
+		return fmt.Errorf("remove vmnet default route on endpoint interface before attach %q: %w", ep.PodKey, err)
+	}
 	rt.endpoints[ep.PodKey] = ep
 	if err := rt.loadAnchorLocked(ctx); err != nil {
 		return fmt.Errorf("attach %q (%s -> %s): %w", ep.PodKey, ep.PodIP, ep.VMIP, err)
 	}
-	klog.InfoS("attached pod to network path", "pod", ep.PodKey, "podIP", ep.PodIP, "vmIP", ep.VMIP)
+	klog.InfoS("attached pod to network path", "pod", ep.PodKey, "podIP", ep.PodIP, "vmIP", ep.VMIP, "interface", ep.Interface)
 	return nil
 }
 
@@ -182,15 +206,43 @@ func (rt *Router) Attach(ctx context.Context, ep Endpoint) error {
 // traffic and sever the kubelet's API connection. Deleting it is idempotent and
 // safe: the route is scoped to the vmnet interface and Pod reachability uses
 // explicit Pod/mesh routes plus pf binat/rdr, not a host default route.
+//
+// It tolerates the route already being absent (errRouteMissing/errRouteNotFound)
+// and the interface not existing yet (errRouteBadInterface): at cold Start the
+// vmnet bridge has not been created, so there is nothing to remove. Attach calls
+// this again after each micro-VM boot, when the bridge — and any default route it
+// installed — actually exists.
 func (rt *Router) removeVMNetDefaultRouteLocked(ctx context.Context) error {
+	return rt.removeVMNetDefaultRouteOnInterfaceLocked(ctx, rt.cfg.Interface)
+}
+
+func (rt *Router) removeVMNetDefaultRouteOnInterfaceLocked(ctx context.Context, iface string) error {
+	// macOS records apple/container's bridge route as a scoped default route.
+	// Use only -ifscope: route(8)'s "-interface <iface>" form can match and
+	// delete the global IPv4 default route on some hosts, severing normal
+	// network access.
 	_, err := rt.runTolerating(ctx, command{
 		Name: rt.route,
-		Args: []string{"-q", "-n", "delete", "-inet", "default", "-interface", rt.cfg.Interface},
-	}, errRouteMissing, errRouteNotFound)
+		Args: []string{"-q", "-n", "delete", "-inet", "default", "-ifscope", iface},
+	}, errRouteMissing, errRouteNotFound, errRouteBadInterface, errRouteBadIfName)
 	if err != nil {
-		return fmt.Errorf("remove vmnet default route on %s: %w", rt.cfg.Interface, err)
+		return fmt.Errorf("remove vmnet default route on %s: %w", iface, err)
 	}
 	return nil
+}
+
+func (rt *Router) resolveVMNetInterface(ctx context.Context, vmIP string) (string, error) {
+	out, err := rt.run.run(ctx, command{Name: rt.route, Args: []string{"-n", "get", vmIP}})
+	if err != nil {
+		return "", err
+	}
+	for _, raw := range strings.Split(out, "\n") {
+		line := strings.TrimSpace(raw)
+		if strings.HasPrefix(line, "interface:") {
+			return strings.TrimSpace(strings.TrimPrefix(line, "interface:")), nil
+		}
+	}
+	return "", nil
 }
 
 // Detach removes a Pod's mapping. Detaching an unknown Pod is a no-op, so
@@ -245,8 +297,8 @@ func (rt *Router) Stop(ctx context.Context) error {
 // loadAnchorLocked renders the current ruleset and loads it into the anchor
 // atomically via `pfctl -a <anchor> -f -`. Caller holds rt.mu.
 func (rt *Router) loadAnchorLocked(ctx context.Context) error {
-	rules := renderAnchor(rt.cfg.Interface, rt.endpointsSortedLocked())
-	rules += renderServiceRules(rt.cfg.Interface, rt.services, rt.vmipByPodIPLocked())
+	rules := renderAnchor(rt.cfg.Interface, rt.cfg.MeshInterface, rt.endpointsSortedLocked())
+	rules += renderServiceRules(rt.vmnetInterfacesLocked(), rt.services, rt.vmipByPodIPLocked())
 	_, err := rt.run.run(ctx, command{
 		Name:  rt.pfctl,
 		Args:  []string{"-a", rt.cfg.Anchor, "-f", "-"},
@@ -270,14 +322,54 @@ func (rt *Router) endpointsSortedLocked() []Endpoint {
 // renderAnchor builds the pf anchor body: one bidirectional NAT rule per Pod,
 // mapping the VM's host-only address to its Pod IP. Rendering is deterministic
 // (endpoints are pre-sorted) so identical state yields identical rules.
-func renderAnchor(iface string, endpoints []Endpoint) string {
+func renderAnchor(iface, meshIface string, endpoints []Endpoint) string {
 	var b strings.Builder
 	b.WriteString("# Managed by macvz (issue #22). Do not edit by hand.\n")
 	for _, ep := range endpoints {
 		fmt.Fprintf(&b, "# %s\n", ep.PodKey)
-		fmt.Fprintf(&b, "binat on %s from %s to any -> %s\n", iface, ep.VMIP, ep.PodIP)
+		for _, epIface := range endpointBinatInterfaces(iface, meshIface, ep) {
+			fmt.Fprintf(&b, "binat on %s from %s to any -> %s\n", epIface, ep.VMIP, ep.PodIP)
+		}
 	}
 	return b.String()
+}
+
+func endpointBinatInterfaces(defaultIface, meshIface string, ep Endpoint) []string {
+	seen := map[string]struct{}{}
+	add := func(iface string) {
+		if iface != "" {
+			seen[iface] = struct{}{}
+		}
+	}
+	add(ep.Interface)
+	if ep.Interface == "" {
+		add(defaultIface)
+	}
+	add(meshIface)
+	out := make([]string, 0, len(seen))
+	for iface := range seen {
+		out = append(out, iface)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func (rt *Router) vmnetInterfacesLocked() []string {
+	seen := map[string]struct{}{}
+	if rt.cfg.Interface != "" {
+		seen[rt.cfg.Interface] = struct{}{}
+	}
+	for _, ep := range rt.endpoints {
+		if ep.Interface != "" {
+			seen[ep.Interface] = struct{}{}
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for iface := range seen {
+		out = append(out, iface)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // runTolerating runs a command, treating an error whose stderr contains any of
@@ -305,4 +397,12 @@ const pfAlreadyEnabled = "pf already enabled"
 const (
 	errRouteMissing  = "not in table"
 	errRouteNotFound = "not found"
+	// errRouteBadInterface is what `route delete ... -interface <iface>` prints
+	// when the interface does not exist yet — e.g. at cold Start, before
+	// apple/container has created the vmnet bridge by booting the first micro-VM.
+	// No interface means there is no vmnet default route to strip, so this is
+	// benign; Attach re-runs the guard once the bridge exists and the route, if
+	// any, actually appears.
+	errRouteBadInterface = "bad address"
+	errRouteBadIfName    = "bad interface name"
 )

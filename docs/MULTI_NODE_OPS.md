@@ -37,16 +37,15 @@ Four facts shape every procedure below:
 | **Join** | `macvz-kubelet bootstrap` + `doctor` | shipped (#54) | [NODE_JOIN.md](NODE_JOIN.md) |
 | **Mesh keys/peers** | `macvz-mesh keygen`/`export`/`peer` | shipped (#55) | [NETWORKING.md](NETWORKING.md#peer-identity--keys) |
 | **Verify** | `doctor`, `/healthz/diagnostics`, `kubectl get node` | shipped (#54/#56) | [below](#verify-a-node) |
-| **Drain** | `kubectl drain` | kubectl today; helper #57 planned | [below](#drain-a-node) |
-| **Remove** | `kubectl delete node` + peer/route/pf cleanup | manual today; helper #58 planned | [below](#remove-a-node) |
-| **Upgrade** | drain → swap binary → restart | manual today | [below](#upgrade-a-node) |
+| **Drain** | `kubectl drain` + `macvz-kubelet cleanup` | shipped (#57) | [below](#drain-a-node) |
+| **Remove** | `macvz-kubelet remove` | shipped (#58) | [below](#remove-a-node) |
+| **Upgrade** | drain → install/upgrade → restart | installer shipped (#70) | [below](#upgrade-a-node) |
 | **Troubleshoot** | `/healthz/diagnostics` → recovery runbook | shipped (#56) | [below](#network-troubleshooting) |
-| **Cleanup** | helper teardown + anchor/route/VM flush | manual today; bundle #59 planned | [PRIVILEGED_NETWORKING.md](PRIVILEGED_NETWORKING.md#teardown) |
+| **Cleanup/diagnostics** | `cleanup`, `remove`, `bundle` | shipped (#57/#58/#59) | [below](#cleanup-and-diagnostic-bundles) |
 
-> Status note: drain (#57), automated removal (#58), and a diagnostic-bundle
-> command (#59) are planned. The procedures here use the tooling that ships today
-> (kubectl plus the documented manual cleanup); the table flags where a future
-> command will replace a manual step. Nothing below waits on unshipped tooling.
+> Status note: disruptive operations still start with stock Kubernetes semantics
+> (`kubectl drain` / scheduling cordons), but MacVz now ships the host-side
+> cleanup, removal, diagnostic-bundle, and installer helpers used below.
 
 ## Join a node
 
@@ -117,8 +116,8 @@ Schedule Pods that tolerate `virtual-kubelet.io/provider=macvz:NoSchedule`.
 ## Drain a node
 
 Drain before any disruptive action (upgrade, reboot, removal) so workloads
-reschedule onto other nodes first. This uses stock kubectl today; a MacVz drain
-helper that also tears down per-Pod data-plane state is planned (#57).
+reschedule onto other nodes first. Kubernetes still owns the eviction decision;
+MacVz's `cleanup` command is the post-drain host verification and recovery pass.
 
 ```sh
 # 1. Stop new placements and evict existing Pods.
@@ -189,31 +188,30 @@ To leave the host completely clean (remove the helper, restore `pf.conf`), follo
 
 ## Upgrade a node
 
-MacVz is a single resident binary per Mac, so an upgrade is a drain-swap-restart.
-Roll one node at a time so capacity stays available.
+Roll one node at a time so capacity stays available. Release artifacts include a
+managed installer that upgrades both `macvz-kubelet` and `macvz-netd` while
+preserving config, PKI, and rollback state (see [PACKAGING.md](PACKAGING.md)).
 
 ```sh
 # 1. Drain so workloads move off (see "Drain a node").
 kubectl drain macvz-a --ignore-daemonsets --delete-emptydir-data
 
-# 2. Stop the kubelet, replace the binary, re-run doctor against the SAME config.
-#    (A new binary can add config validation — doctor catches drift before start.)
-make build && sudo install -m 0755 bin/macvz-kubelet /usr/local/bin/macvz-kubelet
+# 2. Upgrade from the unpacked install bundle.
+sudo ./macvz-install.sh upgrade --from .
+
+# 3. Re-run doctor against the SAME config.
+#    A new binary can add config validation — doctor catches drift before restart.
 macvz-kubelet doctor --config /etc/macvz/config.yaml; echo "exit=$?"   # want exit=0
 
-# 3. If the privileged helper changed, upgrade it too (it is a separate binary).
-#    See PRIVILEGED_NETWORKING.md "Upgrading".
-sudo macvz-netd uninstall && sudo macvz-netd install --config /etc/macvz/config.yaml ...
-
-# 4. Restart and confirm health, then return the node to scheduling.
-KUBECONFIG=/etc/macvz/kubeconfig macvz-kubelet --config /etc/macvz/config.yaml &
+# 4. Confirm health, then return the node to scheduling.
 curl -fsk https://192.168.1.110:10250/healthz/diagnostics >/dev/null && echo READY
 kubectl uncordon macvz-a
 ```
 
-Version skew: `macvz-kubelet` and `macvz-netd` share the config schema. Upgrade
-the helper whenever a release notes a config change, and always re-run `doctor`
-after swapping either binary — it validates the config against the new build.
+For development builds without the installer, stop the kubelet, install both
+fresh binaries, re-run `macvz-netd install --config …`, then restart the kubelet.
+Version skew matters: `macvz-kubelet` and `macvz-netd` share the config schema,
+so always re-run `doctor` after swapping either binary.
 
 ## Network troubleshooting
 
@@ -248,11 +246,12 @@ delete by hand, per the recovery runbook).
 - **Leave a host clean** — stop the kubelet, flush the `macvz/pods` anchor,
   destroy the mesh interface, remove the helper, optionally restore `pf.conf`:
   [PRIVILEGED_NETWORKING.md → Teardown](PRIVILEGED_NETWORKING.md#teardown).
-- **Collect support state** — a one-shot diagnostic-bundle command is planned
-  (#59). Until it ships, capture the live report plus the data-plane state for a
-  bug report:
+- **Collect support state** — use the diagnostic bundle command (#59) for a
+  redacted support archive, and add live data-plane state when debugging mesh or
+  pf failures:
 
   ```sh
+  macvz-kubelet bundle --config /etc/macvz/config.yaml --out ./support
   curl -sk https://<internal-ip>:10250/healthz/diagnostics?format=json > diag.json
   macvz-kubelet doctor --config /etc/macvz/config.yaml > doctor.txt 2>&1
   wg show > wg.txt; netstat -rn -f inet > routes.txt
@@ -270,5 +269,8 @@ other), and confirm the survivor reports no orphan routes. The turnkey bundle in
 [`test/e2e/two-node/`](../test/e2e/two-node/README.md) sets up the join half; the
 cross-Mac Service check is the
 [end-to-end walkthrough in NETWORKING.md](NETWORKING.md#end-to-end-a-service-across-two-macs).
-</content>
-</invoke>
+
+For P9 reliability, extend that live rig with the long-duration soak harness:
+[`test/e2e/soak/run.sh`](../test/e2e/soak/run.sh) / [SOAK_TESTS.md](SOAK_TESTS.md).
+It repeats the e2e and real-app fixtures while restarting services, churning
+nodes, verifying orphan cleanup, and sampling resource usage.

@@ -22,35 +22,47 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 KEY_SRC="$HERE/keys/macvz-$NODE.key"
 PRIV_DEST="/etc/macvz/wireguard.key"
 PKI_DIR="/etc/macvz/pki"
+VOLUME_ROOT="/var/lib/macvz/volumes"
 ANCHOR_HOOKS="$HERE/pf-anchor-hooks.conf"
 PF_CONF="/etc/pf.conf"
+OWNER_UID="${SUDO_UID:-0}"
+OWNER_GID="${SUDO_GID:-0}"
 
 [ "$(id -u)" -eq 0 ] || { echo "must run as root (use sudo)" >&2; exit 2; }
 [ -f "$KEY_SRC" ] || { echo "missing $KEY_SRC — generate keys first (see README)" >&2; exit 2; }
 
 echo "==> Installing WireGuard private key -> $PRIV_DEST"
-install -d -m 700 /etc/macvz
-install -m 600 "$KEY_SRC" "$PRIV_DEST"
+install -d -m 750 -o root -g "$OWNER_GID" /etc/macvz
+install -m 640 -o root -g "$OWNER_GID" "$KEY_SRC" "$PRIV_DEST"
 
 echo "==> Ensuring kubelet serving TLS (self-signed) under $PKI_DIR"
-install -d -m 700 "$PKI_DIR"
+install -d -m 750 -o root -g "$OWNER_GID" "$PKI_DIR"
 if [ ! -f "$PKI_DIR/kubelet.crt" ] || [ ! -f "$PKI_DIR/kubelet.key" ]; then
 	IP="$([ "$NODE" = a ] && echo 192.168.1.110 || echo 192.168.1.122)"
 	openssl req -x509 -nodes -newkey rsa:2048 -days 365 \
 		-keyout "$PKI_DIR/kubelet.key" -out "$PKI_DIR/kubelet.crt" \
 		-subj "/CN=macvz-$NODE" \
 		-addext "subjectAltName=IP:$IP" >/dev/null 2>&1
-	chmod 600 "$PKI_DIR/kubelet.key"
 	echo "    generated kubelet.crt/key for IP $IP"
 else
 	echo "    serving TLS already present, leaving as-is"
 fi
+chown root:"$OWNER_GID" "$PKI_DIR/kubelet.crt" "$PKI_DIR/kubelet.key"
+chmod 644 "$PKI_DIR/kubelet.crt"
+chmod 640 "$PKI_DIR/kubelet.key"
+
+echo "==> Ensuring kubelet volume root -> $VOLUME_ROOT"
+install -d -m 750 -o "$OWNER_UID" -g "$OWNER_GID" "$VOLUME_ROOT"
 
 echo "==> Hooking pf anchor into $PF_CONF"
-if grep -q 'anchor "macvz/pods/\*"' "$PF_CONF" 2>/dev/null; then
+if grep -q 'anchor "macvz/pods"$' "$PF_CONF" 2>/dev/null; then
 	echo "    anchor hooks already present"
 else
 	cp "$PF_CONF" "${PF_CONF}.macvz.bak.$(date +%s 2>/dev/null || echo backup)" 2>/dev/null || true
+	# Older two-node bundles installed wildcard hooks (macvz/pods/*), which
+	# create a visible child namespace but do not evaluate the managed
+	# macvz/pods anchor itself.
+	sed -i '' '/macvz\/pods\/\*/d' "$PF_CONF"
 	# pf requires strict ordering: translation anchors (nat/rdr/binat) must
 	# precede filter anchors. macOS ships a pf.conf with com.apple anchors, so we
 	# insert the macvz translation anchors right after the com.apple rdr-anchor
@@ -61,14 +73,14 @@ else
 		awk '
 			/^rdr-anchor "com\.apple\/\*"/ {
 				print
-				print "nat-anchor \"macvz/pods/*\""
-				print "rdr-anchor \"macvz/pods/*\""
-				print "binat-anchor \"macvz/pods/*\""
+				print "nat-anchor \"macvz/pods\""
+				print "rdr-anchor \"macvz/pods\""
+				print "binat-anchor \"macvz/pods\""
 				next
 			}
 			/^anchor "com\.apple\/\*"/ {
 				print
-				print "anchor \"macvz/pods/*\""
+				print "anchor \"macvz/pods\""
 				next
 			}
 			{ print }

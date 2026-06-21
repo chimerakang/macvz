@@ -20,7 +20,7 @@ func samplePolicy() Policy {
 		MTU:            1380,
 		RouteCIDRs:     NormalizeCIDRSet([]string{"10.244.1.0/24", "10.99.0.2/32"}),
 		PodCIDRs:       NormalizeCIDRSet([]string{"10.244.1.0/24"}),
-		VMNetCIDRs:     NormalizeCIDRSet([]string{"192.168.64.0/24"}),
+		VMNetCIDRs:     NormalizeCIDRSet([]string{"192.168.64.0/22"}),
 		PeerPublicKeys: map[string]bool{"PEERKEY00000000000000000000000000000000000=": true},
 	}
 }
@@ -59,7 +59,9 @@ func TestPolicyAllowsConfiguredCommands(t *testing.T) {
 		{"pfctl", "load managed anchor", Request{Name: "pfctl", Args: []string{"-a", "macvz/pods", "-f", "-"}, Stdin: validAnchorRuleset}},
 		{"route", "add configured pod CIDR", Request{Name: "route", Args: []string{"-q", "-n", "add", "-inet", "10.244.1.0/24", "-interface", "utun7"}}},
 		{"route", "delete configured mesh CIDR", Request{Name: "route", Args: []string{"-q", "-n", "delete", "-inet", "10.99.0.2/32", "-interface", "utun7"}}},
-		{"route", "delete vmnet default route", Request{Name: "route", Args: []string{"-q", "-n", "delete", "-inet", "default", "-interface", "bridge100"}}},
+		{"route", "resolve vmnet interface for guest IP", Request{Name: "route", Args: []string{"-n", "get", "192.168.65.16"}}},
+		{"route", "delete scoped vmnet default route", Request{Name: "route", Args: []string{"-q", "-n", "delete", "-inet", "default", "-ifscope", "bridge100"}}},
+		{"route", "delete scoped vmnet default route on secondary bridge", Request{Name: "route", Args: []string{"-q", "-n", "delete", "-inet", "default", "-ifscope", "bridge101"}}},
 		{"ifconfig", "assign mesh address", Request{Name: "ifconfig", Args: []string{"utun7", "inet", "10.99.0.1", "10.99.0.1", "alias"}}},
 		{"ifconfig", "set configured mtu", Request{Name: "ifconfig", Args: []string{"utun7", "mtu", "1380"}}},
 		{"ifconfig", "bring up", Request{Name: "ifconfig", Args: []string{"utun7", "up"}}},
@@ -101,7 +103,11 @@ func TestPolicyRefusesOutOfScopeCommands(t *testing.T) {
 		// route: only configured CIDRs through the managed interface.
 		{"default route hijack", Request{Name: "route", Args: []string{"-q", "-n", "add", "-inet", "0.0.0.0/0", "-interface", "utun7"}}},
 		{"default route add on vmnet", Request{Name: "route", Args: []string{"-q", "-n", "add", "-inet", "default", "-interface", "bridge100"}}},
+		{"default route delete with unsafe interface form", Request{Name: "route", Args: []string{"-q", "-n", "delete", "-inet", "default", "-interface", "bridge100"}}},
 		{"default route delete on foreign interface", Request{Name: "route", Args: []string{"-q", "-n", "delete", "-inet", "default", "-interface", "en0"}}},
+		{"default route add with ifscope", Request{Name: "route", Args: []string{"-q", "-n", "add", "-inet", "default", "-ifscope", "bridge100"}}},
+		{"route get outside vmnet CIDR", Request{Name: "route", Args: []string{"-n", "get", "192.168.70.16"}}},
+		{"unconfigured CIDR with ifscope", Request{Name: "route", Args: []string{"-q", "-n", "add", "-inet", "10.244.1.0/24", "-ifscope", "utun7"}}},
 		{"unconfigured CIDR", Request{Name: "route", Args: []string{"-q", "-n", "add", "-inet", "10.250.0.0/24", "-interface", "utun7"}}},
 		{"route via foreign interface", Request{Name: "route", Args: []string{"-q", "-n", "add", "-inet", "10.244.1.0/24", "-interface", "en0"}}},
 		{"route flush", Request{Name: "route", Args: []string{"-n", "flush"}}},
@@ -235,6 +241,26 @@ func TestLintAnchorRulesetAllowsLocalVMServiceTarget(t *testing.T) {
 	rs := "rdr on bridge100 inet proto tcp from any to 10.96.0.1 port 80 -> 192.168.64.5 port 8080\n"
 	if err := p.lintAnchorRuleset(rs); err != nil {
 		t.Errorf("local VM service target should pass: %v", err)
+	}
+}
+
+func TestLintAnchorRulesetAllowsSecondaryAppleContainerBridge(t *testing.T) {
+	p := samplePolicy()
+	rs := "binat on bridge101 from 192.168.65.16 to any -> 10.244.1.5\n"
+	if err := p.lintAnchorRuleset(rs); err != nil {
+		t.Errorf("secondary apple/container bridge should pass: %v", err)
+	}
+}
+
+func TestLintAnchorRulesetAllowsMeshBinatButNotMeshRDR(t *testing.T) {
+	p := samplePolicy()
+	rs := "binat on utun7 from 192.168.65.16 to any -> 10.244.1.5\n"
+	if err := p.lintAnchorRuleset(rs); err != nil {
+		t.Errorf("mesh binat should pass: %v", err)
+	}
+	rs = "rdr on utun7 inet proto tcp from any to 10.96.0.1 port 80 -> 192.168.65.16 port 8080\n"
+	if err := p.lintAnchorRuleset(rs); err == nil {
+		t.Error("mesh rdr should be refused")
 	}
 }
 

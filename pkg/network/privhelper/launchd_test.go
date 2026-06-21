@@ -34,15 +34,16 @@ func TestResolveOwnerSpec(t *testing.T) {
 
 func testConfig(dir string) LaunchdConfig {
 	return LaunchdConfig{
-		Label:      "com.test.macvz-netd",
-		PlistDir:   filepath.Join(dir, "LaunchDaemons"),
-		BinaryPath: filepath.Join(dir, "sbin", "macvz-netd"),
-		SocketPath: filepath.Join(dir, "netd.sock"),
-		ConfigPath: "/etc/macvz/config.yaml",
-		OwnerUID:   501,
-		OwnerGID:   20,
-		StdoutPath: filepath.Join(dir, "out.log"),
-		StderrPath: filepath.Join(dir, "err.log"),
+		Label:         "com.test.macvz-netd",
+		PlistDir:      filepath.Join(dir, "LaunchDaemons"),
+		BinaryPath:    filepath.Join(dir, "sbin", "macvz-netd"),
+		SocketPath:    filepath.Join(dir, "netd.sock"),
+		ConfigPath:    "/etc/macvz/config.yaml",
+		OwnerUID:      501,
+		OwnerGID:      20,
+		StdoutPath:    filepath.Join(dir, "out.log"),
+		StderrPath:    filepath.Join(dir, "err.log"),
+		NewsyslogPath: filepath.Join(dir, "newsyslog.d", "macvz-netd.conf"),
 	}
 }
 
@@ -63,6 +64,9 @@ func TestRenderPlist(t *testing.T) {
 		"<string>501:20</string>",
 		"<key>RunAtLoad</key>",
 		"<key>KeepAlive</key>",
+		"<key>EnvironmentVariables</key>",
+		"<key>PATH</key>",
+		"<string>" + DefaultDaemonPath + "</string>",
 		"<string>" + cfg.StdoutPath + "</string>",
 	} {
 		if !strings.Contains(out, want) {
@@ -163,6 +167,8 @@ func (r *recordingRunner) run(_ context.Context, name string, args ...string) (s
 func TestInstallWritesPlistAndBinaryThenLoads(t *testing.T) {
 	dir := t.TempDir()
 	cfg := testConfig(dir)
+	cfg.StdoutPath = filepath.Join(dir, "logs", "netd", "out.log")
+	cfg.StderrPath = filepath.Join(dir, "logs", "netd", "err.log")
 
 	// A fake source binary to install.
 	src := filepath.Join(dir, "build", "macvz-netd")
@@ -186,6 +192,12 @@ func TestInstallWritesPlistAndBinaryThenLoads(t *testing.T) {
 		t.Errorf("binary not installed: %v", err)
 	} else if fi.Mode().Perm()&0o100 == 0 {
 		t.Errorf("installed binary not executable: %v", fi.Mode())
+	}
+	if _, err := os.Stat(cfg.NewsyslogPath); err != nil {
+		t.Errorf("newsyslog rotation config not written: %v", err)
+	}
+	if _, err := os.Stat(filepath.Dir(cfg.StdoutPath)); err != nil {
+		t.Errorf("log dir not created: %v", err)
 	}
 
 	// Install boots out any prior job, then bootstraps the new one.
@@ -220,7 +232,10 @@ func TestUninstallRemovesEverything(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(cfg.BinaryPath), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	for _, p := range []string{cfg.PlistPath(), cfg.BinaryPath, cfg.SocketPath} {
+	if err := os.MkdirAll(cfg.newsyslogDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{cfg.PlistPath(), cfg.BinaryPath, cfg.SocketPath, cfg.NewsyslogPath} {
 		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -231,7 +246,7 @@ func TestUninstallRemovesEverything(t *testing.T) {
 	if err := inst.Uninstall(context.Background()); err != nil {
 		t.Fatalf("Uninstall: %v", err)
 	}
-	for _, p := range []string{cfg.PlistPath(), cfg.BinaryPath, cfg.SocketPath} {
+	for _, p := range []string{cfg.PlistPath(), cfg.BinaryPath, cfg.SocketPath, cfg.NewsyslogPath} {
 		if _, err := os.Stat(p); !os.IsNotExist(err) {
 			t.Errorf("%q should be removed, stat err=%v", p, err)
 		}

@@ -70,10 +70,11 @@ addresses return to the pool and are reused.
 
 | Field | Default | Meaning |
 | --- | --- | --- |
-| `node.podCIDR` | _(empty)_ | Override for the Pod CIDR. When empty, MacVz waits for and uses the Kubernetes-assigned `Node.Spec.PodCIDR`. |
+| `node.podCIDR` | _(empty)_ | Pod CIDR for this node. When empty, MacVz waits for and uses the Kubernetes-assigned `Node.Spec.PodCIDR`; with `privilegedHelperSocket` + `podNetwork.enabled`, set it explicitly so the helper's static policy can validate pf rules. |
 
-Set `node.podCIDR` only on clusters that do **not** allocate node CIDRs; you must
-then give each node a disjoint range manually to preserve collision avoidance.
+Set `node.podCIDR` explicitly on clusters that do **not** allocate node CIDRs,
+and also on helper-managed Pod-network nodes. In both cases give each node a
+disjoint range manually to preserve collision avoidance.
 
 ### Graceful degradation
 
@@ -365,10 +366,10 @@ host-NAT path above needs no guest changes and works with stock
 `pf` must evaluate the MacVz anchor. Reference it from `/etc/pf.conf` once:
 
 ```
-nat-anchor "macvz/pods/*"
-rdr-anchor "macvz/pods/*"
-binat-anchor "macvz/pods/*"
-anchor "macvz/pods/*"
+nat-anchor "macvz/pods"
+rdr-anchor "macvz/pods"
+binat-anchor "macvz/pods"
+anchor "macvz/pods"
 ```
 
 `pfctl` and `sysctl` require elevated privileges. Identify the vmnet interface
@@ -383,13 +384,16 @@ backing the micro-VMs (commonly `bridge100`) with `ifconfig` and set it as
 | `podNetwork.interface` | vmnet interface the micro-VMs attach to (e.g. `bridge100`). |
 | `podNetwork.anchor` | pf anchor to manage (default `macvz/pods`). |
 | `podNetwork.enableForwarding` | Enable IPv4 forwarding (default `true`). |
-| `podNetwork.vmNetCIDRs` | Host-only vmnet CIDRs local micro-VMs may receive; used by `macvz-netd` to validate pf targets (default `192.168.64.0/24`). |
+| `podNetwork.vmNetCIDRs` | Host-only vmnet CIDRs local micro-VMs may receive; used by `macvz-netd` to validate pf targets (default `192.168.64.0/22`). |
 
 ```yaml
+node:
+  podCIDR: 10.244.1.0/24 # required here when privilegedHelperSocket is set
+
 podNetwork:
   enabled: true
   interface: bridge100
-  vmNetCIDRs: ["192.168.64.0/24"]
+  vmNetCIDRs: ["192.168.64.0/22"]
 ```
 
 ### Verifying

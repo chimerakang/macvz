@@ -1,0 +1,25 @@
+# RBAC for the Headlamp UI.
+#
+# This fixture is intentionally read-only: the `headlamp` ServiceAccount is bound
+# to the built-in `view` ClusterRole, so a browser user authenticating with this
+# account's token can list and inspect cluster resources but cannot mutate them.
+# This is the "RBAC-limited interaction" surface from issue #63 — run.sh proves
+# `can-i list pods` succeeds while `can-i delete pods` is denied.
+#
+# To grant write access, bind to `edit` (namespaced) or `cluster-admin` instead;
+# the manifest stays the same shape.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: macvz-headlamp-view
+  labels:
+    app.kubernetes.io/name: headlamp
+    app.kubernetes.io/part-of: macvz-headlamp-ui
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: view # built-in aggregated read-only role
+subjects:
+  - kind: ServiceAccount
+    name: headlamp
+    namespace: macvz-headlamp

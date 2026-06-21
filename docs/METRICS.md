@@ -18,7 +18,9 @@ same as logs/exec.
 | `GET /metrics/resource` | Prometheus text | metrics-server default scrape mode |
 
 Both draw from the same source each scrape: per-workload CPU and memory come
-from `apple/container` via `container stats`; node memory comes from the host.
+from `apple/container` via `container stats`; node memory comes from the host;
+node disk and image-cache usage come from `statfs` on the runtime's data root
+and `container image ls` (#68).
 
 ## Metric names & units
 
@@ -36,9 +38,13 @@ schema. MacVz populates:
 - **Containers** — per-container `cpu` (`usageCoreNanoSeconds`, plus
   `usageNanoCores` after the first sample) and `memory` (`workingSetBytes` /
   `usageBytes`, and `availableBytes` when the VM has a memory limit).
+- **Node disk** (#68) — `fs` reports the filesystem backing micro-VM and image
+  storage (`capacityBytes`, `usedBytes`, `availableBytes`, and inode counts),
+  which is what disk-pressure eviction reads; `runtime.imageFs.usedBytes`
+  reports the bytes consumed by the local image cache on that same filesystem.
 
 Units follow the schema: CPU is core-nanoseconds (cumulative) and nanocores
-(rate); memory is bytes.
+(rate); memory and disk are bytes.
 
 ### Resource metrics (`/metrics/resource`)
 
@@ -55,9 +61,16 @@ them without extra configuration:
 | `container_memory_working_set_bytes` | gauge | bytes | `container`, `pod`, `namespace` |
 | `macvz_node_pods` | gauge | count | — |
 | `macvz_runtime_ready` | gauge | 0/1 | — |
+| `macvz_node_filesystem_capacity_bytes` | gauge | bytes | — |
+| `macvz_node_filesystem_used_bytes` | gauge | bytes | — |
+| `macvz_node_filesystem_available_bytes` | gauge | bytes | — |
+| `macvz_image_cache_bytes` | gauge | bytes | — |
+| `macvz_image_cache_images` | gauge | count | — |
 
-`macvz_node_pods` and `macvz_runtime_ready` are MacVz-specific; metrics-server
-ignores unrecognized families.
+The `macvz_*` families are MacVz-specific; metrics-server ignores unrecognized
+families. The disk and image-cache gauges complement the Summary API's `fs`
+stats for operators scraping Prometheus directly. The standard kubelet resource
+endpoint defines no per-Pod disk series, so disk is reported only at node scope.
 
 ## Inspecting metrics
 
@@ -90,5 +103,19 @@ kubectl top pod -n <namespace>
 - **Node memory is macOS-only.** It is derived from `sysctl hw.memsize` and
   `vm_stat` (active + wired + compressed pages, matching the density benchmark).
   On non-macOS builds the node entry omits memory.
-- **No filesystem, network-per-pod, or PSI stats** are reported yet; only CPU
-  and memory are populated.
+- **Disk is node-scoped, not per-Pod.** MacVz reports the data-root filesystem
+  and image-cache size at node scope (#68). It does not yet attribute ephemeral
+  storage to individual Pods/containers, so the Summary API omits per-Pod
+  `ephemeral-storage` usage. Image-cache bytes are the sum of `container image
+  ls` per-image sizes — an upper bound when images share layers.
+- **No network-per-pod or PSI stats** are reported yet.
+
+## Node ephemeral-storage capacity
+
+When the runtime can report disk, MacVz advertises the node's
+`ephemeral-storage` resource (#68): capacity from the data-root filesystem's
+total size and allocatable from its available bytes, so the scheduler accounts
+for disk. An explicit `ephemeral-storage` in the node config is left untouched
+(operator intent wins). The sampled filesystem is `runtimeDataRoot`; when it is
+empty, MacVz falls back to the operator's home directory — the standard
+per-user volume where `apple/container` stores micro-VM and image data.

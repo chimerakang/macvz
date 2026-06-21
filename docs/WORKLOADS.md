@@ -50,15 +50,60 @@ Each restart increments the container's `RestartCount`, visible in
   still fails fast with a sticky `Failed` status and an actionable message,
   regardless of restart policy.
 
+## Kubelet restart recovery (#66)
+
+`apple/container` micro-VMs outlive the `macvz-kubelet` process: restarting (or
+upgrading) the kubelet does not stop running workloads. The provider keeps its
+Pod→workload map only in memory, so on restart it must re-attach to the VMs that
+are still running rather than rebuild them.
+
+Recovery hangs off two facts that make it deterministic, not stateful:
+
+1. A workload's ID is a pure function of the Pod's identity
+   (`WorkloadID(namespace, name, container)`), so the VM backing a given Pod can
+   be found again by name without any persisted bookkeeping.
+2. Each Pod's IP is restored *before* the Pod controller runs by
+   `RecoverAllocations`, which reserves the `Status.PodIP` already recorded on
+   the API server. The recovered Pod therefore keeps the same IP it advertised
+   in its EndpointSlices.
+
+When Virtual Kubelet replays its Pods after a restart, `CreatePod` probes the
+runtime for the Pod's deterministic workload ID. If a micro-VM is already there,
+the provider **adopts** it: it skips the image pull and create, records the
+existing workload, re-attaches the Pod network path, and resumes probing. A VM
+already in `Running` is left untouched; a VM stranded in `Created` because the
+previous kubelet died between create and start is started in place. Only a Pod
+with no surviving VM takes the normal pull/create/start path.
+
+Adopting instead of recreating matters for more than speed: a re-pull could now
+fail (for example, a private-registry `imagePullSecret` rotated since the VM
+started), which would strand a perfectly healthy container in a failing Pod. The
+driver's `Create` is idempotent as a backstop, so even if the probe misses on a
+transient runtime error, recovery can never duplicate a VM. If the network
+re-attach fails mid-recovery, the adopted VM is left running (not destroyed) so
+the next reconcile can retry.
+
+Restart counts are not persisted; an adopted container resumes from
+`RestartCount` 0. The container itself is the same process that was running
+before the kubelet restarted.
+
 ## Validation
 
 - Provider unit tests in `pkg/provider/restart_test.go` cover the policy
   decision table, backoff growth/cap, an `Always` restart of an exited workload,
   `OnFailure` skipping a clean exit, `Never` staying terminal, and the
   `CrashLoopBackOff` waiting state.
+- Kubelet restart recovery (#66) is covered in `pkg/provider/pod_test.go`:
+  adopting an already-running micro-VM without pull/create/start, and adoption
+  succeeding even when the image can no longer be pulled (rotated pull Secret),
+  starting a recovered VM that was left in `Created`, and handing a recovered
+  `Stopped` VM to the normal restart loop.
 - Manual smoke: `kubectl create deployment web --image=nginx` should roll out to
   `Running` on a MacVz node; deleting the backing micro-VM, or running an image
   that exits, should show `RestartCount` climb while the Deployment self-heals.
+- Manual restart smoke: with a Pod `Running`, restart `macvz-kubelet`; the Pod
+  should return to `Running` with the same Pod IP and **no** new image pull or
+  micro-VM in `container ls`.
 
 ## ConfigMaps (#46)
 

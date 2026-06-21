@@ -1,0 +1,23 @@
+# ClusterIP Service for Headlamp.
+#
+# Browser access is via `kubectl port-forward` (see README.md): a MacVz virtual
+# node runs no kube-proxy, so a NodePort/LoadBalancer Service has nowhere to
+# program on the node. port-forward (#28) is the supported, documented path and
+# needs only this ClusterIP Service. Exposing the UI without port-forward is
+# tracked as a follow-up (Ingress / gateway integration).
+apiVersion: v1
+kind: Service
+metadata:
+  name: headlamp
+  namespace: macvz-headlamp
+  labels:
+    app.kubernetes.io/name: headlamp
+    app.kubernetes.io/part-of: macvz-headlamp-ui
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: headlamp
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

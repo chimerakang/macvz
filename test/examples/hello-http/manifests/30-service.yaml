@@ -1,0 +1,19 @@
+# A normal ClusterIP Service in front of the hello Deployment. It is the stable
+# target for `kubectl port-forward svc/hello`, which is the browser-visible
+# access path: port-forward resolves the Service to a backing Pod and proxies a
+# local port into the micro-VM (see pkg/provider/portforward.go).
+apiVersion: v1
+kind: Service
+metadata:
+  name: hello
+  namespace: macvz-hello
+  labels:
+    app: hello
+    app.kubernetes.io/part-of: macvz-hello-http
+spec:
+  selector:
+    app: hello
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

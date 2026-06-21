@@ -97,8 +97,9 @@ On **each** Mac that will be a node:
   ```
 - A **shared Kubernetes control plane** reachable from every node, with
   `--allocate-node-cidrs=true` and a `--cluster-cidr` so each node gets a
-  disjoint `Spec.PodCIDR`. (Override with `node.podCIDR` only if your cluster
-  does not allocate node CIDRs.)
+  disjoint `Spec.PodCIDR`. When using the privileged helper with
+  `podNetwork.enabled`, also copy that assigned CIDR into `node.podCIDR` in this
+  node's config so the helper's static policy can validate pf rules.
 - **UDP 51820 open** between the hosts (the WireGuard endpoint port). If a host
   firewall is on, allow it explicitly.
 - The built `bin/macvz-kubelet` and `bin/macvz-netd` (`make build`) copied to
@@ -190,7 +191,8 @@ Field reference: see [NETWORKING.md → mesh Configuration](NETWORKING.md#config
 
 `podNetwork` enables the host-side path that maps each Pod IP to its micro-VM's
 host-only vmnet address (1:1 NAT via a pf `binat`) and programs ClusterIP `rdr`
-rules. Add to each node's config:
+rules. Add to each node's config, and make sure `node.podCIDR` is set to this
+node's assigned Pod CIDR so the helper can validate translated Pod IPs:
 
 ```yaml
 podNetwork:
@@ -198,7 +200,7 @@ podNetwork:
   interface: bridge100        # the vmnet bridge apple/container attaches VMs to
   anchor: macvz/pods          # default; the only anchor the helper will touch
   enableForwarding: true      # default; flips net.inet.ip.forwarding to 1
-  vmNetCIDRs: ["192.168.64.0/24"] # default; adjust if your vmnet range differs
+  vmNetCIDRs: ["192.168.64.0/22"] # default; adjust if your vmnet range differs
 ```
 
 **Selecting the bridge.** `apple/container` attaches each micro-VM to a
@@ -228,10 +230,10 @@ hook lines must respect pf's ordering rule — **translation anchors
 (nat/rdr/binat) before filter anchors**:
 
 ```
-nat-anchor "macvz/pods/*"
-rdr-anchor "macvz/pods/*"
-binat-anchor "macvz/pods/*"
-anchor "macvz/pods/*"
+nat-anchor "macvz/pods"
+rdr-anchor "macvz/pods"
+binat-anchor "macvz/pods"
+anchor "macvz/pods"
 ```
 
 On a stock macOS `pf.conf` (which ships `com.apple` anchors), the translation

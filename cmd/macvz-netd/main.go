@@ -230,7 +230,8 @@ func runInstall(args []string) error {
 	}
 	klog.InfoS("macvz-netd installed and started",
 		"plist", cfg.PlistPath(), "binary", cfg.BinaryPath, "socket", cfg.SocketPath,
-		"config", cfg.ConfigPath, "owner", fmt.Sprintf("%d:%d", uid, gid), "logs", cfg.StdoutPath)
+		"config", cfg.ConfigPath, "owner", fmt.Sprintf("%d:%d", uid, gid),
+		"logs", cfg.StdoutPath, "logRotation", cfg.NewsyslogPath)
 	if cfg.AllowUnsafeNoConfig {
 		klog.Warning("installed with --allow-unsafe-no-config: per-request policy validation is disabled. Reinstall with --config <path> to confine the helper to this node's interfaces/CIDRs/peers/anchor (#41).")
 	}

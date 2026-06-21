@@ -63,13 +63,13 @@ func TestGenerateConfigMeshAndPodNetwork(t *testing.T) {
 	for _, want := range []string{
 		"privilegedHelperSocket: /var/run/macvz-netd.sock",
 		"mesh:\n  enabled: true",
-		"interface: utun7",           // default applied
-		"listenPort: 51820",          // default applied
+		"interface: utun7",                         // default applied
+		"listenPort: 51820",                        // default applied
 		"privateKeyFile: /etc/macvz/wireguard.key", // default applied
 		"name: macvz-b",
 		"podNetwork:\n  enabled: true",
 		"interface: bridge100",
-		`vmNetCIDRs: ["192.168.64.0/24"]`, // default applied
+		`vmNetCIDRs: ["192.168.64.0/22"]`, // default applied
 		`clusterDNS: ["10.96.0.10"]`,
 	} {
 		if !strings.Contains(out, want) {
@@ -94,6 +94,13 @@ func TestGenerateConfigValidation(t *testing.T) {
 		"tls cert only":  {NodeName: "n", InternalIP: "1.2.3.4", KubeconfigPath: "/k", ServingTLSCertFile: "c"},
 		"mesh no helper": {NodeName: "n", InternalIP: "1.2.3.4", KubeconfigPath: "/k", Mesh: &MeshParams{Address: "10.99.0.1/32"}},
 		"mesh bad addr":  {NodeName: "n", InternalIP: "1.2.3.4", KubeconfigPath: "/k", PrivilegedHelperSocket: "/s", Mesh: &MeshParams{Address: "10.99.0.1"}},
+		"podnet helper no pod cidr": {
+			NodeName:               "n",
+			InternalIP:             "1.2.3.4",
+			KubeconfigPath:         "/k",
+			PrivilegedHelperSocket: "/s",
+			PodNetwork:             &PodNetworkParams{Interface: "bridge100"},
+		},
 	}
 	for name, p := range cases {
 		t.Run(name, func(t *testing.T) {

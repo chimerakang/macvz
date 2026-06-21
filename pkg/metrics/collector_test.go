@@ -46,7 +46,7 @@ func TestSummaryReportsNodeAndPodStats(t *testing.T) {
 		"default/web/app": {CPUUsageCoreNanoSeconds: 5_000_000_000, MemoryUsageBytes: 100 << 20, MemoryLimitBytes: 512 << 20},
 	})
 
-	s := c.Summary(context.Background(), onePod(), stats)
+	s := c.Summary(context.Background(), onePod(), stats, nil)
 
 	if s.Node.NodeName != "mac-1" {
 		t.Errorf("node name = %q, want mac-1", s.Node.NodeName)
@@ -96,7 +96,7 @@ func TestSummaryComputesNanocoreRateAcrossSamples(t *testing.T) {
 		"default/web/app": {Timestamp: timeAt(1), CPUUsageCoreNanoSeconds: 3_000_000_000},
 	})
 
-	s := c.Summary(context.Background(), pods, stats)
+	s := c.Summary(context.Background(), pods, stats, nil)
 	cs := s.Pods[0].Containers[0]
 	if cs.CPU == nil || cs.CPU.UsageNanoCores == nil {
 		t.Fatalf("expected a nanocore rate, got %v", cs.CPU)
@@ -109,7 +109,7 @@ func TestSummaryComputesNanocoreRateAcrossSamples(t *testing.T) {
 func TestSummaryDegradesWhenRuntimeCannotSample(t *testing.T) {
 	c := NewCollector("mac-1", fakeMem{total: 8 << 30, used: 1 << 30})
 	// statsMap with no entries -> every workload is unavailable.
-	s := c.Summary(context.Background(), onePod(), statsMap(nil))
+	s := c.Summary(context.Background(), onePod(), statsMap(nil), nil)
 
 	p := s.Pods[0]
 	if *p.CPU.UsageCoreNanoSeconds != 0 {
@@ -126,7 +126,7 @@ func TestSummaryDegradesWhenRuntimeCannotSample(t *testing.T) {
 
 func TestSummaryOmitsNodeMemoryOnSamplerError(t *testing.T) {
 	c := NewCollector("mac-1", fakeMem{err: context.DeadlineExceeded})
-	s := c.Summary(context.Background(), onePod(), statsMap(nil))
+	s := c.Summary(context.Background(), onePod(), statsMap(nil), nil)
 	if s.Node.Memory != nil {
 		t.Errorf("node memory should be omitted when sampler fails, got %v", s.Node.Memory)
 	}
@@ -138,7 +138,7 @@ func TestResourceMetricsEmitsStandardFamilies(t *testing.T) {
 		"default/web/app": {CPUUsageCoreNanoSeconds: 4_000_000_000, MemoryUsageBytes: 50 << 20},
 	})
 
-	families := c.ResourceMetrics(context.Background(), onePod(), stats, true)
+	families := c.ResourceMetrics(context.Background(), onePod(), stats, nil, true)
 	byName := map[string]*dto.MetricFamily{}
 	for _, f := range families {
 		byName[f.GetName()] = f
@@ -179,7 +179,7 @@ func TestForgetEvictsStaleRateState(t *testing.T) {
 	c.prev["gone/old/c"] = cpuSample{coreNanoSeconds: 1}
 	c.prev[nodeCPUKey] = cpuSample{coreNanoSeconds: 2}
 
-	c.Summary(context.Background(), onePod(), statsMap(nil))
+	c.Summary(context.Background(), onePod(), statsMap(nil), nil)
 
 	if _, ok := c.prev["gone/old/c"]; ok {
 		t.Error("stale workload rate state should be evicted")

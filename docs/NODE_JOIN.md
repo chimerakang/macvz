@@ -21,7 +21,7 @@ ready-to-run example.
 | Cluster kubeconfig | `--kubeconfig` | always | Credentials to reach the existing API server. No control plane is created. |
 | Node name | `--node-name` | always | Kubernetes node name to register as. |
 | Internal IP | `--internal-ip` | always | The node's reachable IPv4 (API server connects here for logs/exec). |
-| Pod CIDR | `--pod-cidr` | clusters without node-CIDR allocation | Omit when Kubernetes assigns `Node.Spec.PodCIDR`. |
+| Pod CIDR | `--pod-cidr` | Pod network with `--helper-socket`, or clusters without node-CIDR allocation | With the privileged helper, copy this node's assigned `Node.Spec.PodCIDR` into config so the helper policy can validate pf rules. |
 | Cluster DNS | `--cluster-dns` | ClusterIP DNS in-VM | CoreDNS/kube-dns ClusterIP, e.g. `10.96.0.10`. |
 | Helper socket | `--helper-socket` | mesh or Pod network on | macvz-netd unix socket; the kubelet runs as your user and routes pf/wg/route through it. |
 | Mesh address | `--mesh-address` | cross-host networking | This node's mesh address in CIDR form, e.g. `10.99.0.1/32`. Enables the mesh stanza. |

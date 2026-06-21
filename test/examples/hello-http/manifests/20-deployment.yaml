@@ -1,0 +1,87 @@
+# The hello Deployment: a single, unmodified public nginx image (arm64
+# multi-arch) serving a static page from the hello-page ConfigMap. This is the
+# minimal "real HTTP application" for issue #61 — no custom build, no registry
+# auth, just a stock upstream image running inside a MacVz micro-VM.
+#
+# replicas defaults to 1 (single-node demo). On a multi-node baseline, scale it
+# up (`kubectl -n macvz-hello scale deploy/hello --replicas=N`) and the Service
+# load-balances across whichever virtual nodes the Pods land on; each reply names
+# its own pod/node, so a browser refresh shows the spread.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hello
+  namespace: macvz-hello
+  labels:
+    app: hello
+    app.kubernetes.io/part-of: macvz-hello-http
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hello
+  template:
+    metadata:
+      labels:
+        app: hello
+        app.kubernetes.io/part-of: macvz-hello-http
+    spec:
+      # Land on a MacVz virtual node and tolerate its provider taint.
+      nodeSelector:
+        type: virtual-kubelet
+      tolerations:
+        - key: virtual-kubelet.io/provider
+          operator: Exists
+          effect: NoSchedule
+      volumes:
+        # The ConfigMap is mounted read-only as an envsubst template; the rendered
+        # page is written to an emptyDir that nginx serves.
+        - name: tpl
+          configMap:
+            name: hello-page
+        - name: html
+          emptyDir: {}
+      containers:
+        - name: nginx
+          image: nginx:1.27-alpine
+          # Substitute the Downward API values into the template, then hand off to
+          # the stock nginx entrypoint. envsubst ships in the nginx:alpine image.
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              envsubst '${POD_NAME} ${NODE_NAME}' \
+                < /tmp/tpl/index.html > /usr/share/nginx/html/index.html
+              echo "macvz-hello nginx starting pod=${POD_NAME} node=${NODE_NAME}"
+              exec /docker-entrypoint.sh nginx -g 'daemon off;'
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          ports:
+            - name: http
+              containerPort: 80
+          volumeMounts:
+            - name: tpl
+              mountPath: /tmp/tpl
+              readOnly: true
+            - name: html
+              mountPath: /usr/share/nginx/html
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10

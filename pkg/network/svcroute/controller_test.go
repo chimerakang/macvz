@@ -184,6 +184,48 @@ func TestReconcileAttachesAndDetaches(t *testing.T) {
 	}
 }
 
+func TestReconcileFiltersUnroutableBackends(t *testing.T) {
+	ctx := context.Background()
+	router := newFakeRouter()
+	svcs := fakeServices{
+		// default/kubernetes-style Service: its backend is the host-network
+		// apiserver, outside any MacVz Pod/vmnet CIDR.
+		"default/kubernetes": clusterIPService("default", "kubernetes", "10.96.0.1", corev1.ServicePort{Protocol: corev1.ProtocolTCP, Port: 443}),
+		// A normal Service backed by a local MacVz Pod.
+		"default/hello": clusterIPService("default", "hello", "10.96.0.50", corev1.ServicePort{Protocol: corev1.ProtocolTCP, Port: 80}),
+	}
+	slices := fakeSlices{
+		"default/kubernetes": {slice("default", "kubernetes", true, "172.21.0.2", discoveryv1.EndpointPort{Name: ptrStr(""), Port: ptrI32(6443)})},
+		"default/hello":      {slice("default", "hello", true, "10.244.101.2", discoveryv1.EndpointPort{Name: ptrStr(""), Port: ptrI32(8080)})},
+	}
+	c := newController(router, svcs, slices)
+	WithRoutableCIDRs([]string{"10.244.101.0/24"})(c)
+
+	// The unroutable Service must be detached, never attached: its sole backend is
+	// dropped, leaving no rule, so it cannot poison the shared anchor.
+	if err := c.reconcile(ctx, "default/kubernetes"); err != nil {
+		t.Fatalf("reconcile kubernetes: %v", err)
+	}
+	if _, ok := router.attached["default/kubernetes"]; ok {
+		t.Errorf("unroutable Service must not be attached, attached=%v", router.attached)
+	}
+	if router.detached["default/kubernetes"] == 0 {
+		t.Errorf("unroutable Service should be detached")
+	}
+
+	// The routable Service is attached, with its local backend preserved.
+	if err := c.reconcile(ctx, "default/hello"); err != nil {
+		t.Fatalf("reconcile hello: %v", err)
+	}
+	rules, ok := router.attached["default/hello"]
+	if !ok {
+		t.Fatalf("routable Service should be attached, attached=%v", router.attached)
+	}
+	if len(rules) != 1 || len(rules[0].Backends) != 1 || rules[0].Backends[0] != "10.244.101.2" {
+		t.Errorf("expected the local backend kept, got %+v", rules)
+	}
+}
+
 func TestReconcileDetachesWhenBackendsGone(t *testing.T) {
 	ctx := context.Background()
 	router := newFakeRouter()

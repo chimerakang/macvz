@@ -132,7 +132,10 @@ func (rt *Router) Services() []string {
 // attached to the vmnet interface, so no extra route is needed), while a backend
 // on another Mac keeps its Pod IP and is reached over the WireGuard mesh route.
 // Output is deterministic: services, rules, and backends are all sorted.
-func renderServiceRules(iface string, services map[string][]ServiceRule, vmipByPodIP map[string]string) string {
+func renderServiceRules(ifaces []string, services map[string][]ServiceRule, vmipByPodIP map[string]string) string {
+	if len(ifaces) == 0 {
+		return ""
+	}
 	keys := make([]string, 0, len(services))
 	for k := range services {
 		keys = append(keys, k)
@@ -160,13 +163,15 @@ func renderServiceRules(iface string, services map[string][]ServiceRule, vmipByP
 			sort.Strings(targets)
 
 			fmt.Fprintf(&b, "# %s %s:%d -> :%d\n", r.ServiceKey, r.ClusterIP, r.Port, r.TargetPort)
-			if len(targets) == 1 {
-				fmt.Fprintf(&b, "rdr on %s inet proto %s from any to %s port %d -> %s port %d\n",
-					iface, r.Protocol, r.ClusterIP, r.Port, targets[0], r.TargetPort)
-				continue
+			for _, iface := range ifaces {
+				if len(targets) == 1 {
+					fmt.Fprintf(&b, "rdr on %s inet proto %s from any to %s port %d -> %s port %d\n",
+						iface, r.Protocol, r.ClusterIP, r.Port, targets[0], r.TargetPort)
+					continue
+				}
+				fmt.Fprintf(&b, "rdr on %s inet proto %s from any to %s port %d -> { %s } port %d round-robin\n",
+					iface, r.Protocol, r.ClusterIP, r.Port, strings.Join(targets, ", "), r.TargetPort)
 			}
-			fmt.Fprintf(&b, "rdr on %s inet proto %s from any to %s port %d -> { %s } port %d round-robin\n",
-				iface, r.Protocol, r.ClusterIP, r.Port, strings.Join(targets, ", "), r.TargetPort)
 		}
 	}
 	return b.String()

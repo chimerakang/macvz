@@ -28,6 +28,7 @@ node:
   kubeletPort: 10250
   servingTLSCertFile: /etc/macvz/pki/kubelet.crt
   servingTLSKeyFile: /etc/macvz/pki/kubelet.key
+  statusUpdateInterval: 10s
 
   # Cluster DNS so micro-VMs resolve Service names (#37). Set to your cluster's
   # CoreDNS ClusterIP (`kubectl -n kube-system get svc kube-dns`).

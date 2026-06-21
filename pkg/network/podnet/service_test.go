@@ -180,10 +180,34 @@ func TestRenderServiceRulesDeterministic(t *testing.T) {
 		"default/b": {{ServiceKey: "default/b", ClusterIP: "10.96.0.2", Protocol: "tcp", Port: 80, TargetPort: 8080, Backends: []string{"10.244.1.3"}}},
 	}
 	vmip := map[string]string{}
-	first := renderServiceRules("bridge100", services, vmip)
-	second := renderServiceRules("bridge100", services, vmip)
+	first := renderServiceRules([]string{"bridge100"}, services, vmip)
+	second := renderServiceRules([]string{"bridge100"}, services, vmip)
 	if first != second {
 		t.Error("renderServiceRules is not deterministic")
+	}
+}
+
+func TestAttachServiceRendersEveryLocalVMNetInterface(t *testing.T) {
+	fr := newFakeRunner()
+	rt, ctx := startedRouter(t, fr)
+	if err := rt.Attach(ctx, Endpoint{PodKey: "default/be", PodIP: "10.244.101.2", VMIP: "192.168.65.5"}); err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	rule := ServiceRule{
+		ServiceKey: "default/hello", ClusterIP: "10.96.0.50", Protocol: "tcp",
+		Port: 80, TargetPort: 8080, Backends: []string{"10.244.101.2"},
+	}
+	if err := rt.AttachService(ctx, "default/hello", []ServiceRule{rule}); err != nil {
+		t.Fatalf("AttachService: %v", err)
+	}
+	rules, _ := fr.lastAnchorLoad()
+	for _, want := range []string{
+		"rdr on bridge100 inet proto tcp from any to 10.96.0.50 port 80 -> 192.168.65.5 port 8080",
+		"rdr on bridge101 inet proto tcp from any to 10.96.0.50 port 80 -> 192.168.65.5 port 8080",
+	} {
+		if !strings.Contains(rules, want) {
+			t.Errorf("anchor missing local interface rdr %q\n---\n%s", want, rules)
+		}
 	}
 }
 
@@ -202,7 +226,13 @@ func TestServiceAndBinatRulesCoexist(t *testing.T) {
 	if !strings.Contains(rules, "binat on bridge100 from 192.168.64.5 to any -> 10.244.101.2") {
 		t.Errorf("binat rule missing\n---\n%s", rules)
 	}
+	if !strings.Contains(rules, "binat on utun7 from 192.168.64.5 to any -> 10.244.101.2") {
+		t.Errorf("mesh ingress binat rule missing\n---\n%s", rules)
+	}
 	if !strings.Contains(rules, "rdr on bridge100 inet proto tcp from any to 10.96.0.50") {
 		t.Errorf("rdr rule missing\n---\n%s", rules)
+	}
+	if strings.Contains(rules, "rdr on utun7") {
+		t.Errorf("service rdr should stay on vmnet interfaces only\n---\n%s", rules)
 	}
 }

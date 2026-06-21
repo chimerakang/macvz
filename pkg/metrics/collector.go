@@ -9,12 +9,13 @@
 //     text format consumed by metrics-server's default scrape mode.
 //
 // Per-workload CPU and memory come from the runtime via the optional
-// runtime.Stater capability; node memory comes from the host. A Collector owns
-// the small amount of state needed to turn cumulative CPU counters into the
-// instantaneous nanocore rates the Summary schema expects. Everything degrades
-// gracefully: a workload the runtime cannot sample is reported without
-// CPU/memory rather than failing the whole scrape, and a host that cannot
-// report memory yields a node entry without memory stats.
+// runtime.Stater capability; node memory comes from the host; node disk and
+// image-cache accounting come from the optional runtime.DiskReporter capability.
+// A Collector owns the small amount of state needed to turn cumulative CPU
+// counters into the instantaneous nanocore rates the Summary schema expects.
+// Everything degrades gracefully: a workload the runtime cannot sample is
+// reported without CPU/memory rather than failing the whole scrape, and a host
+// or runtime that cannot report node-level resources simply omits those fields.
 package metrics
 
 import (
@@ -58,6 +59,22 @@ type PodInput struct {
 // the collector can skip that workload's CPU/memory without failing.
 type StatsFunc func(ctx context.Context, workloadID string) (stats runtime.ResourceStats, ok bool)
 
+// DiskSample is the node-level disk snapshot for one scrape: the filesystem
+// backing micro-VM/image storage and the local image cache. Each surface
+// carries its own ok flag so a node that can report one but not the other still
+// contributes what it has.
+type DiskSample struct {
+	NodeFS   runtime.FilesystemUsage
+	NodeFSOK bool
+	Images   runtime.ImageCacheUsage
+	ImagesOK bool
+}
+
+// DiskFunc fetches the node disk snapshot for a scrape. It is nil when the
+// runtime exposes no DiskReporter capability, in which case the collector omits
+// all filesystem and image-cache accounting.
+type DiskFunc func(ctx context.Context) DiskSample
+
 // nodeCPUKey is the reserved key under which the node-aggregate CPU sample is
 // stored in the rate cache; no workload ID can collide with it.
 const nodeCPUKey = "\x00node"
@@ -96,6 +113,7 @@ type snapshot struct {
 	memOK     bool
 	memTotal  uint64
 	memUsed   uint64
+	disk      DiskSample
 	pods      []podSnapshot
 	nodeCPUNs uint64 // sum of container cumulative CPU, core-nanoseconds
 	nodeMemWS uint64 // sum of container working-set bytes
@@ -116,14 +134,20 @@ type containerSnapshot struct {
 	ok    bool
 }
 
-// gather samples host memory and every workload once.
-func (c *Collector) gather(ctx context.Context, at time.Time, pods []PodInput, statsFn StatsFunc) snapshot {
+// gather samples host memory, disk, and every workload once. diskFn is nil when
+// the runtime cannot report disk, in which case no filesystem/image accounting
+// is collected.
+func (c *Collector) gather(ctx context.Context, at time.Time, pods []PodInput, statsFn StatsFunc, diskFn DiskFunc) snapshot {
 	s := snapshot{at: at}
 
 	if c.mem != nil {
 		if total, used, err := c.mem.HostMemory(ctx); err == nil {
 			s.memOK, s.memTotal, s.memUsed = true, total, used
 		}
+	}
+
+	if diskFn != nil {
+		s.disk = diskFn(ctx)
 	}
 
 	for _, p := range pods {
@@ -183,9 +207,10 @@ func (c *Collector) forget(live map[string]struct{}) {
 }
 
 // Summary builds the kubelet stats Summary for this node from the given Pods.
-func (c *Collector) Summary(ctx context.Context, pods []PodInput, statsFn StatsFunc) *statsv1alpha1.Summary {
+// diskFn is nil when the runtime reports no disk usage.
+func (c *Collector) Summary(ctx context.Context, pods []PodInput, statsFn StatsFunc, diskFn DiskFunc) *statsv1alpha1.Summary {
 	now := time.Now()
-	s := c.gather(ctx, now, pods, statsFn)
+	s := c.gather(ctx, now, pods, statsFn, diskFn)
 
 	live := make(map[string]struct{}, len(pods))
 	for _, p := range pods {
@@ -224,7 +249,60 @@ func (c *Collector) nodeStats(s snapshot) statsv1alpha1.NodeStats {
 			WorkingSetBytes: u64(s.memUsed),
 		}
 	}
+
+	// Node filesystem stats drive disk-pressure eviction. Image-cache accounting
+	// is independent: if statfs fails but the runtime can list cached images,
+	// still report runtime.imageFs.usedBytes rather than dropping the sample.
+	if s.disk.NodeFSOK {
+		ns.Fs = fsStats(s.disk.NodeFS, s.at)
+	}
+	if s.disk.ImagesOK {
+		ns.Runtime = &statsv1alpha1.RuntimeStats{ImageFs: imageFsStats(s.disk, s.at)}
+	}
 	return ns
+}
+
+// fsStats maps a runtime filesystem sample to the kubelet FsStats schema, using
+// fallback for the timestamp when the sample did not carry one.
+func fsStats(fu runtime.FilesystemUsage, fallback time.Time) *statsv1alpha1.FsStats {
+	at := fu.Timestamp
+	if at.IsZero() {
+		at = fallback
+	}
+	out := &statsv1alpha1.FsStats{
+		Time:           metav1.NewTime(at),
+		CapacityBytes:  u64(fu.TotalBytes),
+		UsedBytes:      u64(fu.UsedBytes),
+		AvailableBytes: u64(fu.AvailableBytes),
+	}
+	if fu.TotalInodes > 0 {
+		free := uint64(0)
+		if fu.TotalInodes > fu.UsedInodes {
+			free = fu.TotalInodes - fu.UsedInodes
+		}
+		out.Inodes = u64(fu.TotalInodes)
+		out.InodesUsed = u64(fu.UsedInodes)
+		out.InodesFree = u64(free)
+	}
+	return out
+}
+
+func imageFsStats(d DiskSample, fallback time.Time) *statsv1alpha1.FsStats {
+	at := d.Images.Timestamp
+	if at.IsZero() {
+		at = fallback
+	}
+	out := &statsv1alpha1.FsStats{
+		Time:      metav1.NewTime(at),
+		UsedBytes: u64(d.Images.TotalBytes),
+	}
+	if d.NodeFSOK {
+		base := fsStats(d.NodeFS, fallback)
+		base.Time = metav1.NewTime(at)
+		base.UsedBytes = out.UsedBytes
+		return base
+	}
+	return out
 }
 
 func (c *Collector) podStats(ps podSnapshot, now time.Time) statsv1alpha1.PodStats {

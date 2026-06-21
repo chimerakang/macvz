@@ -11,6 +11,7 @@ package svcroute
 import (
 	"context"
 	"fmt"
+	"net"
 	"sort"
 	"strings"
 
@@ -157,10 +158,55 @@ type Controller struct {
 	slices    sliceLister
 	queue     workqueue.TypedRateLimitingInterface[string]
 	hasSynced []cache.InformerSynced
+
+	// routable, when non-nil, reports whether a backend IP is one MacVz can
+	// actually DNAT to (a local-vmnet or mesh-reachable Pod). Backends outside it
+	// — host-network endpoints like the kube-apiserver behind the always-present
+	// default/kubernetes Service, or Pods on non-MacVz nodes — are filtered out
+	// before programming, so an unroutable Service cannot poison the shared pf
+	// anchor and block Pod attachment. Nil means "no filtering" (every backend is
+	// kept), which is the historical behaviour the unit tests exercise.
+	routable func(ip string) bool
+}
+
+// Option customises a Controller.
+type Option func(*Controller)
+
+// WithRoutableCIDRs restricts programmed Service backends to the given CIDRs —
+// the MacVz node's own Pod/vmnet ranges plus any mesh-peer Pod CIDRs. Backends
+// outside every CIDR are dropped (and a Service left with none is not
+// programmed). Unparseable CIDRs are ignored. An empty list installs no filter.
+func WithRoutableCIDRs(cidrs []string) Option {
+	nets := make([]*net.IPNet, 0, len(cidrs))
+	for _, c := range cidrs {
+		if c == "" {
+			continue
+		}
+		if _, n, err := net.ParseCIDR(c); err == nil {
+			nets = append(nets, n)
+		}
+	}
+	return func(ctrl *Controller) {
+		if len(nets) == 0 {
+			return
+		}
+		ctrl.routable = func(ip string) bool {
+			parsed := net.ParseIP(ip)
+			if parsed == nil {
+				return false
+			}
+			for _, n := range nets {
+				if n.Contains(parsed) {
+					return true
+				}
+			}
+			return false
+		}
+	}
 }
 
 // New builds a Controller from a cluster-wide (all-namespace) informer factory.
-func New(router Router, factory informers.SharedInformerFactory) *Controller {
+func New(router Router, factory informers.SharedInformerFactory, opts ...Option) *Controller {
 	svcInformer := factory.Core().V1().Services()
 	sliceInformer := factory.Discovery().V1().EndpointSlices()
 
@@ -170,6 +216,9 @@ func New(router Router, factory informers.SharedInformerFactory) *Controller {
 		svcInformer.Informer().HasSynced,
 		sliceInformer.Informer().HasSynced,
 	)
+	for _, opt := range opts {
+		opt(c)
+	}
 
 	_, _ = svcInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    func(obj any) { c.enqueueService(obj) },
@@ -285,11 +334,41 @@ func (c *Controller) reconcile(ctx context.Context, key string) error {
 	if err != nil {
 		return fmt.Errorf("list endpointslices for %q: %w", key, err)
 	}
-	rules := BuildServiceRules(svc, slices)
+	rules := c.filterRoutable(key, BuildServiceRules(svc, slices))
 	if len(rules) == 0 {
 		return c.router.DetachService(ctx, key)
 	}
 	return c.router.AttachService(ctx, key, rules)
+}
+
+// filterRoutable drops backends MacVz cannot DNAT to, so an unroutable Service
+// (e.g. default/kubernetes, whose backend is the host-network kube-apiserver)
+// does not contribute a redirect target the privileged helper will reject — a
+// rejection that would otherwise fail the whole anchor load and block Pod
+// attachment. A rule whose backends are all unroutable is removed; a rule that
+// keeps at least one routable backend is programmed with just those. With no
+// filter configured the rules pass through unchanged.
+func (c *Controller) filterRoutable(key string, rules []podnet.ServiceRule) []podnet.ServiceRule {
+	if c.routable == nil || len(rules) == 0 {
+		return rules
+	}
+	out := make([]podnet.ServiceRule, 0, len(rules))
+	for _, r := range rules {
+		kept := make([]string, 0, len(r.Backends))
+		for _, ip := range r.Backends {
+			if c.routable(ip) {
+				kept = append(kept, ip)
+			}
+		}
+		if len(kept) == 0 {
+			klog.V(2).InfoS("skipping Service rule with no MacVz-routable backends",
+				"service", key, "clusterIP", r.ClusterIP, "port", r.Port, "backends", r.Backends)
+			continue
+		}
+		r.Backends = kept
+		out = append(out, r)
+	}
+	return out
 }
 
 func splitKey(key string) (ns, name string) {

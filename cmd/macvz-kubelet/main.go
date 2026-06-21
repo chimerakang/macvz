@@ -88,12 +88,13 @@ func run(ctx context.Context, configPath, runtimeBinary string) error {
 		"node", cfg.NodeName,
 		"runtimeSocket", cfg.RuntimeSocket,
 		"runtimeBinary", bin,
+		"runtimeDataRoot", cfg.RuntimeDataRoot,
 		"rosetta", cfg.RuntimeRosetta,
 		"logLevel", cfg.LogLevel,
 	)
 
 	// Build the apple/container driver and report runtime readiness (P1).
-	driver := container.New(container.Config{Binary: bin, Rosetta: cfg.RuntimeRosetta})
+	driver := container.New(container.Config{Binary: bin, Rosetta: cfg.RuntimeRosetta, DataRoot: cfg.RuntimeDataRoot})
 	if err := driver.Ready(ctx); err != nil {
 		klog.ErrorS(err, "apple/container runtime is not ready",
 			"hint", "ensure the binary is installed and `container system start` has been run")
@@ -262,8 +263,12 @@ func run(ctx context.Context, configPath, runtimeBinary string) error {
 
 	// Enable coordinated Pod IPAM now that Kubernetes has assigned this node a
 	// Pod CIDR, recovering any existing allocations before Pods are reconciled.
-	if err := setupIPAM(ctx, cfg, clientset, p); err != nil {
+	if podCIDR, err := setupIPAM(ctx, cfg, clientset, p); err != nil {
 		return fmt.Errorf("setup pod IPAM: %w", err)
+	} else if podCIDR != "" {
+		// Service-route filtering uses cfg.RoutableServiceCIDRs; preserve the
+		// Kubernetes-assigned CIDR there as well as in the provider IPAM.
+		cfg.Node.PodCIDR = podCIDR
 	}
 
 	// Program ClusterIP Service routing into the Pod network anchor so micro-VMs
@@ -273,11 +278,20 @@ func run(ctx context.Context, configPath, runtimeBinary string) error {
 	defer stopSvc()
 
 	// Start the Pod lifecycle controller so scheduled Pods become micro-VMs.
-	stopPods, err := startPodController(ctx, cfg, clientset, p, runtime.NumCPU())
+	podLister, stopPods, err := startPodController(ctx, cfg, clientset, p, runtime.NumCPU())
 	if err != nil {
 		return fmt.Errorf("start pod controller: %w", err)
 	}
 	defer stopPods()
+
+	// Start the automatic orphan micro-VM reaper (#67). It runs for the life of
+	// the kubelet, reclaiming any MacVz micro-VM whose backing Pod has gone (a
+	// missed delete, or a Pod removed while the kubelet was down). The pod
+	// controller is already synced, so the lister is a warm, authoritative view of
+	// the live Pods on this node.
+	if err := startOrphanReaper(ctx, cfg, driver, podLister); err != nil {
+		return fmt.Errorf("start orphan reaper: %w", err)
+	}
 
 	// Aggregate node health across runtime, control-plane, and data-plane so the
 	// kubelet's /healthz/diagnostics endpoint can explain why the node is or is

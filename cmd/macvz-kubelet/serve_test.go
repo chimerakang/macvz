@@ -20,13 +20,35 @@ import (
 	"testing"
 	"time"
 
+	"github.com/chimerakang/macvz/internal/types"
 	"github.com/chimerakang/macvz/pkg/config"
-	"k8s.io/apimachinery/pkg/runtime"
+	"github.com/chimerakang/macvz/pkg/provider"
+	macruntime "github.com/chimerakang/macvz/pkg/runtime"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	apiversion "k8s.io/apimachinery/pkg/version"
 	"k8s.io/client-go/discovery/fake"
 	kubernetesfake "k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 )
+
+type setupIPAMRuntime struct{}
+
+func (setupIPAMRuntime) Pull(context.Context, string, *macruntime.RegistryAuth) error { return nil }
+func (setupIPAMRuntime) Create(context.Context, types.ContainerSpec) (string, error)  { return "", nil }
+func (setupIPAMRuntime) Start(context.Context, string) error                          { return nil }
+func (setupIPAMRuntime) Stop(context.Context, string, time.Duration) error            { return nil }
+func (setupIPAMRuntime) Destroy(context.Context, string) error                        { return nil }
+func (setupIPAMRuntime) Status(context.Context, string) (macruntime.Status, error) {
+	return macruntime.Status{}, macruntime.ErrNotFound
+}
+func (setupIPAMRuntime) Logs(context.Context, string, macruntime.LogOptions) (io.ReadCloser, error) {
+	return nil, macruntime.ErrNotFound
+}
+func (setupIPAMRuntime) Exec(context.Context, string, []string, macruntime.ExecIO) error {
+	return macruntime.ErrNotFound
+}
 
 // writeTestCA writes a self-signed CA certificate to a temp file and returns its
 // path, for exercising the kubelet server's client-CA wiring.
@@ -132,7 +154,7 @@ func TestWaitForAPIServerSuccess(t *testing.T) {
 func TestWaitForAPIServerFailure(t *testing.T) {
 	client := kubernetesfake.NewClientset()
 	wantErr := errors.New("no route to host")
-	client.Discovery().(*fake.FakeDiscovery).PrependReactor("*", "*", func(action k8stesting.Action) (bool, runtime.Object, error) {
+	client.Discovery().(*fake.FakeDiscovery).PrependReactor("*", "*", func(action k8stesting.Action) (bool, k8sruntime.Object, error) {
 		return true, nil, wantErr
 	})
 
@@ -142,6 +164,79 @@ func TestWaitForAPIServerFailure(t *testing.T) {
 	}
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("error = %v, want wrapping %v", err, wantErr)
+	}
+}
+
+func TestWaitForPodCIDRReturnsAssignedCIDR(t *testing.T) {
+	client := kubernetesfake.NewClientset(&corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "mac-01"},
+		Spec:       corev1.NodeSpec{PodCIDR: "10.244.101.0/24"},
+	})
+
+	cidr, err := waitForPodCIDR(context.Background(), client, "mac-01")
+	if err != nil {
+		t.Fatalf("waitForPodCIDR: %v", err)
+	}
+	if cidr != "10.244.101.0/24" {
+		t.Errorf("cidr = %q, want 10.244.101.0/24", cidr)
+	}
+}
+
+func TestSetupIPAMReturnsResolvedCIDRForServiceRouting(t *testing.T) {
+	client := kubernetesfake.NewClientset(&corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "mac-01"},
+		Spec:       corev1.NodeSpec{PodCIDR: "10.244.101.0/24"},
+	})
+	cfg := config.Default()
+	cfg.NodeName = "mac-01"
+	cfg.Node.PodCIDR = ""
+	p := provider.New("mac-01", setupIPAMRuntime{})
+
+	cidr, err := setupIPAM(context.Background(), cfg, client, p)
+	if err != nil {
+		t.Fatalf("setupIPAM: %v", err)
+	}
+	if cidr != "10.244.101.0/24" {
+		t.Fatalf("setupIPAM returned cidr %q, want 10.244.101.0/24", cidr)
+	}
+
+	cfg.Node.PodCIDR = cidr
+	if got := cfg.RoutableServiceCIDRs(); !containsString(got, cidr) {
+		t.Fatalf("resolved PodCIDR must feed service-route filtering, got %v", got)
+	}
+}
+
+func TestExpectedWorkloadIDsMatchesSupportedPodShape(t *testing.T) {
+	base := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "web"},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "app", Image: "nginx"}},
+		},
+	}
+
+	got := expectedWorkloadIDs(base)
+	want := provider.WorkloadID("default", "web", "app")
+	if len(got) != 1 || got[0] != want {
+		t.Fatalf("expectedWorkloadIDs = %v, want [%s]", got, want)
+	}
+
+	deleting := base.DeepCopy()
+	now := metav1.Now()
+	deleting.DeletionTimestamp = &now
+	if got := expectedWorkloadIDs(deleting); len(got) != 0 {
+		t.Fatalf("deleting Pod should not protect workloads, got %v", got)
+	}
+
+	withInit := base.DeepCopy()
+	withInit.Spec.InitContainers = []corev1.Container{{Name: "init", Image: "busybox"}}
+	if got := expectedWorkloadIDs(withInit); len(got) != 0 {
+		t.Fatalf("unsupported init-container Pod should not protect workloads, got %v", got)
+	}
+
+	multi := base.DeepCopy()
+	multi.Spec.Containers = append(multi.Spec.Containers, corev1.Container{Name: "sidecar", Image: "busybox"})
+	if got := expectedWorkloadIDs(multi); len(got) != 0 {
+		t.Fatalf("unsupported multi-container Pod should not protect workloads, got %v", got)
 	}
 }
 
@@ -218,4 +313,13 @@ func freeTCPPort(t *testing.T) int {
 	}
 	defer func() { _ = ln.Close() }()
 	return ln.Addr().(*net.TCPAddr).Port
+}
+
+func containsString(xs []string, want string) bool {
+	for _, x := range xs {
+		if x == want {
+			return true
+		}
+	}
+	return false
 }

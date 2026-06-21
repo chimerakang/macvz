@@ -1,0 +1,138 @@
+# frontend: the browser-visible web tier. Three replicas of stock busybox:1.36.1
+# (arm64, no custom build) running httpd + a CGI that talks to Redis over `nc`.
+# Reads come from redis-follower, writes go to redis-leader, so the rendered page
+# spans all three Deployments. Scaling this Deployment and watching the Pods
+# spread across virtual nodes is the headline P8 demo.
+#
+# Inputs:
+#   - guestbook-content ConfigMap -> the landing page + CGI program (copied into
+#     a writable emptyDir at startup and marked executable).
+#   - guestbook-config ConfigMap -> app.conf (Redis hosts/key) + APP_TITLE env.
+#   - guestbook-redis Secret -> the Redis password, mounted read-only as a file
+#     the CGI reads to AUTH (#47, Secret-as-volume).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: macvz-guestbook
+  labels:
+    app: frontend
+    app.kubernetes.io/part-of: macvz-guestbook
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: frontend
+  template:
+    metadata:
+      labels:
+        app: frontend
+        app.kubernetes.io/part-of: macvz-guestbook
+    spec:
+      nodeSelector:
+        type: virtual-kubelet
+      tolerations:
+        - key: virtual-kubelet.io/provider
+          operator: Exists
+          effect: NoSchedule
+      volumes:
+        # CGI + landing page (read-only) and the writable served tree.
+        - name: content
+          configMap:
+            name: guestbook-content
+        - name: www
+          emptyDir: {}
+        - name: config
+          configMap:
+            name: guestbook-config
+            items:
+              - key: app.conf
+                path: app.conf
+        - name: redis-secret
+          secret:
+            secretName: guestbook-redis
+            defaultMode: 0400
+      containers:
+        - name: frontend
+          image: busybox:1.36.1
+          # Stage the CGI into a writable tree, mark it executable, then serve it.
+          # busybox httpd runs anything under /cgi-bin/ as CGI.
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              mkdir -p /www/cgi-bin
+              cp /tpl/index.html /www/index.html
+              cp /tpl/api /www/cgi-bin/api
+              chmod 0755 /www/cgi-bin/api
+              echo "macvz-guestbook frontend starting pod=${POD_NAME} node=${NODE_NAME}"
+              exec httpd -f -v -p 8080 -h /www
+          env:
+            # configMapKeyRef (#46): page title from guestbook-config.
+            - name: APP_TITLE
+              valueFrom:
+                configMapKeyRef:
+                  name: guestbook-config
+                  key: APP_TITLE
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          ports:
+            - name: http
+              containerPort: 8080
+          volumeMounts:
+            - name: content
+              mountPath: /tpl
+              readOnly: true
+            - name: www
+              mountPath: /www
+            - name: config
+              mountPath: /etc/guestbook
+              readOnly: true
+            - name: redis-secret
+              mountPath: /etc/guestbook-secret
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: "100m"
+              memory: 64Mi
+            limits:
+              cpu: "250m"
+              memory: 128Mi
+---
+# The browser-visible Service. ClusterIP, fronting all frontend replicas. The
+# documented access path is `kubectl -n macvz-guestbook port-forward svc/frontend
+# 8080:80`, then open http://localhost:8080/ (see pkg/provider/portforward.go).
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  namespace: macvz-guestbook
+  labels:
+    app: frontend
+    app.kubernetes.io/part-of: macvz-guestbook
+spec:
+  selector:
+    app: frontend
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

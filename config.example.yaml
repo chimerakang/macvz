@@ -15,6 +15,12 @@ runtimeSocket: /var/run/com.apple.container.sock
 # apple/container CLI to drive (path or PATH-resolved name). Defaults to "container".
 runtimeBinary: container
 
+# Filesystem path used for node disk and ephemeral-storage accounting. Leave
+# empty for the operator's home directory, which matches apple/container's
+# standard per-user data location. Set this if your runtime data is on a
+# dedicated volume.
+runtimeDataRoot: ""
+
 # Log verbosity: "info" or "debug" (klog -v levels also honored via flags).
 logLevel: info
 
@@ -35,9 +41,11 @@ node:
   # Node InternalIP. Leave empty to auto-detect the host's primary outbound IPv4.
   internalIP: ""
 
-  # Pod CIDR override for coordinated Pod IPAM. Leave empty to use the
-  # Kubernetes-assigned Node.Spec.PodCIDR. Only set this on clusters that do not
-  # allocate node CIDRs automatically, and give every MacVz node a disjoint CIDR.
+  # Pod CIDR for coordinated Pod IPAM. Leave empty to use the Kubernetes-assigned
+  # Node.Spec.PodCIDR only when running privileged network commands in-process.
+  # When privilegedHelperSocket is set and podNetwork is enabled, this must be
+  # filled explicitly so the root helper's static policy can validate pf rules.
+  # Always give every MacVz node a disjoint CIDR.
   podCIDR: ""
 
   # Extra labels/annotations merged onto the node (override built-ins on clash).
@@ -58,7 +66,7 @@ node:
   enableLease: true
   leaseDurationSeconds: 40
   pingInterval: 10s          # node liveness Ping cadence
-  statusUpdateInterval: 1m   # node status push + runtime readiness re-probe
+  statusUpdateInterval: 10s  # node status push + runtime readiness re-probe
 
   # Kubelet API (kubectl logs/exec). The Kubernetes API server connects to the
   # node's InternalIP on kubeletPort over HTTPS. Provide a serving cert+key to
@@ -100,4 +108,18 @@ podNetwork:
   enableForwarding: true
   # Host-only vmnet CIDRs local micro-VMs may receive. The privileged helper uses
   # these to validate pf rdr/binat targets. Omit to use the common default below.
-  vmNetCIDRs: ["192.168.64.0/24"]
+  vmNetCIDRs: ["192.168.64.0/22"]
+
+# Automatic orphan micro-VM cleanup (#67). The reaper periodically destroys MacVz
+# micro-VMs whose backing Pod no longer exists on this node — a missed delete, or
+# a Pod removed while the kubelet was down — so a leaked VM cannot pin host CPU,
+# RAM, and disk. It never touches non-MacVz workloads, and a VM must stay
+# orphaned for the whole gracePeriod before it is reaped (this absorbs the brief
+# window where a VM exists but its Pod is not yet visible after creation or a
+# restart). It does not flush the pf anchor (the node is live); the operator
+# `macvz-kubelet cleanup` command and node-removal flow own anchor flushing.
+orphanCleanup:
+  enabled: true
+  interval: 2m       # how often to scan for orphans
+  gracePeriod: 10m   # how long a VM must stay orphaned before it is reaped (>= interval)
+  dryRun: false      # set true to log what would be reaped without destroying anything

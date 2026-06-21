@@ -61,8 +61,10 @@ func (p *Provider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	}
 
 	// Allocate a stable Pod IP from this node's Pod CIDR. Until the Pod is
-	// committed to the store, any early return must release it so a retry (or a
-	// terminal failure) does not leak the address.
+	// committed to the store, any newly-assigned address must be released so a
+	// retry (or a terminal failure) does not leak it. A pre-existing reservation
+	// comes from restart recovery and must survive failed adoption retries.
+	hadPodIP := p.hasAllocatedIP(key)
 	podIP, err := p.allocateIP(key)
 	if err != nil {
 		return fmt.Errorf("allocate pod IP for %q: %w", key, err)
@@ -70,7 +72,7 @@ func (p *Provider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	committed := false
 	if podIP != "" {
 		defer func() {
-			if !committed {
+			if !committed && !hadPodIP {
 				p.releaseIP(key)
 			}
 		}()
@@ -86,61 +88,95 @@ func (p *Provider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	st.pod.Status.StartTime = &now
 	st.pod.Status.PodIP = podIP
 
-	// Resolve any private-registry credentials from the Pod's imagePullSecrets
-	// before pulling (#49). A missing/unreadable pull Secret is transient — return
-	// the error so the Pod stays Pending with an actionable message and retries
-	// once the Secret appears (or is corrected). Credentials never enter the error.
-	auth, err := resolvePullAuth(p.secrets, pod, spec.Image)
-	if err != nil {
-		klog.InfoS("Pod image pull credentials not ready; will retry", "pod", key, "reason", err.Error())
-		return fmt.Errorf("pod %q image pull credentials not ready: %w", key, err)
-	}
-
-	if err := p.rt.Pull(ctx, spec.Image, auth); err != nil {
-		// An image with no arm64 variant can never run here (P1 surfaces this
-		// signal); make it a terminal Failed status. Other pull errors (e.g.
-		// runtime not ready) are transient and worth retrying.
-		if errors.Is(err, runtime.ErrIncompatibleArch) {
-			return p.markTerminalFailure(key, pod, "ImageArchitectureMismatch",
-				fmt.Errorf("pull image %q for container %q: %w", spec.Image, c.Name, err))
+	// Kubelet restart recovery (#66): the workload ID is a deterministic function
+	// of the Pod's identity, so a micro-VM left running by a previous kubelet
+	// process is found by probing the runtime for that ID. If it is still there,
+	// adopt it instead of building a second VM: skip image pull/create, and skip
+	// Start only when the VM is already running. A VM left in Created means the
+	// previous kubelet died after Create but before Start, so recovery starts that
+	// existing VM. This keeps the recovered Pod IP (restored by RecoverAllocations
+	// before the controller starts) stable across a restart, and avoids a needless
+	// re-pull that could now fail if the registry credentials have since rotated.
+	// The driver's Create is idempotent, so even if this probe misses (e.g. a
+	// transient runtime error), the normal path below cannot duplicate the VM.
+	var (
+		id      string
+		adopted bool
+	)
+	if existing, ok := p.lookupWorkload(ctx, spec.Name); ok {
+		id = existing.ID
+		adopted = true
+		st.workloads = append(st.workloads, workload{container: c.Name, id: id})
+		klog.InfoS("recovered existing micro-VM after kubelet restart",
+			"pod", key, "workloadID", id, "phase", existing.Phase)
+		if existing.Phase == runtime.PhaseCreated {
+			if err := p.rt.Start(ctx, id); err != nil {
+				return fmt.Errorf("start recovered container %q: %w", c.Name, err)
+			}
 		}
-		return fmt.Errorf("pull image %q for container %q: %w", spec.Image, c.Name, err)
-	}
-	id, err := p.rt.Create(ctx, spec)
-	if err != nil {
-		p.rollback(ctx, st)
-		return fmt.Errorf("create container %q: %w", c.Name, err)
-	}
-	st.workloads = append(st.workloads, workload{container: c.Name, id: id})
-	if err := p.rt.Start(ctx, id); err != nil {
-		p.rollback(ctx, st)
-		return fmt.Errorf("start container %q: %w", c.Name, err)
+	} else {
+		// Resolve any private-registry credentials from the Pod's imagePullSecrets
+		// before pulling (#49). A missing/unreadable pull Secret is transient — return
+		// the error so the Pod stays Pending with an actionable message and retries
+		// once the Secret appears (or is corrected). Credentials never enter the error.
+		auth, err := resolvePullAuth(p.secrets, pod, spec.Image)
+		if err != nil {
+			klog.InfoS("Pod image pull credentials not ready; will retry", "pod", key, "reason", err.Error())
+			return fmt.Errorf("pod %q image pull credentials not ready: %w", key, err)
+		}
+
+		if err := p.rt.Pull(ctx, spec.Image, auth); err != nil {
+			// An image with no arm64 variant can never run here (P1 surfaces this
+			// signal); make it a terminal Failed status. Other pull errors (e.g.
+			// runtime not ready) are transient and worth retrying.
+			if errors.Is(err, runtime.ErrIncompatibleArch) {
+				return p.markTerminalFailure(key, pod, "ImageArchitectureMismatch",
+					fmt.Errorf("pull image %q for container %q: %w", spec.Image, c.Name, err))
+			}
+			return fmt.Errorf("pull image %q for container %q: %w", spec.Image, c.Name, err)
+		}
+		newID, err := p.rt.Create(ctx, spec)
+		if err != nil {
+			p.rollback(ctx, st)
+			return fmt.Errorf("create container %q: %w", c.Name, err)
+		}
+		id = newID
+		st.workloads = append(st.workloads, workload{container: c.Name, id: id})
+		if err := p.rt.Start(ctx, id); err != nil {
+			p.rollback(ctx, st)
+			return fmt.Errorf("start container %q: %w", c.Name, err)
+		}
 	}
 
 	// Wire the micro-VM into the Pod network path so it is reachable at its Pod
 	// IP across the mesh (#22). This needs both the assigned Pod IP and the VM's
-	// host-only address; if either is unavailable, roll back so the retry starts
+	// host-only address; if either is unavailable, unwind so the retry starts
 	// clean (a missing VM IP is transient — the guest is still acquiring DHCP).
+	// For an adopted VM the unwind must not destroy it: the workload survived the
+	// restart and should stay up for the next reconcile to re-adopt and re-attach.
 	if pn := p.podNetRef(); pn != nil && podIP != "" {
 		vmIP := p.observeVMIP(ctx, st)
 		if vmIP == "" {
-			p.rollback(ctx, st)
+			p.unwindCreate(ctx, st, adopted)
 			return fmt.Errorf("pod %q: micro-VM address not available yet for network attach", key)
 		}
 		if err := pn.Attach(ctx, podnet.Endpoint{PodKey: key, PodIP: podIP, VMIP: vmIP}); err != nil {
-			p.rollback(ctx, st)
+			p.unwindCreate(ctx, st, adopted)
 			return fmt.Errorf("attach pod %q network path (%s -> %s): %w", key, podIP, vmIP, err)
 		}
 		st.vmIP = vmIP
 		st.attached = true
 	}
 
-	st.pod.Status = p.reconcileStatus(ctx, st)
 	p.mu.Lock()
 	p.pods[key] = st
+	st.pod.Status = p.reconcileStatus(ctx, st)
 	// Launch the container's probers, if any, against the now-running workload
-	// (#50). Held under the lock so reconcileStatus sees a consistent probe state.
-	p.startProbes(st)
+	// (#50). A recovered stopped/failed workload is handed to the restart loop;
+	// finishRestart arms fresh probers once the replacement VM is running.
+	if st.pod.Status.Phase == corev1.PodRunning {
+		p.startProbes(st)
+	}
 	p.mu.Unlock()
 	committed = true // the allocated Pod IP is now owned by the stored Pod.
 	klog.InfoS("created Pod", "pod", key, "workloadID", spec.Name, "podIP", podIP)
@@ -170,6 +206,37 @@ func (p *Provider) markTerminalFailure(key string, pod *corev1.Pod, reason strin
 	p.mu.Unlock()
 	klog.ErrorS(cause, "Pod cannot run on this node", "pod", key, "reason", reason)
 	return nil
+}
+
+// lookupWorkload reports whether the runtime already has a workload with the
+// given (deterministic) ID, returning its observed status. It underpins kubelet
+// restart recovery (#66): a micro-VM left running by a previous kubelet process
+// is adopted rather than rebuilt. A plain ErrNotFound means "no such VM, create
+// it"; any other error (e.g. the runtime is briefly unreachable) is logged and
+// treated as not-found, so create falls through to its normal — and idempotent —
+// path rather than blocking recovery.
+func (p *Provider) lookupWorkload(ctx context.Context, id string) (runtime.Status, bool) {
+	st, err := p.rt.Status(ctx, id)
+	if err != nil {
+		if !errors.Is(err, runtime.ErrNotFound) {
+			klog.ErrorS(err, "could not probe for an existing micro-VM; treating as new", "workloadID", id)
+		}
+		return runtime.Status{}, false
+	}
+	return st, true
+}
+
+// unwindCreate cleans up after a CreatePod that failed during the network-attach
+// step. For a freshly created workload it is a full rollback (destroy the VM,
+// drop ephemeral storage). For an adopted workload (#66) it must leave the
+// surviving micro-VM running and only drop the local attempt, so the next
+// reconcile can re-adopt and retry the attach; destroying it would kill a
+// workload that outlived the kubelet restart.
+func (p *Provider) unwindCreate(ctx context.Context, st *podState, adopted bool) {
+	if adopted {
+		return
+	}
+	p.rollback(ctx, st)
 }
 
 // rollback destroys any workloads already started for a failed CreatePod and

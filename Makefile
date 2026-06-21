@@ -65,9 +65,17 @@ e2e: ## Run the multi-node end-to-end suite against a real cluster (see docs/E2E
 compat: ## Run the P6 workload compatibility fixture against a real cluster (issue #53)
 	./test/e2e/p6-compat/run.sh
 
+.PHONY: soak
+soak: ## Run the long-duration P9 soak harness against a real cluster (issue #71)
+	./test/e2e/soak/run.sh
+
 .PHONY: release
-release: ## Build, sign, and package a darwin/arm64 release into dist/ (see docs/RELEASE.md)
+release: ## Build, sign, and package a darwin/arm64 release + install bundle into dist/ (see docs/RELEASE.md, docs/PACKAGING.md)
 	VERSION=$(VERSION) COMMIT=$(COMMIT) DATE=$(DATE) ./scripts/macos-release.sh
+
+.PHONY: install-rehearsal
+install-rehearsal: ## Rehearse install→upgrade→rollback→uninstall in a temp prefix (no root; issue #70)
+	./scripts/macvz-install-rehearsal.sh
 
 .PHONY: sign
 sign: build ## Ad-hoc codesign bin/$(BINARY) for local development
@@ -80,5 +88,5 @@ clean: ## Remove build artifacts
 
 .PHONY: help
 help: ## Show this help
-	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
+	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
 		awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'

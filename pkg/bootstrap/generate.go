@@ -60,14 +60,14 @@ type PeerParams struct {
 type PodNetworkParams struct {
 	Interface  string   // host vmnet bridge, e.g. "bridge100" (required)
 	Anchor     string   // pf anchor (default macvz/pods)
-	VMNetCIDRs []string // host-only vmnet ranges (default 192.168.64.0/24)
+	VMNetCIDRs []string // host-only vmnet ranges (default 192.168.64.0/22)
 }
 
 const (
-	defaultMeshInterface  = "utun7"
-	defaultMeshKeyFile    = "/etc/macvz/wireguard.key"
-	defaultHelperSocket   = "/var/run/macvz-netd.sock"
-	defaultPodNetAnchor   = "macvz/pods"
+	defaultMeshInterface   = "utun7"
+	defaultMeshKeyFile     = "/etc/macvz/wireguard.key"
+	defaultHelperSocket    = "/var/run/macvz-netd.sock"
+	defaultPodNetAnchor    = "macvz/pods"
 	defaultPodNetVMNetCIDR = config.DefaultVMNetCIDR
 )
 
@@ -117,6 +117,9 @@ func (p JoinParams) Validate() error {
 		}
 		if p.PrivilegedHelperSocket == "" {
 			return fmt.Errorf("privileged helper socket is required when the Pod network is enabled (--helper-socket)")
+		}
+		if p.PodCIDR == "" {
+			return fmt.Errorf("pod CIDR is required when the Pod network uses the privileged helper (--pod-cidr)")
 		}
 	}
 	return nil

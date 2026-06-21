@@ -14,10 +14,12 @@ import (
 	"time"
 
 	"github.com/chimerakang/macvz/pkg/config"
+	"github.com/chimerakang/macvz/pkg/drain"
 	"github.com/chimerakang/macvz/pkg/network"
 	"github.com/chimerakang/macvz/pkg/network/podnet"
 	"github.com/chimerakang/macvz/pkg/network/svcroute"
 	"github.com/chimerakang/macvz/pkg/network/wireguard"
+	"github.com/chimerakang/macvz/pkg/orphan"
 	"github.com/chimerakang/macvz/pkg/provider"
 	vknode "github.com/virtual-kubelet/virtual-kubelet/node"
 	vkapi "github.com/virtual-kubelet/virtual-kubelet/node/api"
@@ -26,6 +28,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -126,9 +129,10 @@ func waitForAPIServerWithTimeout(ctx context.Context, clientset kubernetes.Inter
 // restart neither leaks addresses nor reassigns a live Pod's IP.
 //
 // IPAM is best-effort: on a cluster that assigns no Pod CIDR (and with no
-// override configured), it logs and returns nil so Pods still run with the Pod
-// IP derived from the runtime-reported address.
-func setupIPAM(ctx context.Context, cfg config.Config, clientset *kubernetes.Clientset, p *provider.Provider) error {
+// override configured), it logs and returns an empty CIDR so Pods still run with
+// the Pod IP derived from the runtime-reported address. On success it returns
+// the resolved CIDR so callers can feed the same range into Service routing.
+func setupIPAM(ctx context.Context, cfg config.Config, clientset kubernetes.Interface, p *provider.Provider) (string, error) {
 	cidr := cfg.Node.PodCIDR
 	if cidr == "" {
 		var err error
@@ -136,13 +140,13 @@ func setupIPAM(ctx context.Context, cfg config.Config, clientset *kubernetes.Cli
 		if err != nil {
 			klog.ErrorS(err, "coordinated Pod IPAM disabled; Pod IPs will come from the runtime",
 				"hint", "run kube-controller-manager with --allocate-node-cidrs or set node.podCIDR")
-			return nil
+			return "", nil
 		}
 	}
 
 	ipam, err := network.NewPodIPAM(cidr)
 	if err != nil {
-		return fmt.Errorf("build pod IPAM for %q: %w", cidr, err)
+		return "", fmt.Errorf("build pod IPAM for %q: %w", cidr, err)
 	}
 	p.SetIPAM(ipam)
 	klog.InfoS("coordinated Pod IPAM enabled", "node", cfg.NodeName, "podCIDR", ipam.CIDR())
@@ -155,19 +159,19 @@ func setupIPAM(ctx context.Context, cfg config.Config, clientset *kubernetes.Cli
 		// A failed recovery list is non-fatal: the allocator starts empty and
 		// re-derives IPs as Pods are (re)created.
 		klog.ErrorS(err, "could not list existing Pods for IPAM recovery", "node", cfg.NodeName)
-		return nil
+		return cidr, nil
 	}
 	pods := make([]*corev1.Pod, 0, len(podList.Items))
 	for i := range podList.Items {
 		pods = append(pods, &podList.Items[i])
 	}
 	p.RecoverAllocations(pods)
-	return nil
+	return cidr, nil
 }
 
 // waitForPodCIDR polls the node until Kubernetes assigns its Spec.PodCIDR, which
 // happens shortly after registration on clusters with node-CIDR allocation.
-func waitForPodCIDR(ctx context.Context, clientset *kubernetes.Clientset, nodeName string) (string, error) {
+func waitForPodCIDR(ctx context.Context, clientset kubernetes.Interface, nodeName string) (string, error) {
 	deadlineCtx, cancel := context.WithTimeout(ctx, podCIDRWaitTimeout)
 	defer cancel()
 	ticker := time.NewTicker(time.Second)
@@ -189,7 +193,11 @@ func waitForPodCIDR(ctx context.Context, clientset *kubernetes.Clientset, nodeNa
 // secret/service informers (pods filtered to this node), an event recorder, and
 // the controller itself driving the provider's Pod lifecycle. It returns a
 // cleanup func to release the event broadcaster.
-func startPodController(ctx context.Context, cfg config.Config, clientset *kubernetes.Clientset, p *provider.Provider, workers int) (func(), error) {
+// startPodController also returns the node-scoped Pod lister it builds. The
+// orphan reaper (#67) reuses it as its authoritative "live Pods on this node"
+// source — the informer is already filtered to this node and kept warm, so the
+// reaper needs no extra API calls to tell orphans from live workloads.
+func startPodController(ctx context.Context, cfg config.Config, clientset *kubernetes.Clientset, p *provider.Provider, workers int) (corev1listers.PodLister, func(), error) {
 	podFactory := informers.NewSharedInformerFactoryWithOptions(clientset, informerResync, nodeutil.PodInformerFilter(cfg.NodeName))
 	scmFactory := informers.NewSharedInformerFactoryWithOptions(clientset, informerResync)
 
@@ -227,7 +235,7 @@ func startPodController(ctx context.Context, cfg config.Config, clientset *kuber
 	})
 	if err != nil {
 		eb.Shutdown()
-		return nil, fmt.Errorf("create pod controller: %w", err)
+		return nil, nil, fmt.Errorf("create pod controller: %w", err)
 	}
 
 	podFactory.Start(ctx.Done())
@@ -244,11 +252,82 @@ func startPodController(ctx context.Context, cfg config.Config, clientset *kuber
 		klog.InfoS("pod controller ready", "node", cfg.NodeName, "workers", workers)
 	case <-pc.Done():
 		eb.Shutdown()
-		return nil, fmt.Errorf("pod controller exited before becoming ready: %w", pc.Err())
+		return nil, nil, fmt.Errorf("pod controller exited before becoming ready: %w", pc.Err())
 	case <-ctx.Done():
 	}
 
-	return eb.Shutdown, nil
+	return podInformer.Lister(), eb.Shutdown, nil
+}
+
+// orphanStopTimeout bounds the graceful stop of each orphan micro-VM before it
+// is force-destroyed by the reaper.
+const orphanStopTimeout = 10 * time.Second
+
+// vmRuntime is the subset of the runtime driver the orphan reaper needs: list
+// every workload on the host and stop/destroy a chosen one. *container.Driver
+// satisfies it (it is drain.VMLister + drain.VMReaper).
+type vmRuntime interface {
+	drain.VMLister
+	drain.VMReaper
+}
+
+// startOrphanReaper launches the automatic orphan micro-VM cleanup loop (#67)
+// when enabled in config. It reaps MacVz micro-VMs whose backing Pod no longer
+// exists on this node, using the node-scoped Pod lister as the authoritative set
+// of live workloads and a grace period to avoid racing Pod creation. It returns
+// a no-op when disabled. The loop stops when ctx is cancelled.
+func startOrphanReaper(ctx context.Context, cfg config.Config, rt vmRuntime, pods corev1listers.PodLister) error {
+	if !cfg.OrphanCleanup.Enabled {
+		klog.InfoS("orphan micro-VM reaper disabled; leaked VMs are reclaimed only by `macvz-kubelet cleanup` or node removal")
+		return nil
+	}
+	interval, grace, err := cfg.OrphanCleanupIntervals()
+	if err != nil {
+		return fmt.Errorf("orphan cleanup intervals: %w", err)
+	}
+
+	// The Pod lister is already filtered to this node; a Pod being deleted is
+	// excluded so its VM becomes reapable if it lingers past the grace period.
+	expected := func(_ context.Context) (map[string]bool, error) {
+		ps, err := pods.List(labels.Everything())
+		if err != nil {
+			return nil, err
+		}
+		out := make(map[string]bool, len(ps))
+		for _, pod := range ps {
+			for _, id := range expectedWorkloadIDs(pod) {
+				out[id] = true
+			}
+		}
+		return out, nil
+	}
+
+	// Flusher is intentionally nil: this node is live, so the pf anchor must not be
+	// flushed (that would drop rules for the Pods still running here).
+	cleaner := &drain.Cleaner{Lister: rt, Reaper: rt, Timeout: orphanStopTimeout}
+	reaper := orphan.New(cleaner, expected, orphan.Policy{
+		Interval:    interval,
+		GracePeriod: grace,
+		DryRun:      cfg.OrphanCleanup.DryRun,
+	})
+	go reaper.Run(ctx)
+	return nil
+}
+
+// expectedWorkloadIDs returns the runtime workload IDs that a Pod can
+// legitimately back on this node. Keep this aligned with provider translation:
+// the beta runs exactly one regular container and rejects init/ephemeral and
+// multi-container Pods, so those unsupported shapes must not protect stale VMs
+// from orphan cleanup.
+func expectedWorkloadIDs(pod *corev1.Pod) []string {
+	if pod == nil || pod.DeletionTimestamp != nil {
+		return nil
+	}
+	if len(pod.Spec.Containers) != 1 || len(pod.Spec.InitContainers) != 0 || len(pod.Spec.EphemeralContainers) != 0 {
+		return nil
+	}
+	c := pod.Spec.Containers[0]
+	return []string{provider.WorkloadID(pod.Namespace, pod.Name, c.Name)}
 }
 
 // setupMesh brings up this node's WireGuard mesh when enabled, returning a
@@ -340,7 +419,11 @@ func startServiceController(ctx context.Context, cfg config.Config, clientset *k
 		return func() {}
 	}
 	factory := informers.NewSharedInformerFactory(clientset, informerResync)
-	ctrl := svcroute.New(router, factory)
+	// Restrict programmed Service backends to ranges MacVz can actually DNAT to,
+	// so the host-network kube-apiserver behind the always-present
+	// default/kubernetes Service (and Pods on non-MacVz nodes) cannot poison the
+	// shared pf anchor and block Pod attachment.
+	ctrl := svcroute.New(router, factory, svcroute.WithRoutableCIDRs(cfg.RoutableServiceCIDRs()))
 
 	ctlCtx, cancel := context.WithCancel(ctx)
 	factory.Start(ctlCtx.Done())

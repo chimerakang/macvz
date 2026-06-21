@@ -1,0 +1,9 @@
+# guestbook (#62): a self-contained namespace holding the multi-component
+# guestbook application — a redis leader/follower data tier and a stateless web
+# frontend — so run.sh can apply, scale, roll, and tear it down as a unit.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: macvz-guestbook
+  labels:
+    app.kubernetes.io/part-of: macvz-guestbook

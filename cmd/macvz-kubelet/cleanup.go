@@ -12,7 +12,6 @@ import (
 	"github.com/chimerakang/macvz/pkg/drain"
 	"github.com/chimerakang/macvz/pkg/network/podnet"
 	"github.com/chimerakang/macvz/pkg/network/privhelper"
-	"github.com/chimerakang/macvz/pkg/provider"
 	"github.com/chimerakang/macvz/pkg/runtime/container"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -66,7 +65,7 @@ func runCleanup(args []string) int {
 		}
 	}
 
-	driver := container.New(container.Config{Binary: cfg.RuntimeBinary, Rosetta: cfg.RuntimeRosetta})
+	driver := container.New(container.Config{Binary: cfg.RuntimeBinary, Rosetta: cfg.RuntimeRosetta, DataRoot: cfg.RuntimeDataRoot})
 	cleaner := &drain.Cleaner{
 		Lister:  driver,
 		Reaper:  driver,
@@ -136,15 +135,8 @@ func expectedWorkloads(ctx context.Context, cfg config.Config) (map[string]bool,
 	}
 	expected := map[string]bool{}
 	for i := range pods.Items {
-		p := &pods.Items[i]
-		if p.DeletionTimestamp != nil {
-			continue // being deleted; its VM is fair game for reaping
-		}
-		for _, c := range p.Spec.InitContainers {
-			expected[provider.WorkloadID(p.Namespace, p.Name, c.Name)] = true
-		}
-		for _, c := range p.Spec.Containers {
-			expected[provider.WorkloadID(p.Namespace, p.Name, c.Name)] = true
+		for _, id := range expectedWorkloadIDs(&pods.Items[i]) {
+			expected[id] = true
 		}
 	}
 	return expected, nil

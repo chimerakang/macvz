@@ -48,6 +48,10 @@ type Config struct {
 	// images are accepted and amd64-only images are rejected with a clear,
 	// actionable error.
 	Rosetta bool
+	// DataRoot is a path on the filesystem backing apple/container's micro-VM
+	// and image storage; it is sampled for node disk accounting (#68). Empty
+	// defaults to the user's home directory, which is on the same volume.
+	DataRoot string
 }
 
 // Driver implements runtime.Runtime (and runtime.Pinger) over apple/container.
@@ -62,12 +66,20 @@ type Driver struct {
 	locks keyedMutex
 	// rosetta allows booting linux/amd64 images via Rosetta translation.
 	rosetta bool
+	// dataRoot is the path sampled for node filesystem accounting (#68); empty
+	// resolves to the user's home directory at call time.
+	dataRoot string
+	// statfs samples a filesystem for NodeFilesystem; nil uses the platform
+	// statfs(2). It is a seam so disk accounting is unit-testable without a real
+	// filesystem.
+	statfs func(path string) (runtime.FilesystemUsage, error)
 }
 
 var (
-	_ runtime.Runtime = (*Driver)(nil)
-	_ runtime.Pinger  = (*Driver)(nil)
-	_ runtime.Lister  = (*Driver)(nil)
+	_ runtime.Runtime      = (*Driver)(nil)
+	_ runtime.Pinger       = (*Driver)(nil)
+	_ runtime.Lister       = (*Driver)(nil)
+	_ runtime.DiskReporter = (*Driver)(nil)
 )
 
 // New returns a Driver backed by the apple/container CLI described by cfg.
@@ -76,7 +88,7 @@ func New(cfg Config) *Driver {
 	if bin == "" {
 		bin = DefaultBinary
 	}
-	return &Driver{run: &cliRunner{bin: bin}, rosetta: cfg.Rosetta}
+	return &Driver{run: &cliRunner{bin: bin}, rosetta: cfg.Rosetta, dataRoot: cfg.DataRoot}
 }
 
 // Ready reports whether the apple/container service is reachable and healthy by

@@ -17,7 +17,7 @@ macvz-kubelet bundle --config /etc/macvz/config.yaml --out ./support --no-archiv
 
 # Include extra log files (e.g. the kubelet or macvz-netd log captured by launchd).
 macvz-kubelet bundle --config /etc/macvz/config.yaml \
-  --log-file /var/log/macvz-kubelet.log,/var/log/macvz-netd.log
+  --log-file /usr/local/var/log/macvz-kubelet.log,/var/log/macvz-netd.log
 ```
 
 Flags:

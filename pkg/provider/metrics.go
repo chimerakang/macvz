@@ -15,7 +15,7 @@ import (
 // server can observe node and Pod resource usage (#25).
 func (p *Provider) StatsSummary(ctx context.Context) (*statsv1alpha1.Summary, error) {
 	pods := p.metricsPodInputs()
-	return p.collector.Summary(ctx, pods, p.statsFunc()), nil
+	return p.collector.Summary(ctx, pods, p.statsFunc(), p.diskFunc()), nil
 }
 
 // MetricsResource serves the Prometheus resource-metrics endpoint
@@ -23,7 +23,7 @@ func (p *Provider) StatsSummary(ctx context.Context) (*statsv1alpha1.Summary, er
 func (p *Provider) MetricsResource(ctx context.Context) ([]*dto.MetricFamily, error) {
 	pods := p.metricsPodInputs()
 	ready, _ := p.runtimeReady(ctx)
-	return p.collector.ResourceMetrics(ctx, pods, p.statsFunc(), ready), nil
+	return p.collector.ResourceMetrics(ctx, pods, p.statsFunc(), p.diskFunc(), ready), nil
 }
 
 // metricsPodInputs snapshots the tracked Pods into the collector's input shape.
@@ -80,5 +80,27 @@ func (p *Provider) statsFunc() metrics.StatsFunc {
 			return runtime.ResourceStats{}, false
 		}
 		return rs, true
+	}
+}
+
+// diskFunc adapts the runtime's optional DiskReporter capability to the
+// collector's DiskFunc. It returns nil when the runtime does not implement
+// DiskReporter, so the collector omits all filesystem/image-cache accounting.
+// The two surfaces are sampled independently: a node that can report one but
+// not the other still contributes what it can.
+func (p *Provider) diskFunc() metrics.DiskFunc {
+	reporter, ok := p.rt.(runtime.DiskReporter)
+	if !ok {
+		return nil
+	}
+	return func(ctx context.Context) metrics.DiskSample {
+		var sample metrics.DiskSample
+		if fs, err := reporter.NodeFilesystem(ctx); err == nil {
+			sample.NodeFS, sample.NodeFSOK = fs, true
+		}
+		if img, err := reporter.ImageCacheUsage(ctx); err == nil {
+			sample.Images, sample.ImagesOK = img, true
+		}
+		return sample
 	}
 }

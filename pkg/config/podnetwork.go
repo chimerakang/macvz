@@ -9,7 +9,7 @@ import (
 
 // DefaultVMNetCIDR is apple/container's usual host-only vmnet range. Operators
 // with a different vmnet range should set podNetwork.vmNetCIDRs explicitly.
-const DefaultVMNetCIDR = "192.168.64.0/24"
+const DefaultVMNetCIDR = "192.168.64.0/22"
 
 // PodNetworkConfig configures the host Pod network path that makes each
 // micro-VM reachable at its assigned Pod IP across the mesh (#22). It is opt-in:
@@ -36,7 +36,7 @@ type PodNetworkConfig struct {
 	// VMNetCIDRs are the host-only apple/container address ranges that local
 	// micro-VMs may receive on the vmnet interface. The privileged helper uses
 	// these to reject pf rules that redirect ClusterIP traffic outside the local
-	// vmnet and Pod networks. Defaults to 192.168.64.0/24 when omitted.
+	// vmnet and Pod networks. Defaults to 192.168.64.0/22 when omitted.
 	VMNetCIDRs []string `yaml:"vmNetCIDRs"`
 }
 
@@ -67,7 +67,37 @@ func (c Config) PodNetworkRouterConfig() podnet.Config {
 	}
 	return podnet.Config{
 		Interface:        pn.Interface,
+		MeshInterface:    c.Mesh.Interface,
 		Anchor:           pn.Anchor,
 		EnableForwarding: forwarding,
 	}
+}
+
+// RoutableServiceCIDRs returns the address ranges a MacVz node can DNAT a
+// ClusterIP Service to: this node's own Pod CIDR, the local apple/container
+// vmnet ranges, and every enabled mesh-peer Pod CIDR. The service-route
+// controller uses it to drop Service backends MacVz cannot reach — most
+// importantly the host-network kube-apiserver behind the always-present
+// default/kubernetes Service, whose redirect target the privileged helper
+// rejects and which would otherwise fail the whole pf anchor load and block Pod
+// attachment. Empty entries are omitted; the result may be empty (no filtering)
+// when none are set.
+func (c Config) RoutableServiceCIDRs() []string {
+	cidrs := make([]string, 0, 1+len(c.PodNetwork.VMNetCIDRs)+len(c.Mesh.Peers))
+	if c.Node.PodCIDR != "" {
+		cidrs = append(cidrs, c.Node.PodCIDR)
+	}
+	vmnet := c.PodNetwork.VMNetCIDRs
+	if c.PodNetwork.Enabled && len(vmnet) == 0 {
+		vmnet = []string{DefaultVMNetCIDR}
+	}
+	cidrs = append(cidrs, vmnet...)
+	if c.Mesh.Enabled {
+		for _, p := range c.Mesh.Peers {
+			if p.PodCIDR != "" {
+				cidrs = append(cidrs, p.PodCIDR)
+			}
+		}
+	}
+	return cidrs
 }

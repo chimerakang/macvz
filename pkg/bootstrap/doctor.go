@@ -113,7 +113,7 @@ func NewDoctor(cfg config.Config, internalIP string) *Doctor {
 		readForwarding: readForwardingSysctl,
 		now:            time.Now,
 	}
-	driver := container.New(container.Config{Binary: cfg.RuntimeBinary, Rosetta: cfg.RuntimeRosetta})
+	driver := container.New(container.Config{Binary: cfg.RuntimeBinary, Rosetta: cfg.RuntimeRosetta, DataRoot: cfg.RuntimeDataRoot})
 	d.runtimeReady = driver.Ready
 
 	if cfg.PrivilegedHelperSocket != "" {

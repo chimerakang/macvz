@@ -25,6 +25,9 @@ func (f *fakeRunner) run(_ context.Context, c command) (string, error) {
 			return "", &CommandError{Cmd: c.String(), Stderr: stderr, ExitCode: 1}
 		}
 	}
+	if c.String() == "route -n get 192.168.65.5" {
+		return "   route to: 192.168.65.5\n  interface: bridge101\n", nil
+	}
 	return "", nil
 }
 
@@ -60,7 +63,7 @@ func contains(haystack []string, sub string) bool {
 }
 
 func newTestRouter(fr *fakeRunner) *Router {
-	return New(Config{Interface: "bridge100", EnableForwarding: true}, WithRunner(fr))
+	return New(Config{Interface: "bridge100", MeshInterface: "utun7", EnableForwarding: true}, WithRunner(fr))
 }
 
 func TestStartEnablesForwardingAndPF(t *testing.T) {
@@ -79,8 +82,11 @@ func TestStartEnablesForwardingAndPF(t *testing.T) {
 	if !contains(cmds, "pfctl -a macvz/pods -f -") {
 		t.Errorf("Start did not load a baseline anchor\nran: %v", cmds)
 	}
-	if !contains(cmds, "route -q -n delete -inet default -interface bridge100") {
-		t.Errorf("Start did not remove vmnet default route\nran: %v", cmds)
+	if !contains(cmds, "route -q -n delete -inet default -ifscope bridge100") {
+		t.Errorf("Start did not remove scoped vmnet default route\nran: %v", cmds)
+	}
+	if contains(cmds, "route -q -n delete -inet default -interface bridge100") {
+		t.Errorf("Start used unsafe vmnet default route cleanup\nran: %v", cmds)
 	}
 }
 
@@ -95,16 +101,31 @@ func TestStartToleratesPFAlreadyEnabled(t *testing.T) {
 
 func TestStartToleratesMissingVMNetDefaultRoute(t *testing.T) {
 	fr := newFakeRunner()
-	fr.failOn["route -q -n delete -inet default -interface bridge100"] = "route: writing to routing socket: not in table"
+	fr.failOn["route -q -n delete -inet default"] = "route: writing to routing socket: not in table"
 	rt := newTestRouter(fr)
 	if err := rt.Start(context.Background()); err != nil {
 		t.Fatalf("Start should tolerate missing vmnet default route, got: %v", err)
 	}
 }
 
+func TestStartToleratesMissingVMNetInterface(t *testing.T) {
+	// Cold start: apple/container has not booted a micro-VM yet, so the vmnet
+	// bridge does not exist. macOS has emitted both "bad address" and "bad
+	// interface name" for that case. There is no default route to strip, so Start
+	// must tolerate either; Attach re-runs the guard once the bridge appears.
+	for _, stderr := range []string{"route: bad address: bridge100", "route: bad interface name"} {
+		fr := newFakeRunner()
+		fr.failOn["route -q -n delete -inet default"] = stderr
+		rt := newTestRouter(fr)
+		if err := rt.Start(context.Background()); err != nil {
+			t.Fatalf("Start should tolerate a not-yet-created vmnet interface (%q), got: %v", stderr, err)
+		}
+	}
+}
+
 func TestStartFailsWhenVMNetDefaultRouteCleanupFails(t *testing.T) {
 	fr := newFakeRunner()
-	fr.failOn["route -q -n delete -inet default -interface bridge100"] = "route: permission denied"
+	fr.failOn["route -q -n delete -inet default -ifscope bridge100"] = "route: permission denied"
 	rt := newTestRouter(fr)
 	if err := rt.Start(context.Background()); err == nil {
 		t.Fatal("Start should fail when vmnet default route cleanup fails")
@@ -129,7 +150,7 @@ func TestAttachInstallsBinatRule(t *testing.T) {
 	if err := rt.Attach(ctx, ep); err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
-	if got := countContaining(fr.strings(), "route -q -n delete -inet default -interface bridge100"); got < 2 {
+	if got := countContaining(fr.strings(), "route -q -n delete -inet default -ifscope bridge100"); got < 2 {
 		t.Errorf("Attach should re-remove vmnet default route after VM start; got %d cleanup calls", got)
 	}
 	rules, ok := fr.lastAnchorLoad()
@@ -142,6 +163,35 @@ func TestAttachInstallsBinatRule(t *testing.T) {
 	}
 	if eps := rt.Endpoints(); len(eps) != 1 || eps[0].PodKey != "default/web" {
 		t.Errorf("Endpoints = %v, want [default/web]", eps)
+	}
+}
+
+func TestAttachUsesResolvedVMNetInterface(t *testing.T) {
+	fr := newFakeRunner()
+	rt := newTestRouter(fr)
+	ctx := context.Background()
+	if err := rt.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	ep := Endpoint{PodKey: "default/web", PodIP: "10.244.1.2", VMIP: "192.168.65.5"}
+	if err := rt.Attach(ctx, ep); err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	rules, ok := fr.lastAnchorLoad()
+	if !ok {
+		t.Fatal("no anchor load recorded")
+	}
+	if !strings.Contains(rules, "binat on bridge101 from 192.168.65.5 to any -> 10.244.1.2") {
+		t.Errorf("anchor missing bridge101 binat\n---\n%s", rules)
+	}
+	if !strings.Contains(rules, "binat on utun7 from 192.168.65.5 to any -> 10.244.1.2") {
+		t.Errorf("anchor missing mesh ingress binat\n---\n%s", rules)
+	}
+	if got := countContaining(fr.strings(), "route -q -n delete -inet default -ifscope bridge101"); got != 1 {
+		t.Errorf("Attach should clean the resolved vmnet default route once; got %d calls", got)
+	}
+	if contains(fr.strings(), "route -q -n delete -inet default -interface bridge101") {
+		t.Errorf("Attach used unsafe default route cleanup\nran: %v", fr.strings())
 	}
 }
 
@@ -230,10 +280,10 @@ func TestDetachUnknownIsNoop(t *testing.T) {
 func TestRenderAnchorDeterministic(t *testing.T) {
 	eps := []Endpoint{
 		{PodKey: "default/a", PodIP: "10.244.1.2", VMIP: "192.168.64.5"},
-		{PodKey: "default/b", PodIP: "10.244.1.3", VMIP: "192.168.64.6"},
+		{PodKey: "default/b", PodIP: "10.244.1.3", VMIP: "192.168.65.6", Interface: "bridge101"},
 	}
-	first := renderAnchor("bridge100", eps)
-	second := renderAnchor("bridge100", eps)
+	first := renderAnchor("bridge100", "utun7", eps)
+	second := renderAnchor("bridge100", "utun7", eps)
 	if first != second {
 		t.Error("renderAnchor is not deterministic")
 	}

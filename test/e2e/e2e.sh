@@ -20,6 +20,8 @@
 #   MACVZ_E2E_NAMESPACE   Namespace for test objects. Default: macvz-e2e.
 #   MACVZ_E2E_DIAG_DIR    Directory for failure diagnostics. Default: a mktemp dir.
 #   MACVZ_E2E_TIMEOUT     Per-wait timeout (seconds). Default: 120.
+#   MACVZ_E2E_TEARDOWN_WAIT
+#                         Wait for namespace deletion before exit. Default: 0.
 #   MACVZ_E2E_DIAG_SSH    Command template to reach a node for privileged
 #                         node-level network diagnostics (#43), with the literal
 #                         token {node} replaced by the node name. Example:
@@ -34,6 +36,7 @@ KUBECTL="${KUBECTL:-kubectl}"
 NS="${MACVZ_E2E_NAMESPACE:-macvz-e2e}"
 IMAGE="${MACVZ_E2E_IMAGE:-busybox:1.36.1}"
 TIMEOUT="${MACVZ_E2E_TIMEOUT:-120}"
+TEARDOWN_WAIT="${MACVZ_E2E_TEARDOWN_WAIT:-0}"
 PROVIDER_TAINT_KEY="virtual-kubelet.io/provider"
 
 NODES=()        # resolved target node names
@@ -161,10 +164,11 @@ phase_cross_node_service() {
 
 	# Curl the Service repeatedly from a client Pod; expect responses from BOTH
 	# nodes, proving cross-node load-balancing over the mesh.
-	local out
+	local out svc_ip
+	svc_ip="$(k -n "$NS" get svc e2e-hello -o jsonpath='{.spec.clusterIP}')"
 	# Single quotes intentional: the loop must run in the client Pod's shell.
 	# shellcheck disable=SC2016
-	out="$(run_client 'for i in $(seq 20); do wget -qO- http://e2e-hello 2>/dev/null; done')"
+	out="$(run_client "for i in \$(seq 20); do wget -T 3 -qO- http://$svc_ip 2>/dev/null; done")"
 	if printf '%s' "$out" | grep -q "NODE:$n1" && printf '%s' "$out" | grep -q "NODE:$n2"; then
 		pass "Service load-balanced across both Macs ($n1 and $n2 both reached)"
 	else
@@ -181,8 +185,9 @@ phase_single_node_service() {
 	if ! wait_endpoints "e2e-hello" 1; then
 		fail "Service e2e-hello has no ready endpoint"; return
 	fi
-	local out
-	out="$(run_client 'wget -qO- http://e2e-hello 2>/dev/null')"
+	local out svc_ip
+	svc_ip="$(k -n "$NS" get svc e2e-hello -o jsonpath='{.spec.clusterIP}')"
+	out="$(run_client "wget -T 3 -qO- http://$svc_ip 2>/dev/null")"
 	if printf '%s' "$out" | grep -q "NODE:$n1"; then
 		pass "single-node Service reachable from client Pod"
 	else
@@ -197,7 +202,7 @@ phase_port_forward() {
 		skip "port-forward needs a backend Pod (service phase did not run)"; return
 	fi
 	local lport=18080 pid out
-	k -n "$NS" port-forward pod/e2e-be-1 "${lport}:8080" >/dev/null 2>&1 &
+	"$KUBECTL" -n "$NS" port-forward pod/e2e-be-1 "${lport}:8080" >/dev/null 2>&1 &
 	pid=$!
 	# Give the forward a moment to establish.
 	local i=0
@@ -206,13 +211,26 @@ phase_port_forward() {
 		[ -n "$out" ] && break
 		i=$((i+1)); sleep 1
 	done
-	kill "$pid" >/dev/null 2>&1
-	wait "$pid" 2>/dev/null
+	stop_port_forward "$pid"
 	if printf '%s' "$out" | grep -q "NODE:"; then
 		pass "port-forward reached the in-Pod HTTP server"
 	else
 		fail "port-forward did not return a response"
 	fi
+}
+
+stop_port_forward() {
+	local pid="$1"
+	kill -INT "$pid" >/dev/null 2>&1 || true
+	sleep 1
+	if kill -0 "$pid" >/dev/null 2>&1; then
+		kill "$pid" >/dev/null 2>&1 || true
+		sleep 1
+	fi
+	if kill -0 "$pid" >/dev/null 2>&1; then
+		kill -KILL "$pid" >/dev/null 2>&1 || true
+	fi
+	wait "$pid" 2>/dev/null || true
 }
 
 # --- manifests ---------------------------------------------------------------
@@ -275,13 +293,26 @@ spec:
 EOF
 }
 
-# run_client runs a throwaway alpine Pod that tolerates the provider taint and
-# executes the given shell, printing its stdout.
+# run_client runs a throwaway client Pod that tolerates the provider taint and
+# executes the given shell via kubectl exec, printing its stdout. We avoid
+# `kubectl run --rm -i --command ...` here because attach stdout is less stable
+# through Virtual Kubelet than exec/logs, and the suite already gates exec above.
 run_client() {
 	local cmd="$1"
-	k -n "$NS" run "e2e-client-$$" --image="$IMAGE" --restart=Never --rm -i \
+	local pod="e2e-client-$$"
+	k -n "$NS" delete pod "$pod" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+	k -n "$NS" run "$pod" --image="$IMAGE" --restart=Never \
 		--overrides="{\"spec\":{\"tolerations\":[$TOLERATION],\"nodeSelector\":{\"type\":\"virtual-kubelet\"}}}" \
-		--command -- sh -c "$cmd" 2>/dev/null
+		--command -- sh -c "sleep 600" >/dev/null
+	if ! k -n "$NS" wait --for=condition=Ready "pod/$pod" --timeout="${TIMEOUT}s" >/dev/null 2>&1; then
+		k -n "$NS" describe "pod/$pod" >&2 || true
+		k -n "$NS" delete pod "$pod" --wait=false >/dev/null 2>&1 || true
+		return 1
+	fi
+	local rc=0
+	k -n "$NS" exec "$pod" -- sh -c "$cmd" || rc=$?
+	k -n "$NS" delete pod "$pod" --wait=false >/dev/null 2>&1 || true
+	return "$rc"
 }
 
 # wait_endpoints waits until a Service has at least n ready endpoint addresses.
@@ -376,7 +407,12 @@ collect_node_diagnostics() {
 
 teardown() {
 	log "Teardown: removing namespace $NS"
-	k delete namespace "$NS" --wait=false >/dev/null 2>&1 || true
+	if [ "$TEARDOWN_WAIT" = 1 ]; then
+		k delete namespace "$NS" --wait=true --timeout="${TIMEOUT}s" >/dev/null 2>&1 ||
+			k delete namespace "$NS" --wait=false >/dev/null 2>&1 || true
+	else
+		k delete namespace "$NS" --wait=false >/dev/null 2>&1 || true
+	fi
 }
 
 # --- main --------------------------------------------------------------------

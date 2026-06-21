@@ -5,6 +5,7 @@ import (
 
 	"github.com/chimerakang/macvz/pkg/runtime"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -62,8 +63,8 @@ func (p *Provider) BuildNode(ctx context.Context, spec NodeSpec) *corev1.Node {
 			Taints: spec.Taints,
 		},
 		Status: corev1.NodeStatus{
-			Capacity:    spec.Capacity,
-			Allocatable: spec.Capacity,
+			Capacity:    spec.Capacity.DeepCopy(),
+			Allocatable: spec.Capacity.DeepCopy(),
 			NodeInfo: corev1.NodeSystemInfo{
 				OperatingSystem: spec.OS,
 				Architecture:    spec.Arch,
@@ -90,7 +91,37 @@ func (p *Provider) BuildNode(ctx context.Context, spec NodeSpec) *corev1.Node {
 		}
 	}
 
+	p.applyEphemeralStorage(ctx, spec, node)
+
 	return node
+}
+
+// applyEphemeralStorage advertises the node's ephemeral-storage resource from
+// the runtime's disk accounting (#68) so the scheduler sees real disk capacity.
+// It is skipped when the config already pins ephemeral-storage (operator intent
+// wins) or the runtime cannot report disk. Capacity reflects the filesystem
+// total; allocatable reflects the bytes actually available to MacVz.
+func (p *Provider) applyEphemeralStorage(ctx context.Context, spec NodeSpec, node *corev1.Node) {
+	if _, set := spec.Capacity[corev1.ResourceEphemeralStorage]; set {
+		return
+	}
+	reporter, ok := p.rt.(runtime.DiskReporter)
+	if !ok {
+		return
+	}
+	fs, err := reporter.NodeFilesystem(ctx)
+	if err != nil || fs.TotalBytes == 0 {
+		return
+	}
+
+	// Clone again before adding disk so the base CPU/memory/pod quantities stay
+	// independent between Capacity and Allocatable.
+	capacity := node.Status.Capacity.DeepCopy()
+	allocatable := node.Status.Allocatable.DeepCopy()
+	capacity[corev1.ResourceEphemeralStorage] = *resource.NewQuantity(int64(fs.TotalBytes), resource.BinarySI)
+	allocatable[corev1.ResourceEphemeralStorage] = *resource.NewQuantity(int64(fs.AvailableBytes), resource.BinarySI)
+	node.Status.Capacity = capacity
+	node.Status.Allocatable = allocatable
 }
 
 // runtimeReady probes the runtime for readiness when it implements

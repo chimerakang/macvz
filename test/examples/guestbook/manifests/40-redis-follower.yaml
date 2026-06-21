@@ -1,0 +1,99 @@
+# redis-follower: the read side of the data tier. Two replicas of redis:7-alpine,
+# each a read-only replica of redis-leader. The frontend LRANGEs the guestbook
+# list from here, so a green page proves Redis replication is flowing across two
+# separate Deployments and that reads are load-balanced across the micro-VMs.
+#
+# masterauth and requirepass both come from the same guestbook-redis Secret (#47).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-follower
+  namespace: macvz-guestbook
+  labels:
+    app: redis
+    role: follower
+    app.kubernetes.io/part-of: macvz-guestbook
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: redis
+      role: follower
+  template:
+    metadata:
+      labels:
+        app: redis
+        role: follower
+        app.kubernetes.io/part-of: macvz-guestbook
+    spec:
+      nodeSelector:
+        type: virtual-kubelet
+      tolerations:
+        - key: virtual-kubelet.io/provider
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          # Replicate from the leader Service. masterauth authenticates the
+          # replication link; requirepass protects this replica's own port.
+          command:
+            - /bin/sh
+            - -c
+            - >
+              exec redis-server
+              --replicaof redis-leader 6379
+              --masterauth "$REDIS_PASSWORD"
+              --requirepass "$REDIS_PASSWORD"
+              --replica-read-only yes
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: guestbook-redis
+                  key: redis-password
+          ports:
+            - name: redis
+              containerPort: 6379
+          # Ready only once the replication link to the leader is up, so the
+          # Service never routes reads to a replica that has not synced yet.
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - 'redis-cli -a "$REDIS_PASSWORD" --no-auth-warning info replication | tr -d "\r" | grep -q "master_link_status:up"'
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            tcpSocket:
+              port: redis
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: "100m"
+              memory: 128Mi
+            limits:
+              cpu: "500m"
+              memory: 256Mi
+---
+# ClusterIP Service load-balancing reads across the two follower replicas.
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-follower
+  namespace: macvz-guestbook
+  labels:
+    app: redis
+    role: follower
+    app.kubernetes.io/part-of: macvz-guestbook
+spec:
+  selector:
+    app: redis
+    role: follower
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis

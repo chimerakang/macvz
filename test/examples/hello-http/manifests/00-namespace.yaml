@@ -1,0 +1,8 @@
+# hello-http (#61): a self-contained namespace holding the minimal public HTTP
+# demo, so run.sh can apply and tear it down as a unit.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: macvz-hello
+  labels:
+    app.kubernetes.io/part-of: macvz-hello-http

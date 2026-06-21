@@ -1,0 +1,86 @@
+# Headlamp — a Kubernetes-native management UI (issue #63).
+#
+# Headlamp is the chosen UI for MacVz validation: a single stateless container,
+# multi-arch (arm64-native) images, and an in-cluster mode that needs only a
+# projected ServiceAccount token (#51) plus ClusterIP routing to the API server
+# (#37) — all of which MacVz already provides. See docs/MANAGEMENT_UI.md for the
+# full evaluation against the Kubernetes Dashboard.
+#
+# Features this Deployment exercises on a MacVz virtual node:
+#   #45 Deployment-managed Pod (restartPolicy Always via the controller template)
+#   #50 readiness + liveness HTTP probes against the UI's own port
+#   #51 ServiceAccount projected token -> in-cluster API access
+#   #52 hardened securityContext (restricted PSS) honored field by field
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: headlamp
+  namespace: macvz-headlamp
+  labels:
+    app.kubernetes.io/name: headlamp
+    app.kubernetes.io/part-of: macvz-headlamp-ui
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: headlamp
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: headlamp
+        app.kubernetes.io/part-of: macvz-headlamp-ui
+    spec:
+      serviceAccountName: headlamp
+      # Land on a MacVz virtual node and tolerate its provider taint.
+      nodeSelector:
+        type: virtual-kubelet
+      tolerations:
+        - key: virtual-kubelet.io/provider
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: headlamp
+          # Multi-arch image; arm64 is published alongside amd64. Pinned for
+          # reproducibility; run.sh substitutes MACVZ_HEADLAMP_IMAGE if set.
+          image: ghcr.io/headlamp-k8s/headlamp:v0.30.0
+          args:
+            - -in-cluster
+            - -plugins-dir=/headlamp/plugins
+          ports:
+            - name: http
+              containerPort: 4466
+          # The UI serves its SPA and health on the same port; readiness gates the
+          # Service endpoint and liveness restarts a wedged server (#50).
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 256Mi
+          # Hardened to the "restricted" Pod Security Standard. MacVz honors each
+          # field (#52): runAsNonRoot is enforced because it is paired with an
+          # explicit non-zero runAsUser; cap-drop ALL maps to --cap-drop ALL;
+          # allowPrivilegeEscalation:false and seccompProfile:RuntimeDefault are
+          # accepted no-ops satisfied by the micro-VM boundary.
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 100
+            runAsGroup: 101
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: RuntimeDefault

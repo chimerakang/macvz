@@ -58,11 +58,20 @@ sudo ./prep-node.sh b      # on 192.168.1.122
 KUBECONFIG=... ./run.sh start a   # on .110
 KUBECONFIG=... ./run.sh start b   # on .122
 
+# For soak/restart testing, run it as a per-user LaunchAgent instead. This keeps
+# the kubelet alive across short SSH/test shells and gives issue #71 stable
+# restart hooks.
+KUBECONFIG=... ./run.sh agent-start a
+KUBECONFIG=... ./run.sh agent-start b
+
 # 4. confirm the data plane is live (either Mac)
 sudo ./verify-dataplane.sh a
 
-# 5. run the suite (from any host with cluster access)
+# 5. run the suite (from any host with direct cluster access)
+# Use a direct kubeconfig here. The kubelet nodes may use kubeconfig-proxy.yaml,
+# but kubectl exec/port-forward streaming does not work through kubectl proxy.
 MACVZ_E2E_NODES=macvz-a,macvz-b MACVZ_E2E_TIMEOUT=120 \
+  KUBECONFIG=generated/kubeconfig-local.yaml \
   MACVZ_E2E_DIAG_DIR=./diag ../e2e.sh
 ```
 
@@ -77,7 +86,7 @@ MACVZ_E2E_NODES=macvz-a,macvz-b MACVZ_E2E_TIMEOUT=120 \
 ## Cleanup
 
 ```sh
-./run.sh stop a                 # stop kubelet (flushes the macvz/pods anchor)
+./run.sh stop a                 # stop kubelet/LaunchAgent (flushes macvz/pods)
 # Reap any orphan micro-VMs + flush the anchor (e.g. after a kubelet kill -9).
 # See docs/NODE_DRAIN.md for the full drain/remove workflow.
 macvz-kubelet cleanup --config macvz-a.yaml --all
@@ -90,3 +99,21 @@ netstat -rn -f inet | grep utun7  # expect no stale remote Pod CIDR routes
 
 Record results in `docs/MULTI_NODE_TEST_REPORT_2026-06-19.md` (or a new dated
 report) per the issue's Validation section.
+
+## LaunchAgent hooks for soak (#71)
+
+`run.sh agent-start <a|b>` stages the kubelet binary, node config, kubeconfig,
+and agent logs under `~/.macvz/two-node/<node>/`, then writes and loads
+`~/Library/LaunchAgents/com.github.chimerakang.macvz-kubelet.two-node.<node>.plist`
+with staged paths, PATH, and user environment. Useful commands:
+
+```sh
+KUBECONFIG=... ./run.sh agent-start a
+./run.sh agent-restart a
+./run.sh agent-stop a
+./run.sh agent-uninstall a
+```
+
+Use `agent-restart` for `MACVZ_SOAK_RESTART_KUBELET_CMD`, `agent-stop` for
+`MACVZ_SOAK_STOP_KUBELET_CMD`, and `agent-start` for
+`MACVZ_SOAK_START_KUBELET_CMD`.

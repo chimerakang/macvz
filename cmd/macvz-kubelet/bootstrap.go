@@ -117,7 +117,7 @@ func runBootstrap(args []string) int {
 		nodeName     = fs.String("node-name", "", "Kubernetes node name (required)")
 		internalIP   = fs.String("internal-ip", "", "node's reachable IPv4 (required)")
 		kubeconfig   = fs.String("kubeconfig", "", "path to the cluster kubeconfig (required)")
-		podCIDR      = fs.String("pod-cidr", "", "manual Pod CIDR (only for clusters without node CIDRs)")
+		podCIDR      = fs.String("pod-cidr", "", "this node's Pod CIDR (required with --podnet-interface/--helper-socket; otherwise optional override for clusters without node CIDRs)")
 		clusterDNS   = fs.String("cluster-dns", "", "CoreDNS/kube-dns ClusterIP for in-VM Service DNS")
 		helperSocket = fs.String("helper-socket", "", "macvz-netd socket (required with mesh/podnet)")
 		out          = fs.String("out", "", "write config to this file (default: stdout)")

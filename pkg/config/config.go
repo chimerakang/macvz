@@ -35,6 +35,12 @@ type Config struct {
 	// name). Defaults to "container".
 	RuntimeBinary string `yaml:"runtimeBinary"`
 
+	// RuntimeDataRoot is a path on the filesystem backing apple/container's
+	// micro-VM and image storage. It is sampled for node disk/ephemeral-storage
+	// accounting. Empty defaults to the operator's home directory, which is where
+	// apple/container stores data in the standard per-user setup.
+	RuntimeDataRoot string `yaml:"runtimeDataRoot"`
+
 	// RuntimeRosetta enables running linux/amd64 images via Rosetta-for-Linux
 	// translation on Apple Silicon (#27). Disabled by default: only linux/arm64
 	// images run, and amd64-only images fail with an actionable error. Enabling
@@ -65,6 +71,29 @@ type Config struct {
 	// commands directly (the kubelet must then be root, which is incompatible
 	// with apple/container).
 	PrivilegedHelperSocket string `yaml:"privilegedHelperSocket"`
+
+	// OrphanCleanup configures the in-kubelet reaper that periodically detects and
+	// destroys MacVz micro-VMs whose backing Pod no longer exists on this node
+	// (#67). Enabled by default with a conservative grace period.
+	OrphanCleanup OrphanCleanupConfig `yaml:"orphanCleanup"`
+}
+
+// OrphanCleanupConfig tunes the automatic orphan micro-VM reaper (#67). A VM is
+// an orphan when MacVz created it but no live Pod on this node maps to it; the
+// reaper destroys such VMs to reclaim their CPU/RAM/disk. The grace period
+// guards against reaping a VM whose Pod is merely not yet visible (informer lag
+// just after creation, or mid-adoption after a kubelet restart).
+type OrphanCleanupConfig struct {
+	// Enabled turns the periodic reaper on. Default true.
+	Enabled bool `yaml:"enabled"`
+	// Interval is how often the reaper scans for orphans. Default "2m".
+	Interval string `yaml:"interval"`
+	// GracePeriod is how long a VM must stay continuously orphaned before it is
+	// reaped. Default "10m". It must comfortably exceed the time between a Pod
+	// being scheduled and its micro-VM appearing in the node's Pod cache.
+	GracePeriod string `yaml:"gracePeriod"`
+	// DryRun logs what would be reaped without destroying anything. Default false.
+	DryRun bool `yaml:"dryRun"`
 }
 
 // NodeConfig is the configurable shape of the virtual node registered with
@@ -211,14 +240,43 @@ func Default() Config {
 			EnableLease:          true,
 			LeaseDurationSeconds: 40,
 			PingInterval:         "10s",
-			StatusUpdateInterval: "1m",
+			StatusUpdateInterval: "10s",
 			// Standard kubelet API port.
 			KubeletPort: 10250,
 			// Ephemeral volumes live under a dedicated host root; hostPath stays
 			// disabled until an operator allowlists prefixes.
 			Volumes: VolumesConfig{Root: "/var/lib/macvz/volumes"},
 		},
+		// Automatically reap orphan micro-VMs with a conservative grace period so a
+		// crash or missed delete cannot pin host resources indefinitely (#67).
+		OrphanCleanup: OrphanCleanupConfig{
+			Enabled:     true,
+			Interval:    "2m",
+			GracePeriod: "10m",
+		},
 	}
+}
+
+// OrphanCleanupIntervals parses the configured reaper scan interval and grace
+// period. Both must be positive, and the grace period must be at least the scan
+// interval so a candidate is observed at least once before it can mature. It is
+// only meaningful when OrphanCleanup.Enabled.
+func (c Config) OrphanCleanupIntervals() (interval, grace time.Duration, err error) {
+	interval, err = time.ParseDuration(c.OrphanCleanup.Interval)
+	if err != nil {
+		return 0, 0, fmt.Errorf("orphanCleanup.interval %q: %w", c.OrphanCleanup.Interval, err)
+	}
+	if interval <= 0 {
+		return 0, 0, fmt.Errorf("orphanCleanup.interval must be positive, got %q", c.OrphanCleanup.Interval)
+	}
+	grace, err = time.ParseDuration(c.OrphanCleanup.GracePeriod)
+	if err != nil {
+		return 0, 0, fmt.Errorf("orphanCleanup.gracePeriod %q: %w", c.OrphanCleanup.GracePeriod, err)
+	}
+	if grace < interval {
+		return 0, 0, fmt.Errorf("orphanCleanup.gracePeriod %q must be >= interval %q", c.OrphanCleanup.GracePeriod, c.OrphanCleanup.Interval)
+	}
+	return interval, grace, nil
 }
 
 // Capacity returns the node capacity/allocatable resource list parsed from the
@@ -356,11 +414,29 @@ func (c Config) Validate() error {
 	if _, err := c.Taints(); err != nil {
 		return err
 	}
+	if c.RuntimeDataRoot != "" && !filepath.IsAbs(c.RuntimeDataRoot) {
+		return fmt.Errorf("runtimeDataRoot must be an absolute path when set, got %q", c.RuntimeDataRoot)
+	}
 	if _, _, err := c.HeartbeatIntervals(); err != nil {
 		return err
 	}
+	if c.OrphanCleanup.Enabled {
+		if _, _, err := c.OrphanCleanupIntervals(); err != nil {
+			return err
+		}
+	}
 	if c.Node.EnableLease && c.Node.LeaseDurationSeconds <= 0 {
 		return fmt.Errorf("node.leaseDurationSeconds must be positive when leases are enabled, got %d", c.Node.LeaseDurationSeconds)
+	}
+	if c.Node.EnableLease {
+		_, status, err := c.HeartbeatIntervals()
+		if err != nil {
+			return err
+		}
+		lease := time.Duration(c.Node.LeaseDurationSeconds) * time.Second
+		if status >= lease {
+			return fmt.Errorf("node.statusUpdateInterval %s must be shorter than node.leaseDurationSeconds %s when leases are enabled", status, lease)
+		}
 	}
 	if c.Node.KubeletPort <= 0 || c.Node.KubeletPort > 65535 {
 		return fmt.Errorf("node.kubeletPort must be in 1..65535, got %d", c.Node.KubeletPort)
@@ -381,6 +457,9 @@ func (c Config) Validate() error {
 	}
 	if err := c.validatePodNetwork(); err != nil {
 		return err
+	}
+	if c.PrivilegedHelperSocket != "" && c.PodNetwork.Enabled && c.Node.PodCIDR == "" {
+		return fmt.Errorf("node.podCIDR is required when podNetwork is enabled with privilegedHelperSocket; the helper's static policy must know the local Pod CIDR")
 	}
 	if err := c.validateVolumes(); err != nil {
 		return err

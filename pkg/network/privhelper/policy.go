@@ -153,15 +153,18 @@ func (p Policy) lintAnchorRuleset(ruleset string) error {
 		if len(fields) < 3 || fields[1] != "on" {
 			return fmt.Errorf("anchor rule %q is not a binat/rdr rule", line)
 		}
-		if fields[2] != p.VMNetInterface {
-			return fmt.Errorf("anchor rule on interface %q, not the managed vmnet interface %q", fields[2], p.VMNetInterface)
-		}
 		switch fields[0] {
 		case "binat":
+			if err := p.checkPodNATInterface(fields[2]); err != nil {
+				return fmt.Errorf("anchor rule on interface %q not permitted: %w", fields[2], err)
+			}
 			if err := p.lintBinatRule(fields); err != nil {
 				return fmt.Errorf("anchor rule %q not permitted: %w", line, err)
 			}
 		case "rdr":
+			if err := p.checkVMNetInterface(fields[2]); err != nil {
+				return fmt.Errorf("anchor rule on interface %q not permitted: %w", fields[2], err)
+			}
 			if err := p.lintRDRRule(fields); err != nil {
 				return fmt.Errorf("anchor rule %q not permitted: %w", line, err)
 			}
@@ -288,13 +291,18 @@ func (p Policy) ipInSet(raw string, cidrs map[string]bool) bool {
 }
 
 // validateRoute permits adding/deleting host routes only for configured CIDRs,
-// and only through the managed mesh interface.
+// and only through the managed mesh interface. The one exception is deleting
+// apple/container's vmnet-scoped default route, which must target the configured
+// vmnet interface and is never allowed for add.
 func (p Policy) validateRoute(req Request) error {
 	if req.Stdin != "" {
 		return fmt.Errorf("route takes no stdin")
 	}
-	// route -q -n <add|delete> <-inet|-inet6> <cidr> -interface <iface>
-	if len(req.Args) != 7 || req.Args[0] != "-q" || req.Args[1] != "-n" || req.Args[5] != "-interface" {
+	if len(req.Args) == 3 && req.Args[0] == "-n" && req.Args[1] == "get" {
+		return p.checkIPInSet(req.Args[2], p.VMNetCIDRs, "vmnet CIDR")
+	}
+	// route -q -n <add|delete> <-inet|-inet6> <cidr> <-interface|-ifscope> <iface>
+	if len(req.Args) != 7 || req.Args[0] != "-q" || req.Args[1] != "-n" {
 		return fmt.Errorf("route args %v not permitted", req.Args)
 	}
 	if req.Args[2] != "add" && req.Args[2] != "delete" {
@@ -304,7 +312,13 @@ func (p Policy) validateRoute(req Request) error {
 		return fmt.Errorf("route family %q not permitted", req.Args[3])
 	}
 	if req.Args[2] == "delete" && req.Args[3] == "-inet" && req.Args[4] == "default" {
+		if req.Args[5] != "-ifscope" {
+			return fmt.Errorf("route default delete scope %q not permitted", req.Args[5])
+		}
 		return p.checkVMNetInterface(req.Args[6])
+	}
+	if req.Args[5] != "-interface" {
+		return fmt.Errorf("route scope %q not permitted", req.Args[5])
 	}
 	if err := p.checkMeshInterface(req.Args[6]); err != nil {
 		return err
@@ -449,10 +463,32 @@ func (p Policy) checkVMNetInterface(iface string) error {
 	if p.VMNetInterface == "" {
 		return fmt.Errorf("no vmnet interface is configured; command refused")
 	}
-	if iface != p.VMNetInterface {
-		return fmt.Errorf("interface %q is not the managed vmnet interface %q", iface, p.VMNetInterface)
+	if iface == p.VMNetInterface || isBridgeInterface(iface) {
+		return nil
 	}
-	return nil
+	return fmt.Errorf("interface %q is not the managed vmnet interface %q or an apple/container bridge", iface, p.VMNetInterface)
+}
+
+func (p Policy) checkPodNATInterface(iface string) error {
+	if p.checkVMNetInterface(iface) == nil {
+		return nil
+	}
+	if p.MeshInterface != "" && iface == p.MeshInterface {
+		return nil
+	}
+	return fmt.Errorf("interface %q is not a managed vmnet bridge or mesh interface", iface)
+}
+
+func isBridgeInterface(iface string) bool {
+	if !strings.HasPrefix(iface, "bridge") || len(iface) == len("bridge") {
+		return false
+	}
+	for _, r := range iface[len("bridge"):] {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // isReadOnlyProbe reports whether req is a harmless read-only probe (the ping),

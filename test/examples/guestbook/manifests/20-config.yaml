@@ -1,0 +1,217 @@
+# ConfigMaps for the guestbook frontend. Two of them, exercising both projection
+# styles in one app:
+#   - guestbook-config: env (configMapKeyRef -> APP_TITLE) plus a sourceable
+#     app.conf file mounted at /etc/guestbook, which tells the CGI where the
+#     leader/follower Services live and which Redis key to use. Keeping the Redis
+#     hostnames and list key here (not in code) follows the no-hardcoding rule.
+#   - guestbook-content: the static landing redirect and the CGI program, mounted
+#     read-only and copied into the served tree at startup.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: guestbook-config
+  namespace: macvz-guestbook
+  labels:
+    app.kubernetes.io/part-of: macvz-guestbook
+data:
+  APP_TITLE: "MacVz Guestbook"
+  # Sourced by the CGI. Service short-names resolve via the cluster DNS search
+  # domains MacVz injects (#37), so this stays correct under any namespace.
+  app.conf: |
+    REDIS_LEADER_HOST=redis-leader
+    REDIS_FOLLOWER_HOST=redis-follower
+    GUESTBOOK_KEY=guestbook:entries
+    APP_TITLE=MacVz Guestbook
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: guestbook-content
+  namespace: macvz-guestbook
+  labels:
+    app.kubernetes.io/part-of: macvz-guestbook
+data:
+  # Landing page: bounce the browser to the CGI, which renders the live page.
+  index.html: |
+    <!doctype html>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8">
+      <meta http-equiv="refresh" content="0; url=cgi-bin/api">
+      <title>MacVz Guestbook</title>
+    </head>
+    <body>
+      <p>Loading the guestbook… <a href="cgi-bin/api">continue</a>.</p>
+    </body>
+    </html>
+  # The guestbook CGI. Speaks Redis RESP over busybox `nc`; reads from the
+  # follower replica, writes to the leader. Validated end to end against
+  # redis:7-alpine + busybox:1.36.1 before shipping.
+  api: |
+    #!/bin/sh
+    # guestbook CGI — speaks the Redis RESP protocol over `nc` (both ship in busybox,
+    # arm64, no custom image). GET renders the guestbook page (entries read from the
+    # redis-follower read replica); POST appends a signed entry to the redis-leader.
+    # Reads are served from the follower and writes go to the leader, so the page
+    # proves Redis replication across two Deployments.
+    #
+    # Inputs (from the mounted ConfigMap app.conf and Secret file):
+    #   REDIS_LEADER_HOST   write target (redis-leader)
+    #   REDIS_FOLLOWER_HOST read target  (redis-follower)
+    #   GUESTBOOK_KEY       Redis list key
+    #   APP_TITLE           page heading
+    #   /etc/guestbook-secret/redis-password  AUTH password
+    #
+    # Entries are ASCII-sanitised (CR/LF and control bytes stripped, length capped)
+    # so each list element is a single RESP bulk string on one line.
+    set -u
+
+    CONF="${GUESTBOOK_CONF:-/etc/guestbook/app.conf}"
+    PASS_FILE="${GUESTBOOK_PASS_FILE:-/etc/guestbook-secret/redis-password}"
+    # shellcheck disable=SC1090
+    [ -r "$CONF" ] && . "$CONF"
+
+    LEADER="${REDIS_LEADER_HOST:-redis-leader}"
+    FOLLOWER="${REDIS_FOLLOWER_HOST:-redis-follower}"
+    KEY="${GUESTBOOK_KEY:-guestbook:entries}"
+    TITLE="${APP_TITLE:-MacVz Guestbook}"
+    PASS=""
+    [ -r "$PASS_FILE" ] && PASS="$(cat "$PASS_FILE")"
+
+    # redis HOST CMD ARG...  — sends an optional AUTH then one command as a RESP
+    # array, returns the raw reply. Lengths are byte counts of ASCII payloads.
+    redis() {
+      host="$1"
+      shift
+      {
+        if [ -n "$PASS" ]; then
+          printf '*2\r\n$4\r\nAUTH\r\n$%d\r\n%s\r\n' "${#PASS}" "$PASS"
+        fi
+        printf '*%d\r\n' "$#"
+        for a in "$@"; do
+          printf '$%d\r\n%s\r\n' "${#a}" "$a"
+        done
+      } | nc -w 3 "$host" 6379 2>/dev/null
+    }
+
+    # list_entries — LRANGE the list on the follower and emit one value per line.
+    # The RESP reply is parsed structurally: every bulk-length header ($<n>) is
+    # followed by exactly one value line, so values are reproduced verbatim
+    # regardless of their content (newlines were stripped on write).
+    list_entries() {
+      redis "$FOLLOWER" LRANGE "$KEY" 0 -1 | tr -d '\r' | awk '
+        /^\$-1$/ { next }
+        /^\$/    { want = 1; next }
+        want == 1 { print; want = 0; next }
+        { next }
+      '
+    }
+
+    # urldecode — decode application/x-www-form-urlencoded text.
+    urldecode() {
+      # Turn + into space and %XX into the byte, via printf.
+      s="$(printf '%s' "$1" | sed 's/+/ /g; s/%/\\x/g')"
+      printf '%b' "$s"
+    }
+
+    # sanitize — strip CR/LF and other control bytes, collapse to a single line, cap
+    # the length so one entry is always a single, bounded RESP bulk string.
+    sanitize() {
+      printf '%s' "$1" | tr -d '\000-\037' | cut -c1-280
+    }
+
+    # html_escape — minimal escaping so entry text renders as text, not markup.
+    html_escape() {
+      printf '%s' "$1" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g'
+    }
+
+    emit_page() {
+      note="$1"
+      printf 'Content-Type: text/html; charset=utf-8\r\n\r\n'
+      cat <<HTML
+    <!doctype html>
+    <html lang="en">
+    <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>${TITLE}</title>
+    <style>
+      :root { color-scheme: dark; }
+      body { margin:0; min-height:100vh; display:grid; place-items:center;
+        font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+        background: radial-gradient(circle at 30% 20%, #1f2a44, #0b1020 70%); color:#e8ecf4; }
+      .card { background: rgba(255,255,255,.04); border:1px solid rgba(255,255,255,.08);
+        border-radius:18px; padding:2rem 2.5rem; box-shadow:0 20px 60px rgba(0,0,0,.4);
+        width:min(40rem,92vw); }
+      h1 { margin:0 0 .25rem; font-size:1.8rem; }
+      p.tag { margin:0 0 1.25rem; color:#93a1c4; }
+      form { display:flex; gap:.5rem; margin-bottom:1.25rem; }
+      input[type=text] { flex:1; padding:.6rem .8rem; border-radius:10px;
+        border:1px solid rgba(255,255,255,.12); background:rgba(0,0,0,.25); color:#e8ecf4; }
+      button { padding:.6rem 1rem; border:0; border-radius:10px; font-weight:600;
+        background:#5ad17f; color:#06231a; cursor:pointer; }
+      ul { list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:.4rem; }
+      li { background:rgba(255,255,255,.04); border:1px solid rgba(255,255,255,.06);
+        border-radius:10px; padding:.55rem .8rem; font-family: ui-monospace, monospace; }
+      .empty { color:#93a1c4; font-style:italic; }
+      .note { color:#5ad17f; margin:0 0 1rem; }
+    </style>
+    </head>
+    <body>
+      <div class="card">
+        <h1>${TITLE}</h1>
+        <p class="tag">Writes go to <code>${LEADER}</code>; this list is read from <code>${FOLLOWER}</code>.</p>
+    HTML
+      [ -n "$note" ] && printf '    <p class="note">%s</p>\n' "$note"
+      cat <<'HTML'
+        <form method="post" action="">
+          <input type="text" name="entry" placeholder="Sign the guestbook…" maxlength="280" autofocus>
+          <button type="submit">Add</button>
+        </form>
+        <ul>
+    HTML
+      entries="$(list_entries)"
+      if [ -z "$entries" ]; then
+        printf '      <li class="empty">No entries yet — be the first to sign.</li>\n'
+      else
+        # Newest first (awk reverse is portable across busybox builds).
+        printf '%s\n' "$entries" | awk '{a[NR]=$0} END{for(i=NR;i>=1;i--) if(a[i]!="") print a[i]}' |
+          while IFS= read -r line; do
+            printf '      <li>%s</li>\n' "$(html_escape "$line")"
+          done
+      fi
+      cat <<'HTML'
+        </ul>
+      </div>
+    </body>
+    </html>
+    HTML
+    }
+
+    case "${REQUEST_METHOD:-GET}" in
+    POST)
+      len="${CONTENT_LENGTH:-0}"
+      body=""
+      [ "$len" -gt 0 ] 2>/dev/null && body="$(dd bs=1 count="$len" 2>/dev/null)"
+      # body is entry=<urlencoded>
+      raw="${body#entry=}"
+      entry="$(sanitize "$(urldecode "$raw")")"
+      note=""
+      if [ -n "$entry" ]; then
+        reply="$(redis "$LEADER" RPUSH "$KEY" "$entry")"
+        case "$reply" in
+        :*) note="Added." ;;
+        *)  note="Could not save entry (Redis write failed)." ;;
+        esac
+      fi
+      # Post/Redirect/Get so a browser refresh does not re-submit.
+      if [ -n "${HTTP_HOST:-}" ]; then
+        printf 'Status: 303 See Other\r\nLocation: %s\r\n\r\n' "${SCRIPT_NAME:-/cgi-bin/api}"
+      else
+        emit_page "$note"
+      fi
+      ;;
+    *)
+      emit_page ""
+      ;;
+    esac

@@ -24,6 +24,17 @@ func (p *Provider) allocateIP(key string) (string, error) {
 	return ipam.Allocate(key)
 }
 
+// hasAllocatedIP reports whether key already holds an IP before this create
+// attempt. Startup recovery pre-reserves API-observed PodIPs; a failed adoption
+// retry must not release those durable reservations back to the pool.
+func (p *Provider) hasAllocatedIP(key string) bool {
+	ipam := p.ipamRef()
+	if ipam == nil {
+		return false
+	}
+	return ipam.IP(key) != ""
+}
+
 // releaseIP returns key's Pod IP to the pool. It is a no-op when IPAM is
 // disabled or key holds no address, so deletion stays idempotent.
 func (p *Provider) releaseIP(key string) {

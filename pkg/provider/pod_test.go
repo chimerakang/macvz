@@ -303,6 +303,133 @@ func TestCreatePodIdempotent(t *testing.T) {
 	}
 }
 
+// seedWorkload makes the runtime report a micro-VM under the deterministic
+// workload ID for (ns/name/container), as if it had been left behind by a
+// previous kubelet process. The provider's in-memory store is left empty,
+// modelling the state right after a kubelet restart.
+func (r *recordingRuntime) seedWorkload(id string, phase runtime.Phase, ip string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.exists[id] = true
+	r.statuses[id] = runtime.Status{ID: id, Phase: phase, StartedAt: time.Now(), IP: ip}
+}
+
+func (r *recordingRuntime) seedRunningWorkload(id, ip string) {
+	r.seedWorkload(id, runtime.PhaseRunning, ip)
+}
+
+func TestCreatePodAdoptsExistingWorkloadAfterRestart(t *testing.T) {
+	p, rt := newTestProvider()
+	id := WorkloadID("default", "p1", "web")
+	rt.seedRunningWorkload(id, "")
+
+	// A fresh provider (empty store) reconciling a Pod whose micro-VM survived a
+	// kubelet restart must adopt the running VM, not pull/create/start a new one.
+	if err := p.CreatePod(context.Background(), testPod("web")); err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+	pulls, creates, starts, _, _ := rt.counts()
+	if pulls != 0 || creates != 0 || starts != 0 {
+		t.Errorf("adoption should not pull/create/start: pulls=%d creates=%d starts=%d, want 0/0/0", pulls, creates, starts)
+	}
+
+	got, err := p.GetPod(context.Background(), "default", "p1")
+	if err != nil {
+		t.Fatalf("GetPod: %v", err)
+	}
+	if got.Status.Phase != corev1.PodRunning {
+		t.Errorf("phase = %q, want Running", got.Status.Phase)
+	}
+	if len(got.Status.ContainerStatuses) != 1 {
+		t.Fatalf("container statuses = %d, want 1", len(got.Status.ContainerStatuses))
+	}
+}
+
+// TestCreatePodAdoptionSkipsImagePull is the correctness payoff of #66: a
+// recovered VM must come back even when the image could no longer be pulled —
+// e.g. its private-registry pull Secret has since been rotated away. Without
+// adoption, the re-pull would fail and leave a healthy running container stuck in
+// a failing Pod.
+func TestCreatePodAdoptionSkipsImagePull(t *testing.T) {
+	rt := newRecordingRuntime()
+	rt.pullErr = runtime.ErrNotReady // any pull now fails
+	// No SecretGetter wired, so resolving an imagePullSecret would itself error —
+	// proving adoption bypasses the whole pull/credentials path.
+	p := New("mac-01", rt)
+
+	id := WorkloadID("default", "p1", "web")
+	rt.seedRunningWorkload(id, "")
+
+	pod := testPod("web")
+	pod.Spec.Containers[0].Image = "registry.example.com/team/app:v1"
+	pod.Spec.ImagePullSecrets = []corev1.LocalObjectReference{{Name: "rotated-away"}}
+
+	if err := p.CreatePod(context.Background(), pod); err != nil {
+		t.Fatalf("CreatePod should adopt the running VM without pulling: %v", err)
+	}
+	pulls, creates, _, _, _ := rt.counts()
+	if pulls != 0 || creates != 0 {
+		t.Errorf("adoption pulled/created despite a live VM: pulls=%d creates=%d, want 0/0", pulls, creates)
+	}
+}
+
+func TestCreatePodStartsCreatedWorkloadAfterRestart(t *testing.T) {
+	p, rt := newTestProvider()
+	id := WorkloadID("default", "p1", "web")
+	rt.seedWorkload(id, runtime.PhaseCreated, "")
+
+	// If the previous kubelet died after Create but before Start, restart
+	// recovery should boot that existing VM instead of leaving it stuck in
+	// Created or creating a duplicate.
+	if err := p.CreatePod(context.Background(), testPod("web")); err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+	pulls, creates, starts, _, _ := rt.counts()
+	if pulls != 0 || creates != 0 || starts != 1 {
+		t.Errorf("created-workload adoption should only start: pulls=%d creates=%d starts=%d, want 0/0/1", pulls, creates, starts)
+	}
+	rt.mu.Lock()
+	startedID := ""
+	if len(rt.startedIDs) == 1 {
+		startedID = rt.startedIDs[0]
+	}
+	rt.mu.Unlock()
+	if startedID != id {
+		t.Fatalf("started workload %q, want recovered id %q", startedID, id)
+	}
+
+	got, err := p.GetPod(context.Background(), "default", "p1")
+	if err != nil {
+		t.Fatalf("GetPod: %v", err)
+	}
+	if got.Status.Phase != corev1.PodRunning {
+		t.Errorf("phase = %q, want Running", got.Status.Phase)
+	}
+}
+
+func TestCreatePodRestartsRecoveredStoppedWorkload(t *testing.T) {
+	p, rt := newTestProvider()
+	p.restartBackoffBase = 0
+	id := WorkloadID("default", "p1", "web")
+	rt.seedWorkload(id, runtime.PhaseStopped, "")
+
+	if err := p.CreatePod(context.Background(), restartTestPod(corev1.RestartPolicyAlways, "web")); err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+
+	st := waitForRestartCount(t, p, "default", "p1", 1)
+	if st.Phase != corev1.PodRunning {
+		t.Errorf("phase = %q, want Running after recovered workload restart", st.Phase)
+	}
+	pulls, creates, starts, _, destroys := rt.counts()
+	if pulls != 0 {
+		t.Errorf("recovered stopped workload should not be re-pulled, got pulls=%d", pulls)
+	}
+	if creates != 1 || starts != 1 || destroys != 1 {
+		t.Errorf("restart counts = creates %d starts %d destroys %d, want 1/1/1", creates, starts, destroys)
+	}
+}
+
 func TestCreatePodConcurrentIdempotent(t *testing.T) {
 	p, rt := newTestProvider()
 	ctx := context.Background()

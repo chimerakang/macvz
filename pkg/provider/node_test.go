@@ -64,7 +64,8 @@ func findCondition(node *corev1.Node, t corev1.NodeConditionType) (corev1.NodeCo
 
 func TestBuildNodeShape(t *testing.T) {
 	p := New("mac-01", pingableRuntime{})
-	node := p.BuildNode(context.Background(), testSpec())
+	spec := testSpec()
+	node := p.BuildNode(context.Background(), spec)
 
 	if node.Name != "mac-01" {
 		t.Errorf("Name = %q, want mac-01", node.Name)
@@ -91,6 +92,14 @@ func TestBuildNodeShape(t *testing.T) {
 	}
 	if len(node.Spec.Taints) != 1 || node.Spec.Taints[0].Key != "virtual-kubelet.io/provider" {
 		t.Errorf("taints = %v, want the provider taint", node.Spec.Taints)
+	}
+
+	node.Status.Capacity[corev1.ResourceCPU] = resource.MustParse("99")
+	if spec.Capacity.Cpu().String() != "4" {
+		t.Errorf("BuildNode capacity aliases caller spec map; spec CPU changed to %s", spec.Capacity.Cpu().String())
+	}
+	if node.Status.Allocatable.Cpu().String() != "4" {
+		t.Errorf("BuildNode capacity aliases allocatable map; allocatable CPU changed to %s", node.Status.Allocatable.Cpu().String())
 	}
 
 	var foundIP bool
@@ -153,5 +162,65 @@ func TestBuildNodeAdvertisesKubeletPortOnlyWhenConfigured(t *testing.T) {
 	node = New("n", fakeRuntime{}).BuildNode(context.Background(), spec)
 	if node.Status.DaemonEndpoints.KubeletEndpoint.Port != 10250 {
 		t.Errorf("kubelet endpoint port = %d, want 10250", node.Status.DaemonEndpoints.KubeletEndpoint.Port)
+	}
+}
+
+// diskRuntime adds the optional runtime.DiskReporter capability (#68).
+type diskRuntime struct {
+	fakeRuntime
+	fs    runtime.FilesystemUsage
+	fsErr error
+}
+
+func (d diskRuntime) NodeFilesystem(context.Context) (runtime.FilesystemUsage, error) {
+	return d.fs, d.fsErr
+}
+func (d diskRuntime) ImageCacheUsage(context.Context) (runtime.ImageCacheUsage, error) {
+	return runtime.ImageCacheUsage{}, nil
+}
+
+func TestBuildNodeAdvertisesEphemeralStorageFromDiskReporter(t *testing.T) {
+	rt := diskRuntime{fs: runtime.FilesystemUsage{TotalBytes: 500 << 30, AvailableBytes: 300 << 30}}
+	spec := testSpec()
+	node := New("mac-01", rt).BuildNode(context.Background(), spec)
+
+	cap := node.Status.Capacity[corev1.ResourceEphemeralStorage]
+	if cap.Value() != int64(500<<30) {
+		t.Errorf("ephemeral-storage capacity = %d, want %d", cap.Value(), int64(500<<30))
+	}
+	alloc := node.Status.Allocatable[corev1.ResourceEphemeralStorage]
+	if alloc.Value() != int64(300<<30) {
+		t.Errorf("ephemeral-storage allocatable = %d, want %d", alloc.Value(), int64(300<<30))
+	}
+	// The caller's spec map must not be mutated by node construction.
+	if _, set := spec.Capacity[corev1.ResourceEphemeralStorage]; set {
+		t.Error("BuildNode mutated the caller's spec.Capacity map")
+	}
+}
+
+func TestBuildNodeKeepsExplicitEphemeralStorage(t *testing.T) {
+	rt := diskRuntime{fs: runtime.FilesystemUsage{TotalBytes: 500 << 30, AvailableBytes: 300 << 30}}
+	spec := testSpec()
+	spec.Capacity[corev1.ResourceEphemeralStorage] = resource.MustParse("10Gi")
+
+	node := New("mac-01", rt).BuildNode(context.Background(), spec)
+	cap := node.Status.Capacity[corev1.ResourceEphemeralStorage]
+	if cap.Value() != 10<<30 {
+		t.Errorf("explicit ephemeral-storage = %d, want %d (operator value preserved)", cap.Value(), int64(10<<30))
+	}
+}
+
+func TestBuildNodeOmitsEphemeralStorageWithoutDiskReporter(t *testing.T) {
+	node := New("mac-01", fakeRuntime{}).BuildNode(context.Background(), testSpec())
+	if _, set := node.Status.Capacity[corev1.ResourceEphemeralStorage]; set {
+		t.Error("ephemeral-storage should be absent when the runtime cannot report disk")
+	}
+}
+
+func TestBuildNodeOmitsEphemeralStorageOnDiskError(t *testing.T) {
+	rt := diskRuntime{fsErr: runtime.ErrDiskUsageUnavailable}
+	node := New("mac-01", rt).BuildNode(context.Background(), testSpec())
+	if _, set := node.Status.Capacity[corev1.ResourceEphemeralStorage]; set {
+		t.Error("ephemeral-storage should be absent when NodeFilesystem errors")
 	}
 }

@@ -8,6 +8,7 @@ import (
 
 	"github.com/chimerakang/macvz/pkg/network"
 	"github.com/chimerakang/macvz/pkg/network/podnet"
+	"github.com/chimerakang/macvz/pkg/runtime"
 	corev1 "k8s.io/api/core/v1"
 )
 
@@ -112,6 +113,29 @@ func TestCreatePodRollsBackAndReleasesIPWhenAttachFails(t *testing.T) {
 		if got := len(p.ipam.Allocations()); got != 0 {
 			t.Errorf("failed attach leaked %d IP allocations", got)
 		}
+	}
+}
+
+func TestCreatePodPreservesRecoveredIPWhenAdoptedAttachFails(t *testing.T) {
+	p, rt, pn := newPodNetProvider(t)
+	key := "default/p1"
+	id := WorkloadID("default", "p1", "web")
+	if err := p.ipam.Reserve(key, "10.244.1.5"); err != nil {
+		t.Fatalf("reserve recovered IP: %v", err)
+	}
+	rt.seedWorkload(id, runtime.PhaseRunning, "192.168.64.5")
+	pn.attachErr = fmt.Errorf("pfctl boom")
+
+	if err := p.CreatePod(context.Background(), testPod("web")); err == nil {
+		t.Fatal("expected CreatePod to fail when adopted network attach fails")
+	}
+
+	if got := p.ipam.IP(key); got != "10.244.1.5" {
+		t.Fatalf("recovered PodIP reservation was released: got %q, want 10.244.1.5", got)
+	}
+	_, creates, _, _, destroys := rt.counts()
+	if creates != 0 || destroys != 0 {
+		t.Errorf("adopted workload should not be recreated or destroyed on attach failure: creates=%d destroys=%d", creates, destroys)
 	}
 }
 

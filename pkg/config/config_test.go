@@ -107,6 +107,19 @@ func TestRuntimeSocketIsOptional(t *testing.T) {
 	}
 }
 
+func TestRuntimeDataRootMustBeAbsoluteWhenSet(t *testing.T) {
+	c := Default()
+	c.RuntimeDataRoot = "relative/data"
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected relative runtimeDataRoot to fail validation")
+	}
+
+	c.RuntimeDataRoot = "/Users/operator/.container"
+	if err := c.Validate(); err != nil {
+		t.Fatalf("absolute runtimeDataRoot should validate: %v", err)
+	}
+}
+
 func TestDefaultNodeCapacity(t *testing.T) {
 	c := Default()
 	cap, err := c.Capacity()
@@ -195,8 +208,8 @@ func TestDefaultHeartbeat(t *testing.T) {
 	if ping != 10*time.Second {
 		t.Errorf("ping = %v, want 10s", ping)
 	}
-	if status != time.Minute {
-		t.Errorf("status = %v, want 1m", status)
+	if status != 10*time.Second {
+		t.Errorf("status = %v, want 10s", status)
 	}
 }
 
@@ -229,6 +242,19 @@ func TestValidateRejectsBadLeaseDuration(t *testing.T) {
 	c.Node.EnableLease = false
 	if err := c.Validate(); err != nil {
 		t.Fatalf("lease duration should be ignored when leases disabled: %v", err)
+	}
+}
+
+func TestValidateRejectsStatusIntervalLongerThanLease(t *testing.T) {
+	c := Default()
+	c.Node.LeaseDurationSeconds = 40
+	c.Node.StatusUpdateInterval = "40s"
+	if err := c.Validate(); err == nil {
+		t.Fatal("Validate should reject status interval equal to lease duration")
+	}
+	c.Node.EnableLease = false
+	if err := c.Validate(); err != nil {
+		t.Fatalf("status interval may exceed lease duration when leases disabled: %v", err)
 	}
 }
 

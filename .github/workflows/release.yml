@@ -1,6 +1,6 @@
 name: Release
 
-# Build, sign, notarize, and publish a darwin/arm64 macvz-kubelet release.
+# Build, sign, notarize, and publish darwin/arm64 MacVz release artifacts.
 # Triggered by pushing a version tag (e.g. v0.4.0).
 #
 # Signing and notarization run only when the required secrets are present, so

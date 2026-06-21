@@ -480,6 +480,70 @@ surfaces — logs, exec, attach, port-forward — and container stats, which kub
 exercises immediately after a Pod goes Ready. The CRI route remains **not**
 stopped.
 
+## CRI-P6: Logs, Exec, Attach, Port-Forward, Stats
+
+CRI-P6 gives the experimental adapter the kubelet-facing operational surfaces a
+node needs once a Pod is Ready (#78): `kubectl logs`, `kubectl exec`,
+`kubectl port-forward`, and container/Pod stats. All `apple/container`
+assumptions stay inside `pkg/runtime`; the adapter reaches them through the
+narrow `ContainerRuntime`/`statsRuntime` interfaces it already owns.
+
+### What is honest
+
+- **Logs** (`pkg/criserver/logs.go`). CRI logging is file-based, not an RPC: the
+  runtime must write each container's output to the CRI log file, and kubelet
+  reads that file directly. On `StartContainer` the adapter opens a follow stream
+  over the workload (`container logs --follow`) and pumps every line into
+  `<LogDirectory>/<LogPath>` in the kubelet format
+  `<RFC3339Nano> stdout F <message>`. `ReopenContainerLog` swaps the destination
+  file for kubelet's log rotation. The pump runs on a background context, is
+  reaped on stop/remove, and never fails or blocks the container start.
+- **Exec / ExecSync** (`pkg/criserver/streaming.go`). The `Exec` RPC validates the
+  container is Running and hands kubelet a streaming URL minted by the
+  `k8s.io/kubelet/pkg/cri/streaming` server, whose backend runs `container exec`
+  with the client's stdin/stdout/stderr and TTY. `ExecSync` runs a command to
+  completion and returns captured stdout/stderr and the exit code — the path
+  kubelet uses for exec liveness/readiness probes. A clean non-zero exit is
+  reported as an exit code, not an RPC error.
+- **Port-forward** (`pkg/criserver/streaming.go`). The `PortForward` RPC hands
+  kubelet a streaming URL; the backend dials the Pod micro-VM's address directly
+  (the kubelet shares the host with the guest, so the host-only address is always
+  reachable) and proxies bytes both ways until either side closes. Both copy
+  goroutines and the connection are always reaped.
+- **Stats** (`pkg/criserver/stats.go`). `ContainerStats`, `ListContainerStats`,
+  `PodSandboxStats`, and `ListPodSandboxStats` sample the runtime's optional
+  `Stater` capability (`container stats`). CPU (cumulative core-nanoseconds) and
+  memory (working set, usage, and available against a known limit) are mapped to
+  the CRI shapes. A container that is not running or whose sample is unavailable
+  is reported with only its attributes — never faked zeros — so a consumer cannot
+  mistake "unobservable" for "idle". With one container per Pod (CRI-P3), Pod
+  stats lift the single container's sample to the Pod level.
+
+### Documented limitations
+
+- **Attach is unsupported.** `apple/container` exposes no honest way to reattach
+  to a started container's primary process streams, so the `Attach` RPC returns
+  `codes.Unimplemented` with that reason rather than minting a URL that would
+  carry nothing. `kubectl exec` is the supported alternative.
+- **Logs merge stdout and stderr.** `container logs` returns one combined stream,
+  so every CRI log line is tagged `stdout`. The `F` (full) tag is always used
+  because the pump reassembles complete lines before writing.
+- **No writable-layer / swap / PSI stats.** The micro-VM runtime exposes no
+  honest source for those fields in this phase, so they are left unset.
+- **Streaming requires a configured server.** Started without `--streaming-addr`,
+  `Exec`/`PortForward` return `FailedPrecondition` rather than a dead URL. The
+  default binds `127.0.0.1:0` (kubelet runs on the same Mac).
+
+### CRI-P6 Decision
+
+The operational surfaces are **proven and honest** over the CRI path: logs, exec,
+exec-sync, port-forward, and stats all work through kubelet-compatible endpoints,
+and the one surface the runtime cannot back — attach — fails loudly instead of
+faking success. The CRI route remains **not** stopped. The remaining gap before a
+default-capable node is multi-container Pod support, which stays explicitly out of
+scope. A live kubelet/k3s smoke (`kubectl logs`/`exec`/`port-forward` against a
+single-container Pod on the experimental CRI node) is the natural next validation.
+
 ## Reproducible Probe
 
 Run:

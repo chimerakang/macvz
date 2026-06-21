@@ -36,13 +36,14 @@ type fakeRuntime struct {
 	startIP string
 
 	// CRI-P6 streaming/logging/stats knobs (#78).
-	logsData    string     // bytes the Logs follow stream emits
-	logsErr     error      // injected Logs failure
-	logsFollow  bool       // records the last Follow option seen by Logs
-	execStdout  string     // written to the Exec stdout stream
-	execStderr  string     // written to the Exec stderr stream
-	execErr     error      // injected Exec result (e.g. *runtime.ExitError)
-	execCalls   [][]string // commands passed to Exec
+	logsData    string        // bytes the Logs follow stream emits
+	logsReader  io.ReadCloser // when set, Logs returns this instead of logsData
+	logsErr     error         // injected Logs failure
+	logsFollow  bool          // records the last Follow option seen by Logs
+	execStdout  string        // written to the Exec stdout stream
+	execStderr  string        // written to the Exec stderr stream
+	execErr     error         // injected Exec result (e.g. *runtime.ExitError)
+	execCalls   [][]string    // commands passed to Exec
 	statsSample runtime.ResourceStats
 	statsErr    error // injected Stats failure (e.g. runtime.ErrStatsUnavailable)
 }
@@ -130,6 +131,9 @@ func (f *fakeRuntime) Logs(_ context.Context, _ string, opts runtime.LogOptions)
 	f.logsFollow = opts.Follow
 	if f.logsErr != nil {
 		return nil, f.logsErr
+	}
+	if f.logsReader != nil {
+		return f.logsReader, nil
 	}
 	return io.NopCloser(strings.NewReader(f.logsData)), nil
 }

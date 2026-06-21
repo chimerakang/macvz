@@ -5,6 +5,7 @@ import ContainerizationExtras
 import ContainerizationOCI
 import Foundation
 import Logging
+@preconcurrency import Virtualization
 
 @main
 struct LinuxPodSharedNamespacePoC: AsyncParsableCommand {
@@ -31,7 +32,7 @@ struct LinuxPodSharedNamespacePoC: AsyncParsableCommand {
     @Option(help: "TCP port inside the shared Pod namespace.")
     var port: Int = 18080
 
-    @Option(help: "Probe to run: c1 for pre-create two-container semantics, c2 for post-create addContainer ordering.")
+    @Option(help: "Probe to run: c1 for pre-create two-container semantics, c2 for post-create addContainer ordering, c4 for HotplugProvider boundary.")
     var probe: String = "c1"
 
     @Flag(help: "Enable Rosetta for linux/amd64 images.")
@@ -82,8 +83,19 @@ struct LinuxPodSharedNamespacePoC: AsyncParsableCommand {
             )
             return
         }
+        if probe == "c4" {
+            try await runHotplugProviderProbe(
+                imageStore: imageStore,
+                vmm: vmm,
+                logger: logger,
+                startedAt: startedAt,
+                logsURL: logsURL,
+                rootfsURL: rootfsURL
+            )
+            return
+        }
         guard probe == "c1" else {
-            throw ValidationError("unsupported probe \(probe); expected c1 or c2")
+            throw ValidationError("unsupported probe \(probe); expected c1, c2, or c4")
         }
 
         let podID = "macvz-poc-\(Int(startedAt.timeIntervalSince1970))"
@@ -369,6 +381,168 @@ struct LinuxPodSharedNamespacePoC: AsyncParsableCommand {
         }
     }
 
+    private func runHotplugProviderProbe(
+        imageStore: ImageStore,
+        vmm: VZVirtualMachineManager,
+        logger: Logger,
+        startedAt: Date,
+        logsURL: URL,
+        rootfsURL: URL
+    ) async throws {
+        let podID = "macvz-c4-\(Int(startedAt.timeIntervalSince1970))"
+        let probeState = HotplugProbeState()
+        let hotplugExtension = ProbeHotplugExtension(state: probeState)
+        let pod = try LinuxPod(podID, vmm: vmm, logger: logger) { config in
+            config.cpus = 2
+            config.memoryInBytes = 1024 * 1024 * 1024
+            config.hostname = "macvz-linuxpod-c4"
+            config.bootLog = .file(path: logsURL.appendingPathComponent("boot.log"))
+            config.extensions.append(hotplugExtension)
+        }
+
+        let baseImage = try await imageStore.get(reference: image, pull: true)
+        let serverRootfs = try await unpackRootfs(baseImage, at: rootfsURL.appendingPathComponent("server.ext4"))
+        let clientRootfs = try await unpackRootfs(baseImage, at: rootfsURL.appendingPathComponent("late-client.ext4"))
+
+        let serverLog = try FileLogWriter(path: logsURL.appendingPathComponent("server.log"), stream: "stdout")
+        let serverErr = try FileLogWriter(path: logsURL.appendingPathComponent("server.log"), stream: "stderr")
+        let clientLog = try FileLogWriter(path: logsURL.appendingPathComponent("late-client.log"), stream: "stdout")
+        let clientErr = try FileLogWriter(path: logsURL.appendingPathComponent("late-client.log"), stream: "stderr")
+        let execLog = try FileLogWriter(path: logsURL.appendingPathComponent("exec.log"), stream: "stdout")
+
+        var podCreated = false
+        var serverStarted = false
+        var lateAddReturned = false
+        var lateStartSucceeded = false
+        var localhostAfterLateAdd = false
+        var errors: [String: String] = [:]
+
+        do {
+            try await pod.addContainer("server", rootfs: serverRootfs) { config in
+                config.process.arguments = [
+                    "/bin/sh",
+                    "-c",
+                    "mkdir -p /www; echo macvz-linuxpod-hotplug-ok > /www/index.html; exec httpd -f -p 127.0.0.1:\(port) -h /www",
+                ]
+                config.process.environmentVariables = ["PATH=\(LinuxProcessConfiguration.defaultPath)"]
+                config.process.workingDirectory = "/"
+                config.process.stdout = serverLog
+                config.process.stderr = serverErr
+                config.useInit = true
+            }
+
+            try await pod.create()
+            podCreated = true
+            try await pod.startContainer("server")
+            serverStarted = true
+
+            do {
+                try await pod.addContainer("late-client", rootfs: clientRootfs) { config in
+                    config.process.arguments = [
+                        "/bin/sh",
+                        "-c",
+                        "for i in $(seq 1 30); do if wget -qO /tmp/localhost-result http://127.0.0.1:\(port); then grep -q macvz-linuxpod-hotplug-ok /tmp/localhost-result && touch /tmp/localhost-ok && exec sleep 300; fi; sleep 1; done; exit 42",
+                    ]
+                    config.process.environmentVariables = ["PATH=\(LinuxProcessConfiguration.defaultPath)"]
+                    config.process.workingDirectory = "/"
+                    config.process.stdout = clientLog
+                    config.process.stderr = clientErr
+                    config.useInit = true
+                }
+                lateAddReturned = true
+            } catch {
+                errors["lateAdd"] = describe(error)
+            }
+
+            if lateAddReturned {
+                do {
+                    try await pod.startContainer("late-client")
+                    lateStartSucceeded = true
+                    try await waitForClientProbe(pod, containerID: "late-client", stdout: execLog, timeoutSeconds: 45)
+                    localhostAfterLateAdd = true
+                } catch {
+                    errors["lateStartOrProbe"] = describe(error)
+                }
+            }
+
+            if lateStartSucceeded {
+                try? await pod.stopContainer("late-client")
+            }
+            if serverStarted {
+                try? await pod.stopContainer("server")
+            }
+            try await pod.stop()
+            try close(serverLog, serverErr, clientLog, clientErr, execLog)
+
+            let snapshot = probeState.snapshot()
+            let outcome = hotplugOutcome(
+                snapshot: snapshot,
+                lateAddReturned: lateAddReturned,
+                lateStartSucceeded: lateStartSucceeded,
+                localhostAfterLateAdd: localhostAfterLateAdd
+            )
+            let result = HotplugProbeSummary(
+                podID: podID,
+                image: image,
+                kernel: kernel,
+                workDir: workDir,
+                durationSeconds: Date().timeIntervalSince(startedAt),
+                providerInstalled: snapshot.providerInstalled,
+                providerCalled: snapshot.providerCalled,
+                usbControllerConfigured: snapshot.usbControllerConfigured,
+                usbAttachAttempted: snapshot.usbAttachAttempted,
+                usbAttachSucceeded: snapshot.usbAttachSucceeded,
+                guestPathResolved: snapshot.guestPathResolved,
+                lateAddReturned: lateAddReturned,
+                lateStartSucceeded: lateStartSucceeded,
+                localhostAfterLateAdd: localhostAfterLateAdd,
+                outcome: outcome,
+                providerEvents: snapshot.events,
+                errors: errors,
+                logs: [
+                    "server": logsURL.appendingPathComponent("server.log").path,
+                    "lateClient": logsURL.appendingPathComponent("late-client.log").path,
+                    "exec": logsURL.appendingPathComponent("exec.log").path,
+                    "boot": logsURL.appendingPathComponent("boot.log").path,
+                ]
+            )
+            print(try result.jsonString())
+        } catch {
+            if podCreated {
+                try? await pod.stop()
+            }
+            try? close(serverLog, serverErr, clientLog, clientErr, execLog)
+            throw error
+        }
+    }
+
+    private func hotplugOutcome(
+        snapshot: HotplugProbeSnapshot,
+        lateAddReturned: Bool,
+        lateStartSucceeded: Bool,
+        localhostAfterLateAdd: Bool
+    ) -> String {
+        if !snapshot.providerInstalled {
+            return "providerCannotBeInstalled"
+        }
+        if !snapshot.providerCalled {
+            return "providerInstalledButNotCalled"
+        }
+        if snapshot.usbAttachAttempted && !snapshot.usbAttachSucceeded {
+            return "providerCalledButPublicApiCannotAttachRootfs"
+        }
+        if snapshot.usbAttachSucceeded && !snapshot.guestPathResolved {
+            return "providerCalledUsbAttachedNoGuestPath"
+        }
+        if lateAddReturned && !lateStartSucceeded {
+            return "rootfsAttachedButLateContainerDidNotStart"
+        }
+        if lateStartSucceeded && localhostAfterLateAdd {
+            return "lateContainerStartedSuccessfully"
+        }
+        return "unknown"
+    }
+
     private func waitForClientProbe(_ pod: LinuxPod, stdout: FileLogWriter) async throws {
         try await waitForClientProbe(pod, containerID: "client", stdout: stdout, timeoutSeconds: 90)
     }
@@ -441,6 +615,224 @@ private struct OrderingProbeSummary: Encodable {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         return String(decoding: try encoder.encode(self), as: UTF8.self)
+    }
+}
+
+private struct HotplugProbeSummary: Encodable {
+    let podID: String
+    let image: String
+    let kernel: String
+    let workDir: String
+    let durationSeconds: TimeInterval
+    let providerInstalled: Bool
+    let providerCalled: Bool
+    let usbControllerConfigured: Bool
+    let usbAttachAttempted: Bool
+    let usbAttachSucceeded: Bool
+    let guestPathResolved: Bool
+    let lateAddReturned: Bool
+    let lateStartSucceeded: Bool
+    let localhostAfterLateAdd: Bool
+    let outcome: String
+    let providerEvents: [String]
+    let errors: [String: String]
+    let logs: [String: String]
+
+    func jsonString() throws -> String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        return String(decoding: try encoder.encode(self), as: UTF8.self)
+    }
+}
+
+private struct HotplugProbeSnapshot {
+    let providerInstalled: Bool
+    let providerCalled: Bool
+    let usbControllerConfigured: Bool
+    let usbAttachAttempted: Bool
+    let usbAttachSucceeded: Bool
+    let guestPathResolved: Bool
+    let events: [String]
+}
+
+private final class HotplugProbeState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var providerInstalledValue = false
+    private var providerCalledValue = false
+    private var usbControllerConfiguredValue = false
+    private var usbAttachAttemptedValue = false
+    private var usbAttachSucceededValue = false
+    private var guestPathResolvedValue = false
+    private var eventsValue: [String] = []
+
+    func mark(_ event: String) {
+        lock.lock()
+        eventsValue.append(event)
+        switch event {
+        case "providerInstalled":
+            providerInstalledValue = true
+        case "providerCalled":
+            providerCalledValue = true
+        case "usbControllerConfigured":
+            usbControllerConfiguredValue = true
+        case "usbAttachAttempted":
+            usbAttachAttemptedValue = true
+        case "usbAttachSucceeded":
+            usbAttachSucceededValue = true
+        case "guestPathResolved":
+            guestPathResolvedValue = true
+        default:
+            break
+        }
+        lock.unlock()
+    }
+
+    func snapshot() -> HotplugProbeSnapshot {
+        lock.lock()
+        defer { lock.unlock() }
+        return HotplugProbeSnapshot(
+            providerInstalled: providerInstalledValue,
+            providerCalled: providerCalledValue,
+            usbControllerConfigured: usbControllerConfiguredValue,
+            usbAttachAttempted: usbAttachAttemptedValue,
+            usbAttachSucceeded: usbAttachSucceededValue,
+            guestPathResolved: guestPathResolvedValue,
+            events: eventsValue
+        )
+    }
+}
+
+private struct HotplugProbeFailure: Error, CustomStringConvertible {
+    let description: String
+}
+
+private final class ProbeHotplugExtension: VZInstanceExtension, @unchecked Sendable {
+    private let state: HotplugProbeState
+
+    init(state: HotplugProbeState) {
+        self.state = state
+    }
+
+    func configureVZ(
+        _ config: inout VZVirtualMachineConfiguration,
+        allocator: any AddressAllocator<Character>,
+        storageDeviceCount: Int,
+        mountsByID: [String: [Containerization.Mount]]
+    ) throws {
+        config.usbControllers.append(VZXHCIControllerConfiguration())
+        state.mark("usbControllerConfigured")
+    }
+
+    func didCreate(_ instance: VZVirtualMachineInstance) throws {
+        instance.hotplugProvider = ProbeHotplugProvider(instance: instance, state: state)
+        state.mark("providerInstalled")
+    }
+}
+
+private final class ProbeHotplugProvider: HotplugProvider, @unchecked Sendable {
+    private let instance: VZVirtualMachineInstance
+    private let state: HotplugProbeState
+    private let lock = NSLock()
+    private var devicesByID: [String: VZUSBMassStorageDevice] = [:]
+
+    init(instance: VZVirtualMachineInstance, state: HotplugProbeState) {
+        self.instance = instance
+        self.state = state
+    }
+
+    func hotplug(_ block: Containerization.Mount, id: String) async throws -> AttachedFilesystem {
+        state.mark("providerCalled")
+        guard block.isBlock else {
+            throw HotplugProbeFailure(description: "hotplug probe only handles block rootfs mounts")
+        }
+        state.mark("usbAttachAttempted")
+
+        let attachment = try VZDiskImageStorageDeviceAttachment(
+            url: URL(fileURLWithPath: block.source),
+            readOnly: block.options.contains("ro"),
+            cachingMode: .cached,
+            synchronizationMode: .fsync
+        )
+        let configuration = VZUSBMassStorageDeviceConfiguration(attachment: attachment)
+        let device = VZUSBMassStorageDevice(configuration: configuration)
+
+        try await attach(device: device)
+        storeDevice(device, id: id)
+        state.mark("usbAttachSucceeded")
+
+        throw HotplugProbeFailure(
+            description: "USB mass storage attach succeeded, but no public API provided a deterministic Linux guest block path for the ext4 rootfs; refusing to return a guessed AttachedFilesystem"
+        )
+    }
+
+    func registerMounts(id: String, rootfs: AttachedFilesystem, additionalMounts: [Containerization.Mount]) throws {
+        throw HotplugProbeFailure(description: "registerMounts should not be reached unless a real guest rootfs path is resolved")
+    }
+
+    func releaseHotplug(id: String) async throws {
+        let device = removeDevice(id: id)
+        if let device {
+            try await detach(device: device)
+        }
+    }
+
+    func hotplugVirtioFS(_ mounts: [Containerization.Mount], id: String) async throws {
+        throw HotplugProbeFailure(description: "virtiofs hotplug is out of scope for the C4 rootfs boundary probe")
+    }
+
+    func releaseVirtioFS(id: String) async throws {}
+
+    func cleanup() {
+        lock.lock()
+        devicesByID.removeAll()
+        lock.unlock()
+    }
+
+    private func storeDevice(_ device: VZUSBMassStorageDevice, id: String) {
+        lock.lock()
+        devicesByID[id] = device
+        lock.unlock()
+    }
+
+    private func removeDevice(id: String) -> VZUSBMassStorageDevice? {
+        lock.lock()
+        let device = devicesByID.removeValue(forKey: id)
+        lock.unlock()
+        return device
+    }
+
+    private func attach(device: VZUSBMassStorageDevice) async throws {
+        guard let controller = instance.vzVirtualMachine.usbControllers.first else {
+            throw HotplugProbeFailure(description: "no VZ USB controller is available on the running VM")
+        }
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            instance.vmQueue.async {
+                controller.attach(device: device) { error in
+                    if let error {
+                        continuation.resume(throwing: error)
+                    } else {
+                        continuation.resume(returning: ())
+                    }
+                }
+            }
+        }
+    }
+
+    private func detach(device: VZUSBMassStorageDevice) async throws {
+        guard let controller = instance.vzVirtualMachine.usbControllers.first else {
+            return
+        }
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            instance.vmQueue.async {
+                controller.detach(device: device) { error in
+                    if let error {
+                        continuation.resume(throwing: error)
+                    } else {
+                        continuation.resume(returning: ())
+                    }
+                }
+            }
+        }
     }
 }
 

@@ -1073,9 +1073,17 @@ real hotplug boundary: `LinuxPod.addContainer` can call into a
 default VM implementation reports `unsupported`. An open upstream issue
 (`apple/containerization#767`) reports the same public-consumer gap. The next
 smallest experiment is therefore #91, a hotplug-provider boundary probe, not a
-full backend. If that probe fails, MacVz must choose between a deliberately limited
-predeclared-container backend, an explicit stop/recreate smoke fallback, or
-deferring route C while keeping the Virtual Kubelet path as the shipped product.
+full backend.
+
+#91 completed that probe. A consumer-provided `VZInstanceExtension` can install
+a `HotplugProvider`, post-create `LinuxPod.addContainer(...)` does call it, and
+public VZ USB mass-storage attach succeeds for the late ext4 image. The boundary
+is the next step: public APIs did not provide a deterministic Linux guest block
+path for that attached rootfs, so the probe refused to return a guessed
+`AttachedFilesystem` and the late container did not start. MacVz must now choose
+in #92 between a deliberately limited predeclared-container backend, an explicit
+stop/recreate smoke fallback, or deferring route C while keeping the Virtual
+Kubelet path as the shipped product.
 
 ## CRI-P9 Follow-up (#86): Unblock Honest Multi-Container Pods
 

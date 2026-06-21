@@ -241,9 +241,19 @@ Acceptance:
 - no fake `AttachedFilesystem` or guessed guest `/dev/...` path is counted as a
   success.
 
+C4 result: **blocked at guest block-path resolution**. The live run on
+2026-06-21 installed the custom extension/provider, reached the provider through
+post-create `LinuxPod.addContainer(...)`, and successfully attached the late
+rootfs image as public VZ USB mass storage. It still could not turn that attach
+into a real LinuxPod rootfs mount because public APIs did not expose a
+deterministic Linux guest block path for the attached ext4 image. The probe
+refused to return a guessed `AttachedFilesystem`, so `addContainer` failed before
+the late container could start. See
+[CRI_LINUXPOD_C4_REPORT.md](CRI_LINUXPOD_C4_REPORT.md).
+
 ### C5: Swift Helper Daemon Prototype
 
-Only if C4 proves a viable hotplug path, or the project explicitly accepts a
+Only if the project explicitly accepts a limited/predeclared-container model:
 limited/predeclared-container model:
 
 - expose a small local socket API for `CreatePod`, `AddContainer`,
@@ -274,13 +284,13 @@ accepted ordering limits:
 
 ## Recommendation After C3
 
-Pause route-C implementation work until C4 answers the public hotplug boundary.
-The currently accepted position is:
+Pause route-C implementation work until #92 chooses a limited model or a
+stop/recreate model. The currently accepted position is:
 
 - keep LinuxPod as a research-only proof of the shared sandbox primitive;
-- do one focused hotplug-provider boundary probe;
-- do not build a helper daemon until either hotplug is viable or the project
-  explicitly accepts a limited/predeclared-container backend;
+- do not build a helper daemon on the assumption that hotplug is viable;
+- design either a limited/predeclared-container backend or explicit
+  stop/recreate semantics before implementation resumes;
 - keep a MacVz-owned sandbox VM runtime as a later fallback, not the next issue.
 
 ## References
@@ -298,6 +308,9 @@ The currently accepted position is:
   not currently proven for public VZ-backed ext4/block rootfs consumers.
 - [CRI_LINUXPOD_C3_DECISION.md](CRI_LINUXPOD_C3_DECISION.md): MacVz route-C
   backend limit decision after C1/C2.
+- [CRI_LINUXPOD_C4_REPORT.md](CRI_LINUXPOD_C4_REPORT.md): consumer-installed
+  HotplugProvider reaches public USB attach but cannot resolve a deterministic
+  guest block path for LinuxPod rootfs hotplug.
 - `vanchonlee/krust-cri`: public experimental macOS CRI runtime over
   Apple Containerization `LinuxPod`.
 - Kata Containers and firecracker-containerd: mature references for per-Pod VM,

@@ -27,8 +27,13 @@ case "${PROBE}" in
     REPORT_TITLE="CRI LinuxPod C2 Ordering Probe Report (#89)"
     WORK_DIR="${MACVZ_LINUXPOD_WORK_DIR:-/tmp/macvz-linuxpod-c2}"
     ;;
+  c4)
+    DEFAULT_REPORT_PATH="${ROOT_DIR}/docs/CRI_LINUXPOD_C4_REPORT.md"
+    REPORT_TITLE="CRI LinuxPod C4 HotplugProvider Boundary Probe Report (#91)"
+    WORK_DIR="${MACVZ_LINUXPOD_WORK_DIR:-/tmp/macvz-linuxpod-c4}"
+    ;;
   *)
-    echo "unsupported MACVZ_LINUXPOD_PROBE=${PROBE}; expected c1 or c2" >&2
+    echo "unsupported MACVZ_LINUXPOD_PROBE=${PROBE}; expected c1, c2, or c4" >&2
     exit 1
     ;;
 esac
@@ -45,6 +50,7 @@ MACVZ_LINUXPOD_POC is not 1; plan only.
 This gated Swift harness can run:
   - c1 (#88): pre-create two-container shared-namespace proof
   - c2 (#89): post-create addContainer kubelet-ordering probe
+  - c4 (#91): consumer HotplugProvider boundary probe
 
 Selected probe: ${PROBE}
 
@@ -60,6 +66,13 @@ C2 flow:
   2. create/start the Pod and server
   3. attempt to add/start late-client after pod.create()
   4. record whether late-client can reach server via localhost
+
+C4 flow:
+  1. install a custom VZInstanceExtension / HotplugProvider
+  2. register/start server before pod.create()
+  3. attempt late-client after pod.create()
+  4. record whether provider is installed, called, can attach rootfs, and can
+     start the late container without guessing a guest block path
 
 Set MACVZ_LINUXPOD_VMNET=1 to also attach a vmnet interface. The default
 keeps this C1 probe focused on LinuxPod shared-namespace behavior.
@@ -83,6 +96,7 @@ Suggested setup:
 Run live:
   MACVZ_LINUXPOD_POC=1 make cri-linuxpod-poc
   MACVZ_LINUXPOD_POC=1 make cri-linuxpod-c2
+  MACVZ_LINUXPOD_POC=1 make cri-linuxpod-c4
 EOF
   exit 0
 fi
@@ -171,7 +185,8 @@ if [[ "${PROBE}" == "c1" ]]; then
 
 EOF
 else
-  cat >>"${REPORT_PATH}" <<EOF
+  if [[ "${PROBE}" == "c2" ]]; then
+    cat >>"${REPORT_PATH}" <<EOF
 - [x] One LinuxPod was created.
 - [x] Server was registered before pod.create().
 - [x] Pod and server were started before the late add attempt.
@@ -179,6 +194,18 @@ else
 - [x] The fallback model is included in the JSON result.
 
 EOF
+  else
+    cat >>"${REPORT_PATH}" <<EOF
+- [x] One LinuxPod was created.
+- [x] A custom VZInstanceExtension / HotplugProvider was installed or the failure was recorded.
+- [x] Server was registered before pod.create().
+- [x] Pod and server were started before the late add attempt.
+- [x] The post-create addContainer path recorded whether the provider was called.
+- [x] The report distinguishes provider install/call, public rootfs attach, guest path resolution, and late-container start.
+- [x] No guessed guest block path is counted as success.
+
+EOF
+  fi
 fi
 
-echo "LinuxPod PoC passed. Report written to ${REPORT_PATH}"
+echo "LinuxPod probe completed. Report written to ${REPORT_PATH}"

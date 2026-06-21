@@ -22,18 +22,23 @@ make -C test/e2e/cri-linuxpod/containerization init
 
 MACVZ_LINUXPOD_POC=1 make cri-linuxpod-poc
 MACVZ_LINUXPOD_POC=1 make cri-linuxpod-c2
+MACVZ_LINUXPOD_POC=1 make cri-linuxpod-c4
 ```
 
 Set `MACVZ_CONTAINERIZATION_DIR` if the checkout lives elsewhere. The default
 live run does not attach a vmnet interface; C1 focuses on the LinuxPod
 shared-namespace proof by using loopback inside the Pod. C2 tests whether a
 container can be added after `pod.create()`, which maps to kubelet's
-`RunPodSandbox` before later `CreateContainer` ordering. Set
+`RunPodSandbox` before later `CreateContainer` ordering. C4 installs a custom
+`VZInstanceExtension` / `HotplugProvider` and records whether public APIs can
+turn a post-create rootfs hotplug request into a real late container start
+without guessing the guest block path. Set
 `MACVZ_LINUXPOD_VMNET=1` to include vmnet attachment as an additional host
 network probe.
 
 The C1 live run writes `docs/CRI_LINUXPOD_POC_REPORT.md`; C2 writes
-`docs/CRI_LINUXPOD_C2_REPORT.md` unless `MACVZ_LINUXPOD_REPORT` points to
+`docs/CRI_LINUXPOD_C2_REPORT.md`; C4 writes
+`docs/CRI_LINUXPOD_C4_REPORT.md` unless `MACVZ_LINUXPOD_REPORT` points to
 another path.
 
 ## What It Proves

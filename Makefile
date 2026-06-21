@@ -52,6 +52,10 @@ cri-linuxpod-poc: ## Run the #88 LinuxPod shared-namespace PoC (set MACVZ_LINUXP
 cri-linuxpod-c2: ## Run the #89 LinuxPod post-create addContainer probe (set MACVZ_LINUXPOD_POC=1 to run live)
 	MACVZ_LINUXPOD_PROBE=c2 ./test/e2e/cri-linuxpod/run.sh
 
+.PHONY: cri-linuxpod-c4
+cri-linuxpod-c4: ## Run the #91 LinuxPod HotplugProvider boundary probe (set MACVZ_LINUXPOD_POC=1 to run live)
+	MACVZ_LINUXPOD_PROBE=c4 ./test/e2e/cri-linuxpod/run.sh
+
 .PHONY: bench
 bench: ## Build the density/RAM benchmark harness into bin/mvz-bench
 	@mkdir -p $(BIN_DIR)

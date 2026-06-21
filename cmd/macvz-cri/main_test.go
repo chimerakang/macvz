@@ -1,10 +1,16 @@
 package main
 
 import (
+	"context"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"github.com/chimerakang/macvz/pkg/criserver"
+	"github.com/chimerakang/macvz/pkg/criserver/store"
+	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
 )
 
 func TestSocketPath(t *testing.T) {
@@ -86,4 +92,37 @@ func TestPrepareSocket(t *testing.T) {
 			t.Fatalf("stale socket path still exists: %v", err)
 		}
 	})
+}
+
+func TestSetupStreamingPublishesConcretePort(t *testing.T) {
+	containers, _, err := store.NewContainerStore("")
+	if err != nil {
+		t.Fatalf("NewContainerStore: %v", err)
+	}
+	id, err := store.NewID()
+	if err != nil {
+		t.Fatalf("NewID: %v", err)
+	}
+	if err := containers.Put(&store.Container{
+		ID:         id,
+		SandboxID:  "sandbox",
+		WorkloadID: store.DeriveWorkloadID(id),
+		State:      store.ContainerRunning,
+	}); err != nil {
+		t.Fatalf("put container: %v", err)
+	}
+	srv := criserver.New(criserver.Options{Containers: containers})
+	stop, err := setupStreaming(srv, "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("setupStreaming: %v", err)
+	}
+	defer stop()
+
+	resp, err := srv.Exec(context.Background(), &runtimeapi.ExecRequest{ContainerId: id, Stdout: true})
+	if err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+	if strings.Contains(resp.GetUrl(), ":0/") {
+		t.Fatalf("Exec URL still advertises port 0: %s", resp.GetUrl())
+	}
 }

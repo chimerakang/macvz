@@ -82,6 +82,27 @@ func TestLogPumpWritesCRIFormat(t *testing.T) {
 	}
 }
 
+func TestLogPumpSelfExitIsNotReopenable(t *testing.T) {
+	dir := t.TempDir()
+	rt := newFakeRuntime()
+	rt.logsData = "one-shot\n"
+	s, sandboxID := newServerWithLogDir(t, rt, dir)
+	ctx := context.Background()
+
+	cResp, err := s.CreateContainer(ctx, createReqWithLog(sandboxID, "app", "app.log"))
+	if err != nil {
+		t.Fatalf("CreateContainer: %v", err)
+	}
+	id := cResp.GetContainerId()
+	if _, err := s.StartContainer(ctx, &runtimeapi.StartContainerRequest{ContainerId: id}); err != nil {
+		t.Fatalf("StartContainer: %v", err)
+	}
+	waitForPumpGone(t, s, id)
+
+	_, err = s.ReopenContainerLog(ctx, &runtimeapi.ReopenContainerLogRequest{ContainerId: id})
+	wantCode(t, err, codes.FailedPrecondition)
+}
+
 func TestLogPumpAbsentWithoutLogPath(t *testing.T) {
 	rt := newFakeRuntime()
 	rt.logsData = "x\n"
@@ -163,4 +184,19 @@ func waitForFileContains(t *testing.T, path, want string) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for %q to contain %q", path, want)
+}
+
+func waitForPumpGone(t *testing.T, s *Server, id string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		s.logMu.Lock()
+		_, ok := s.logPumps[id]
+		s.logMu.Unlock()
+		if !ok {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for log pump %q to exit", id)
 }

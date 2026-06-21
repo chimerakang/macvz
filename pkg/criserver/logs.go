@@ -83,6 +83,7 @@ func (s *Server) startLogPump(c *store.Container, sb *store.Sandbox) {
 // and signalling done.
 func (s *Server) runLogPump(ctx context.Context, containerID, workloadID string, p *logPump) {
 	defer close(p.done)
+	defer s.forgetLogPump(containerID, p)
 	defer func() {
 		p.mu.Lock()
 		if p.file != nil {
@@ -115,6 +116,14 @@ func (s *Server) runLogPump(ctx context.Context, containerID, workloadID string,
 	}
 	if serr := scanner.Err(); serr != nil && ctx.Err() == nil {
 		klog.V(4).InfoS("CRI: container log stream ended with error", "containerID", containerID, "err", serr)
+	}
+}
+
+func (s *Server) forgetLogPump(containerID string, p *logPump) {
+	s.logMu.Lock()
+	defer s.logMu.Unlock()
+	if current, ok := s.logPumps[containerID]; ok && current == p {
+		delete(s.logPumps, containerID)
 	}
 }
 
@@ -153,6 +162,13 @@ func (s *Server) ReopenContainerLog(_ context.Context, req *runtimeapi.ReopenCon
 	if !ok {
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"ReopenContainerLog: container %q has no active log stream", id)
+	}
+	select {
+	case <-p.done:
+		s.forgetLogPump(id, p)
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"ReopenContainerLog: container %q has no active log stream", id)
+	default:
 	}
 
 	f, err := openLogFile(p.path)

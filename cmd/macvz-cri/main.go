@@ -60,6 +60,8 @@ const defaultListen = "unix:///tmp/macvz-cri.sock"
 // is published in the streaming URLs kubelet redirects to.
 const defaultStreamingAddr = "127.0.0.1:0"
 
+const streamingStartTimeout = 5 * time.Second
+
 func main() {
 	var (
 		listen        string
@@ -212,31 +214,90 @@ func run(ctx context.Context, listen, stateDir, runtimeBinary string, rosetta bo
 }
 
 // setupStreaming builds and starts the CRI-P6 exec/port-forward streaming server
-// (#78) and wires it onto the CRI server. An empty addr leaves streaming off, in
-// which case exec and port-forward return a clear FailedPrecondition. The returned
-// stop function shuts the streaming server down on adapter exit. The server runs
-// in the background; a fatal serve error is logged (the gRPC server stays up so the
-// rest of the CRI surface keeps working).
+// (#78) and wires it onto the CRI server only after the HTTP listener is reachable.
+// An empty addr leaves streaming off, in which case exec and port-forward return a
+// clear FailedPrecondition. The returned stop function shuts the streaming server
+// down on adapter exit. A startup failure is fatal: serving dead streaming URLs is
+// worse than failing fast.
 func setupStreaming(srv *criserver.Server, addr string) (func(), error) {
 	if addr == "" {
 		klog.InfoS("CRI streaming disabled; exec and port-forward will return FailedPrecondition")
 		return func() {}, nil
 	}
+	listenAddr, err := concreteStreamingAddr(addr)
+	if err != nil {
+		return nil, err
+	}
 	cfg := streaming.DefaultConfig
-	cfg.Addr = addr
+	cfg.Addr = listenAddr
 	streamServer, err := streaming.NewServer(cfg, srv.StreamingRuntime())
 	if err != nil {
-		return nil, fmt.Errorf("build CRI streaming server on %q: %w", addr, err)
+		return nil, fmt.Errorf("build CRI streaming server on %q: %w", listenAddr, err)
 	}
-	srv.SetStreamingServer(streamServer)
+	errc := make(chan error, 1)
 	go func() {
 		// Start blocks until Stop; http.ErrServerClosed is the clean-shutdown signal.
-		if err := streamServer.Start(true); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			klog.ErrorS(err, "CRI streaming server stopped with error; exec/port-forward unavailable")
+		if err := streamServer.Start(true); err != nil {
+			errc <- err
 		}
 	}()
-	klog.InfoS("CRI streaming server started", "addr", addr)
+
+	if err := waitForStreamingReady(listenAddr, errc); err != nil {
+		_ = streamServer.Stop()
+		return nil, err
+	}
+	srv.SetStreamingServer(streamServer)
+	klog.InfoS("CRI streaming server started", "addr", listenAddr)
 	return func() { _ = streamServer.Stop() }, nil
+}
+
+func concreteStreamingAddr(addr string) (string, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "", fmt.Errorf("parse streaming address %q: %w", addr, err)
+	}
+	if port != "0" {
+		return addr, nil
+	}
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return "", fmt.Errorf("reserve streaming address %q: %w", addr, err)
+	}
+	actual := ln.Addr().String()
+	if host != "" {
+		if _, actualPort, splitErr := net.SplitHostPort(actual); splitErr == nil {
+			actual = net.JoinHostPort(host, actualPort)
+		}
+	}
+	if err := ln.Close(); err != nil {
+		return "", fmt.Errorf("release reserved streaming address %q: %w", actual, err)
+	}
+	return actual, nil
+}
+
+func waitForStreamingReady(addr string, errc <-chan error) error {
+	deadline := time.NewTimer(streamingStartTimeout)
+	defer deadline.Stop()
+	tick := time.NewTicker(10 * time.Millisecond)
+	defer tick.Stop()
+
+	for {
+		select {
+		case err := <-errc:
+			if errors.Is(err, http.ErrServerClosed) {
+				return fmt.Errorf("streaming server on %q closed during startup", addr)
+			}
+			return fmt.Errorf("start CRI streaming server on %q: %w", addr, err)
+		case <-deadline.C:
+			return fmt.Errorf("start CRI streaming server on %q: timed out waiting for listener", addr)
+		case <-tick.C:
+			conn, err := net.DialTimeout("tcp", addr, 200*time.Millisecond)
+			if err == nil {
+				_ = conn.Close()
+				return nil
+			}
+		}
+	}
 }
 
 // setupPodNetwork builds the CRI-P5 Pod networking dependencies (#77) when both a

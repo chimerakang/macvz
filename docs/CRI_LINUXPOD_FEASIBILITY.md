@@ -182,9 +182,37 @@ If this fails, document the exact fallback model:
 - reject late sidecar/container creation honestly;
 - or rebuild the Pod only for explicitly marked experimental smoke flows.
 
+### C2 Result
+
+C2 completed on 2026-06-21 UTC using the same upstream checkout and assets as
+C1. The live probe registered `server` before `pod.create()`, created and
+started the Pod, then attempted `pod.addContainer("late-client", ...)`.
+
+Result: post-create add is **not supported**. The public LinuxPod API returned:
+
+```text
+ContainerizationError: unsupported: "hotplug not supported"
+```
+
+The report is `docs/CRI_LINUXPOD_C2_REPORT.md`.
+
+Decision: LinuxPod is still useful for proving the missing "one VM, multiple
+containers" sandbox primitive, but it cannot currently serve as an honest
+general CRI backend for normal kubelet ordering. A LinuxPod-backed route-C
+adapter must either:
+
+- pre-register every container before `pod.create()` and explicitly restrict the
+  supported workload class;
+- reject late `CreateContainer` calls with a clear unsupported error; or
+- use an explicit stop/recreate model only for marked experimental smoke flows,
+  with honest Pod event/status consequences.
+
+Do not build a production-shaped Swift helper daemon until this ordering
+limitation has an accepted product/roadmap answer.
+
 ### C3: Swift Helper Daemon Prototype
 
-Only if C1 passes:
+Only if the project accepts a limited route-C workload model despite C2:
 
 - expose a small local socket API for `CreatePod`, `AddContainer`,
   `StartContainer`, `StopContainer`, `StopPod`, `Exec`, `Stats`, and `Status`;
@@ -194,7 +222,8 @@ Only if C1 passes:
 
 ### C4: Experimental `macvz-cri --runtime-backend=linuxpod`
 
-Only if C3 is stable enough:
+Only if C3 is stable enough and the C2 ordering limitation is represented
+honestly in CRI behavior:
 
 - add a new backend behind an explicit experimental flag;
 - keep the current CLI-backed backend untouched;
@@ -203,23 +232,23 @@ Only if C3 is stable enough:
 
 ### C5: k3s In-Loop Evidence
 
-Only after the backend can run a real two-container Pod shape:
+Only after the backend can run a real two-container Pod shape within the
+accepted ordering limits:
 
 - run a single-node k3s/kubelet smoke;
 - verify scheduling, Pod events, logs, exec, stats, restart behavior, and cleanup;
 - keep `Attach`/`PortForward` honest if still unsupported;
 - run longer soak only after basic semantics pass.
 
-## Recommended Next Issue
+## Recommendation After C2
 
-Create a follow-up issue for C2:
+Pause route-C implementation work until the project chooses one of these paths:
 
-**CRI-C2: LinuxPod kubelet ordering and post-create container probe**
-
-This should stay outside the production Go CRI backend. It decides whether
-LinuxPod can support kubelet's `RunPodSandbox` before later `CreateContainer`
-ordering honestly, or whether the route-C backend needs an explicit limited
-workload model before a helper daemon is worth building.
+- keep LinuxPod as a research-only proof of the shared sandbox primitive;
+- design a deliberately limited LinuxPod backend that requires predeclared
+  containers and rejects late adds;
+- wait for upstream LinuxPod hotplug support; or
+- move the long-term CRI ambition back toward a MacVz-owned sandbox VM runtime.
 
 ## References
 

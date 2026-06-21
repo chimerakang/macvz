@@ -31,6 +31,9 @@ struct LinuxPodSharedNamespacePoC: AsyncParsableCommand {
     @Option(help: "TCP port inside the shared Pod namespace.")
     var port: Int = 18080
 
+    @Option(help: "Probe to run: c1 for pre-create two-container semantics, c2 for post-create addContainer ordering.")
+    var probe: String = "c1"
+
     @Flag(help: "Enable Rosetta for linux/amd64 images.")
     var rosetta = false
 
@@ -67,6 +70,21 @@ struct LinuxPodSharedNamespacePoC: AsyncParsableCommand {
             rosetta: rosetta,
             logger: logger
         )
+
+        if probe == "c2" {
+            try await runOrderingProbe(
+                imageStore: imageStore,
+                vmm: vmm,
+                logger: logger,
+                startedAt: startedAt,
+                logsURL: logsURL,
+                rootfsURL: rootfsURL
+            )
+            return
+        }
+        guard probe == "c1" else {
+            throw ValidationError("unsupported probe \(probe); expected c1 or c2")
+        }
 
         let podID = "macvz-poc-\(Int(startedAt.timeIntervalSince1970))"
         var network: VmnetNetwork?
@@ -213,12 +231,159 @@ struct LinuxPodSharedNamespacePoC: AsyncParsableCommand {
         return try await unpacker.unpack(image, for: .current, at: url)
     }
 
+    private func runOrderingProbe(
+        imageStore: ImageStore,
+        vmm: VZVirtualMachineManager,
+        logger: Logger,
+        startedAt: Date,
+        logsURL: URL,
+        rootfsURL: URL
+    ) async throws {
+        let podID = "macvz-c2-\(Int(startedAt.timeIntervalSince1970))"
+        let pod = try LinuxPod(podID, vmm: vmm, logger: logger) { config in
+            config.cpus = 2
+            config.memoryInBytes = 1024 * 1024 * 1024
+            config.hostname = "macvz-linuxpod-c2"
+            config.bootLog = .file(path: logsURL.appendingPathComponent("boot.log"))
+        }
+
+        let baseImage = try await imageStore.get(reference: image, pull: true)
+        let serverRootfs = try await unpackRootfs(baseImage, at: rootfsURL.appendingPathComponent("server.ext4"))
+        let clientRootfs = try await unpackRootfs(baseImage, at: rootfsURL.appendingPathComponent("late-client.ext4"))
+
+        let serverLog = try FileLogWriter(path: logsURL.appendingPathComponent("server.log"), stream: "stdout")
+        let serverErr = try FileLogWriter(path: logsURL.appendingPathComponent("server.log"), stream: "stderr")
+        let clientLog = try FileLogWriter(path: logsURL.appendingPathComponent("late-client.log"), stream: "stdout")
+        let clientErr = try FileLogWriter(path: logsURL.appendingPathComponent("late-client.log"), stream: "stderr")
+        let execLog = try FileLogWriter(path: logsURL.appendingPathComponent("exec.log"), stream: "stdout")
+
+        var podCreated = false
+        var serverStarted = false
+        var clientStarted = false
+        var lateAddSupported = false
+        var lateStartSupported = false
+        var localhostAfterLateAdd = false
+        var errors: [String: String] = [:]
+        var statsCount: Int?
+
+        do {
+            try await pod.addContainer("server", rootfs: serverRootfs) { config in
+                config.process.arguments = [
+                    "/bin/sh",
+                    "-c",
+                    "mkdir -p /www; echo macvz-linuxpod-localhost-ok > /www/index.html; exec httpd -f -p 127.0.0.1:\(port) -h /www",
+                ]
+                config.process.environmentVariables = ["PATH=\(LinuxProcessConfiguration.defaultPath)"]
+                config.process.workingDirectory = "/"
+                config.process.stdout = serverLog
+                config.process.stderr = serverErr
+                config.useInit = true
+            }
+
+            try await pod.create()
+            podCreated = true
+            try await pod.startContainer("server")
+            serverStarted = true
+
+            do {
+                try await pod.addContainer("late-client", rootfs: clientRootfs) { config in
+                    config.process.arguments = [
+                        "/bin/sh",
+                        "-c",
+                        "for i in $(seq 1 30); do if wget -qO /tmp/localhost-result http://127.0.0.1:\(port); then grep -q macvz-linuxpod-localhost-ok /tmp/localhost-result && touch /tmp/localhost-ok && exec sleep 300; fi; sleep 1; done; exit 42",
+                    ]
+                    config.process.environmentVariables = ["PATH=\(LinuxProcessConfiguration.defaultPath)"]
+                    config.process.workingDirectory = "/"
+                    config.process.stdout = clientLog
+                    config.process.stderr = clientErr
+                    config.useInit = true
+                }
+                lateAddSupported = true
+            } catch {
+                errors["lateAdd"] = describe(error)
+            }
+
+            if lateAddSupported {
+                do {
+                    try await pod.startContainer("late-client")
+                    clientStarted = true
+                    lateStartSupported = true
+                    try await waitForClientProbe(pod, containerID: "late-client", stdout: execLog, timeoutSeconds: 45)
+                    localhostAfterLateAdd = true
+                } catch {
+                    errors["lateStartOrProbe"] = describe(error)
+                }
+            }
+
+            if let stats = try? await pod.statistics(
+                containerIDs: lateAddSupported ? ["server", "late-client"] : ["server"],
+                categories: [.cpu, .memory]
+            ) {
+                statsCount = stats.count
+            }
+
+            if clientStarted {
+                try? await pod.stopContainer("late-client")
+            }
+            if serverStarted {
+                try? await pod.stopContainer("server")
+            }
+            try await pod.stop()
+            try close(serverLog, serverErr, clientLog, clientErr, execLog)
+
+            let fallback: String
+            if lateAddSupported && lateStartSupported && localhostAfterLateAdd {
+                fallback = "post-create addContainer works in this probe; route C may preserve kubelet ordering for this narrow case"
+            } else if !lateAddSupported {
+                fallback = "all containers must be registered before pod.create(), or the runtime must use a stop/recreate model for late containers"
+            } else {
+                fallback = "post-create addContainer returned successfully, but start/probe failed; treat late containers as unsupported until resolved"
+            }
+
+            let result = OrderingProbeSummary(
+                podID: podID,
+                image: image,
+                kernel: kernel,
+                workDir: workDir,
+                durationSeconds: Date().timeIntervalSince(startedAt),
+                lateAddSupported: lateAddSupported,
+                lateStartSupported: lateStartSupported,
+                localhostAfterLateAdd: localhostAfterLateAdd,
+                statsCount: statsCount,
+                fallback: fallback,
+                errors: errors,
+                logs: [
+                    "server": logsURL.appendingPathComponent("server.log").path,
+                    "lateClient": logsURL.appendingPathComponent("late-client.log").path,
+                    "exec": logsURL.appendingPathComponent("exec.log").path,
+                    "boot": logsURL.appendingPathComponent("boot.log").path,
+                ]
+            )
+            print(try result.jsonString())
+        } catch {
+            if podCreated {
+                try? await pod.stop()
+            }
+            try? close(serverLog, serverErr, clientLog, clientErr, execLog)
+            throw error
+        }
+    }
+
     private func waitForClientProbe(_ pod: LinuxPod, stdout: FileLogWriter) async throws {
-        let deadline = Date().addingTimeInterval(90)
+        try await waitForClientProbe(pod, containerID: "client", stdout: stdout, timeoutSeconds: 90)
+    }
+
+    private func waitForClientProbe(
+        _ pod: LinuxPod,
+        containerID: String,
+        stdout: FileLogWriter,
+        timeoutSeconds: TimeInterval
+    ) async throws {
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
         var attempts = 0
         while Date() < deadline {
             attempts += 1
-            let exec = try await pod.execInContainer("client", processID: "client-probe-\(attempts)") { config in
+            let exec = try await pod.execInContainer(containerID, processID: "\(containerID)-probe-\(attempts)") { config in
                 config.arguments = [
                     "/bin/sh",
                     "-c",
@@ -234,7 +399,11 @@ struct LinuxPodSharedNamespacePoC: AsyncParsableCommand {
             }
             try await Task.sleep(nanoseconds: 1_000_000_000)
         }
-        throw ValidationError("client did not confirm localhost probe before timeout")
+        throw ValidationError("\(containerID) did not confirm localhost probe before timeout")
+    }
+
+    private func describe(_ error: Error) -> String {
+        "\(type(of: error)): \(error)"
     }
 }
 
@@ -245,6 +414,27 @@ private struct ResultSummary: Encodable {
     let kernel: String
     let workDir: String
     let durationSeconds: TimeInterval
+    let logs: [String: String]
+
+    func jsonString() throws -> String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        return String(decoding: try encoder.encode(self), as: UTF8.self)
+    }
+}
+
+private struct OrderingProbeSummary: Encodable {
+    let podID: String
+    let image: String
+    let kernel: String
+    let workDir: String
+    let durationSeconds: TimeInterval
+    let lateAddSupported: Bool
+    let lateStartSupported: Bool
+    let localhostAfterLateAdd: Bool
+    let statsCount: Int?
+    let fallback: String
+    let errors: [String: String]
     let logs: [String: String]
 
     func jsonString() throws -> String {

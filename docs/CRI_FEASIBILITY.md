@@ -1054,12 +1054,16 @@ Linux containers inside one VM. That shifts the next step from "wait for
 LinuxPod directly as the Pod sandbox backend. #87 C0 is now recorded in
 [CRI_LINUXPOD_FEASIBILITY.md](CRI_LINUXPOD_FEASIBILITY.md): the decision is **go
 to a minimal LinuxPod PoC**, with a Swift helper daemon as the likely bridge only
-if that PoC passes. #88 has now passed the first pure LinuxPod shared-namespace
-probe (two containers in one LinuxPod, localhost reachability, logs, exec, stats,
-and stop-order isolation). This still does not flip CRI-P9 to **go**: LinuxPod
-still needs kubelet ordering/post-create container validation, vmnet/Pod IP
-network proof, bridge validation, CRI gap analysis, and k3s in-loop soak. The CRI
-track stays an isolated `develop` spike.
+if that PoC passes. #88 passed the first pure LinuxPod shared-namespace probe
+(two containers in one LinuxPod, localhost reachability, logs, exec, stats, and
+stop-order isolation). #89 then tested kubelet-style late container ordering and
+found that `pod.addContainer` after `pod.create()` returns
+`unsupported: "hotplug not supported"`. This keeps CRI-P9 at **no-go for a
+general replacement**: LinuxPod can model predeclared multi-container Pods, but
+not arbitrary kubelet late sidecar/restart flows without a limited workload model
+or stop/recreate fallback. vmnet/Pod IP networking, bridge validation, CRI gap
+analysis, and k3s in-loop soak also remain open. The CRI track stays an isolated
+`develop` spike.
 
 ## CRI-P9 Follow-up (#86): Unblock Honest Multi-Container Pods
 

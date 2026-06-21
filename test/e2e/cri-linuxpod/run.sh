@@ -16,7 +16,23 @@ KERNEL_PATH="${MACVZ_LINUXPOD_KERNEL:-${DEFAULT_KERNEL}}"
 INIT_REFERENCE="${MACVZ_LINUXPOD_INITFS_REFERENCE:-vminit:latest}"
 IMAGE="${MACVZ_LINUXPOD_IMAGE:-docker.io/library/busybox:1.36.1}"
 WORK_DIR="${MACVZ_LINUXPOD_WORK_DIR:-/tmp/macvz-linuxpod-poc}"
-REPORT_PATH="${MACVZ_LINUXPOD_REPORT:-${ROOT_DIR}/docs/CRI_LINUXPOD_POC_REPORT.md}"
+PROBE="${MACVZ_LINUXPOD_PROBE:-c1}"
+case "${PROBE}" in
+  c1)
+    DEFAULT_REPORT_PATH="${ROOT_DIR}/docs/CRI_LINUXPOD_POC_REPORT.md"
+    REPORT_TITLE="CRI LinuxPod PoC Report (#88)"
+    ;;
+  c2)
+    DEFAULT_REPORT_PATH="${ROOT_DIR}/docs/CRI_LINUXPOD_C2_REPORT.md"
+    REPORT_TITLE="CRI LinuxPod C2 Ordering Probe Report (#89)"
+    WORK_DIR="${MACVZ_LINUXPOD_WORK_DIR:-/tmp/macvz-linuxpod-c2}"
+    ;;
+  *)
+    echo "unsupported MACVZ_LINUXPOD_PROBE=${PROBE}; expected c1 or c2" >&2
+    exit 1
+    ;;
+esac
+REPORT_PATH="${MACVZ_LINUXPOD_REPORT:-${DEFAULT_REPORT_PATH}}"
 EXTRA_ARGS=()
 if [[ "${MACVZ_LINUXPOD_VMNET:-0}" == "1" ]]; then
   EXTRA_ARGS+=(--vmnet)
@@ -26,12 +42,24 @@ if [[ "${MACVZ_LINUXPOD_POC:-0}" != "1" ]]; then
   cat <<EOF
 MACVZ_LINUXPOD_POC is not 1; plan only.
 
-This #88 PoC builds and runs a Swift LinuxPod shared-namespace probe:
+This gated Swift harness can run:
+  - c1 (#88): pre-create two-container shared-namespace proof
+  - c2 (#89): post-create addContainer kubelet-ordering probe
+
+Selected probe: ${PROBE}
+
+C1 flow:
   1. create one apple/containerization LinuxPod
   2. pre-register two busybox containers
   3. server listens on 127.0.0.1 inside the Pod
   4. client reaches server via localhost
   5. exec/stats/logs/stop-order behavior is checked
+
+C2 flow:
+  1. register server before pod.create()
+  2. create/start the Pod and server
+  3. attempt to add/start late-client after pod.create()
+  4. record whether late-client can reach server via localhost
 
 Set MACVZ_LINUXPOD_VMNET=1 to also attach a vmnet interface. The default
 keeps this C1 probe focused on LinuxPod shared-namespace behavior.
@@ -54,6 +82,7 @@ Suggested setup:
 
 Run live:
   MACVZ_LINUXPOD_POC=1 make cri-linuxpod-poc
+  MACVZ_LINUXPOD_POC=1 make cri-linuxpod-c2
 EOF
   exit 0
 fi
@@ -97,13 +126,14 @@ summary_json="$(
     --initfs-reference "${INIT_REFERENCE}" \
     --image "${IMAGE}" \
     --work-dir "${WORK_DIR}" \
+    --probe "${PROBE}" \
     "${EXTRA_ARGS[@]}"
 )"
 
 popd >/dev/null
 
 cat >"${REPORT_PATH}" <<EOF
-# CRI LinuxPod PoC Report (#88)
+# ${REPORT_TITLE}
 
 Date: $(date -u +%Y-%m-%dT%H:%M:%SZ)
 
@@ -116,6 +146,7 @@ Date: $(date -u +%Y-%m-%dT%H:%M:%SZ)
 - Initfs reference: ${INIT_REFERENCE}
 - Image: ${IMAGE}
 - Work dir: ${WORK_DIR}
+- Probe: ${PROBE}
 - vmnet interface: ${MACVZ_LINUXPOD_VMNET:-0}
 
 ## Result
@@ -124,8 +155,11 @@ Date: $(date -u +%Y-%m-%dT%H:%M:%SZ)
 ${summary_json}
 \`\`\`
 
-## Acceptance
+## Acceptance / Interpretation
+EOF
 
+if [[ "${PROBE}" == "c1" ]]; then
+  cat >>"${REPORT_PATH}" <<EOF
 - [x] One LinuxPod was created.
 - [x] Two containers were registered before pod.create().
 - [x] Server container listened on 127.0.0.1.
@@ -136,5 +170,15 @@ ${summary_json}
 - [x] Pod stop completed cleanly.
 
 EOF
+else
+  cat >>"${REPORT_PATH}" <<EOF
+- [x] One LinuxPod was created.
+- [x] Server was registered before pod.create().
+- [x] Pod and server were started before the late add attempt.
+- [x] The post-create addContainer/start/probe outcome was recorded.
+- [x] The fallback model is included in the JSON result.
+
+EOF
+fi
 
 echo "LinuxPod PoC passed. Report written to ${REPORT_PATH}"

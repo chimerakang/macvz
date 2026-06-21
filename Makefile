@@ -48,6 +48,10 @@ cri-k3s-inloop: ## Run the CRI-P9 real kubelet/k3s in-loop suite (set MACVZ_INTE
 cri-linuxpod-poc: ## Run the #88 LinuxPod shared-namespace PoC (set MACVZ_LINUXPOD_POC=1 to run live)
 	./test/e2e/cri-linuxpod/run.sh
 
+.PHONY: cri-linuxpod-c2
+cri-linuxpod-c2: ## Run the #89 LinuxPod post-create addContainer probe (set MACVZ_LINUXPOD_POC=1 to run live)
+	MACVZ_LINUXPOD_PROBE=c2 ./test/e2e/cri-linuxpod/run.sh
+
 .PHONY: bench
 bench: ## Build the density/RAM benchmark harness into bin/mvz-bench
 	@mkdir -p $(BIN_DIR)

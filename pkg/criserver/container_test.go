@@ -2,6 +2,8 @@ package criserver
 
 import (
 	"context"
+	"io"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -32,6 +34,17 @@ type fakeRuntime struct {
 	// startIP, when set, is the host-only address Start records on the workload so
 	// the CRI-P5 network attach path can observe a VM IP in hermetic tests.
 	startIP string
+
+	// CRI-P6 streaming/logging/stats knobs (#78).
+	logsData    string     // bytes the Logs follow stream emits
+	logsErr     error      // injected Logs failure
+	logsFollow  bool       // records the last Follow option seen by Logs
+	execStdout  string     // written to the Exec stdout stream
+	execStderr  string     // written to the Exec stderr stream
+	execErr     error      // injected Exec result (e.g. *runtime.ExitError)
+	execCalls   [][]string // commands passed to Exec
+	statsSample runtime.ResourceStats
+	statsErr    error // injected Stats failure (e.g. runtime.ErrStatsUnavailable)
 }
 
 func newFakeRuntime() *fakeRuntime {
@@ -109,6 +122,39 @@ func (f *fakeRuntime) Status(_ context.Context, id string) (runtime.Status, erro
 		return runtime.Status{}, runtime.ErrNotFound
 	}
 	return st, nil
+}
+
+func (f *fakeRuntime) Logs(_ context.Context, _ string, opts runtime.LogOptions) (io.ReadCloser, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.logsFollow = opts.Follow
+	if f.logsErr != nil {
+		return nil, f.logsErr
+	}
+	return io.NopCloser(strings.NewReader(f.logsData)), nil
+}
+
+func (f *fakeRuntime) Exec(_ context.Context, _ string, cmd []string, sio runtime.ExecIO) error {
+	f.mu.Lock()
+	f.execCalls = append(f.execCalls, cmd)
+	stdout, stderr, execErr := f.execStdout, f.execStderr, f.execErr
+	f.mu.Unlock()
+	if sio.Stdout != nil && stdout != "" {
+		_, _ = io.WriteString(sio.Stdout, stdout)
+	}
+	if sio.Stderr != nil && stderr != "" {
+		_, _ = io.WriteString(sio.Stderr, stderr)
+	}
+	return execErr
+}
+
+func (f *fakeRuntime) Stats(_ context.Context, _ string) (runtime.ResourceStats, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.statsErr != nil {
+		return runtime.ResourceStats{}, f.statsErr
+	}
+	return f.statsSample, nil
 }
 
 // newServerWithRuntime builds a server with in-memory stores and the given fake

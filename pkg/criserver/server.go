@@ -103,6 +103,18 @@ type Server struct {
 	lifecycleMu      sync.Mutex
 	now              func() time.Time
 
+	// streamServer mints the per-request streaming URLs kubelet redirects exec and
+	// port-forward clients to (CRI-P6, #78). Nil leaves those surfaces returning a
+	// clear FailedPrecondition rather than a dead URL. Set via SetStreamingServer.
+	streamServer StreamingServer
+
+	// logPumps tracks the per-container goroutines copying workload output into the
+	// CRI log file (CRI-P6, #78), keyed by container ID, so StopContainer can stop a
+	// pump and ReopenContainerLog can rotate its file. Guarded by logMu, which is
+	// never held across a lifecycle mutation so the two locks cannot deadlock.
+	logMu    sync.Mutex
+	logPumps map[string]*logPump
+
 	// vmIPPoll* bound how long StartContainer waits for the micro-VM's host-only
 	// address before attaching the Pod network. Tests shorten them.
 	vmIPPollAttempts int
@@ -143,6 +155,7 @@ func New(opts Options) *Server {
 		podNet:           opts.PodNetwork,
 		ipam:             opts.IPAM,
 		now:              now,
+		logPumps:         make(map[string]*logPump),
 		vmIPPollAttempts: defaultVMIPPollAttempts,
 		vmIPPollInterval: defaultVMIPPollInterval,
 	}

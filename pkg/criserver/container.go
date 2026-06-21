@@ -3,6 +3,7 @@ package criserver
 import (
 	"context"
 	"errors"
+	"io"
 	"time"
 
 	"github.com/chimerakang/macvz/internal/types"
@@ -35,6 +36,20 @@ type ContainerRuntime interface {
 	Stop(ctx context.Context, id string, timeout time.Duration) error
 	Destroy(ctx context.Context, id string) error
 	Status(ctx context.Context, id string) (runtime.Status, error)
+	// Logs returns a reader over the workload's combined output for the CRI-P6
+	// logging path (#78); the caller closes it.
+	Logs(ctx context.Context, id string, opts runtime.LogOptions) (io.ReadCloser, error)
+	// Exec runs a command inside the workload, wiring the given streams, for the
+	// CRI-P6 exec path (#78).
+	Exec(ctx context.Context, id string, cmd []string, sio runtime.ExecIO) error
+}
+
+// statsRuntime is the optional resource-usage capability the CRI-P6 stats
+// surfaces use (#78). It mirrors runtime.Stater; *container.Driver satisfies it.
+// When the configured runtime does not implement it, the stats surfaces degrade
+// to empty/unavailable rather than faking samples.
+type statsRuntime interface {
+	Stats(ctx context.Context, id string) (runtime.ResourceStats, error)
 }
 
 // defaultStopTimeout is used when StopContainer is called with a non-positive
@@ -199,6 +214,13 @@ func (s *Server) StartContainer(ctx context.Context, req *runtimeapi.StartContai
 				return nil, err
 			}
 		}
+	}
+
+	// Begin streaming the container's output into its CRI log file (CRI-P6, #78) so
+	// `kubectl logs` works. This is best-effort and runs on a background context, so
+	// it neither fails nor blocks the start.
+	if sbOK {
+		s.startLogPump(&c, &sb)
 	}
 	klog.V(4).InfoS("CRI StartContainer", "containerID", id, "workloadID", c.WorkloadID)
 	return &runtimeapi.StartContainerResponse{}, nil
@@ -376,6 +398,10 @@ func (s *Server) removeSandboxContainers(ctx context.Context, sandboxID string, 
 }
 
 func (s *Server) stopContainerRecord(ctx context.Context, c store.Container, timeout time.Duration, method string) error {
+	// Reap the log pump regardless of state: once the workload stops its follow
+	// stream ends on its own, but stopping here removes the tracking entry promptly
+	// and deterministically. It is a no-op when no pump is running.
+	s.stopLogPump(c.ID)
 	if c.State == store.ContainerExited {
 		return s.detachContainerNetwork(ctx, c.SandboxID, method)
 	}

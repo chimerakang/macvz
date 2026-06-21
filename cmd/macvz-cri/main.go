@@ -14,9 +14,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
@@ -33,6 +35,7 @@ import (
 	"github.com/chimerakang/macvz/pkg/runtime/container"
 	"google.golang.org/grpc"
 	"k8s.io/klog/v2"
+	streaming "k8s.io/kubelet/pkg/cri/streaming"
 )
 
 // podNetConfig collects the CRI-P5 Pod networking flags (#77). Pod networking is
@@ -51,6 +54,12 @@ func (c podNetConfig) enabled() bool { return c.podCIDR != "" && c.iface != "" }
 // defaultListen is the CRI socket endpoint used when --listen is not provided.
 const defaultListen = "unix:///tmp/macvz-cri.sock"
 
+// defaultStreamingAddr is the address the CRI-P6 streaming server binds for
+// exec/port-forward URL handoff. It binds loopback because kubelet runs on the same
+// Mac as the adapter; port 0 lets the OS pick a free port, and the actual address
+// is published in the streaming URLs kubelet redirects to.
+const defaultStreamingAddr = "127.0.0.1:0"
+
 func main() {
 	var (
 		listen        string
@@ -58,10 +67,13 @@ func main() {
 		runtimeBinary string
 		rosetta       bool
 		showVersion   bool
+		streamingAddr string
 		pn            podNetConfig
 	)
 	flag.StringVar(&listen, "listen", defaultListen,
 		"CRI gRPC endpoint to serve (unix:///path/to.sock or an absolute socket path)")
+	flag.StringVar(&streamingAddr, "streaming-addr", defaultStreamingAddr,
+		"host:port for the CRI-P6 exec/port-forward streaming server kubelet redirects to (empty disables exec/port-forward)")
 	flag.StringVar(&stateDir, "state-dir", defaultStateDir(),
 		"directory for restart-tolerant Pod sandbox and container state (empty = in-memory only)")
 	flag.StringVar(&runtimeBinary, "runtime-binary", "",
@@ -91,7 +103,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	if err := run(ctx, listen, stateDir, runtimeBinary, rosetta, pn); err != nil {
+	if err := run(ctx, listen, stateDir, runtimeBinary, rosetta, streamingAddr, pn); err != nil {
 		klog.ErrorS(err, "macvz-cri exited with error")
 		klog.Flush()
 		os.Exit(1)
@@ -99,7 +111,7 @@ func main() {
 	klog.Flush()
 }
 
-func run(ctx context.Context, listen, stateDir, runtimeBinary string, rosetta bool, pn podNetConfig) error {
+func run(ctx context.Context, listen, stateDir, runtimeBinary string, rosetta bool, streamingAddr string, pn podNetConfig) error {
 	socketPath, err := socketPath(listen)
 	if err != nil {
 		return err
@@ -164,6 +176,17 @@ func run(ctx context.Context, listen, stateDir, runtimeBinary string, rosetta bo
 	// Rebuild Pod IP reservations and re-attach surviving sandboxes so a restart
 	// neither leaks addresses nor wipes other Pods' host rules. No-op when off.
 	srv.RecoverNetwork(ctx)
+
+	// Wire the CRI-P6 streaming server (#78) so `kubectl exec`/`port-forward` work.
+	// It is built with the CRI server's streaming runtime as its backend, then set
+	// back on the server to break the mutual reference. Empty addr leaves exec and
+	// port-forward returning a clear FailedPrecondition rather than a dead URL.
+	stopStreaming, err := setupStreaming(srv, streamingAddr)
+	if err != nil {
+		return err
+	}
+	defer stopStreaming()
+
 	srv.Register(grpcServer)
 
 	klog.InfoS("starting experimental macvz-cri server",
@@ -186,6 +209,34 @@ func run(ctx context.Context, listen, stateDir, runtimeBinary string, rosetta bo
 	}
 	klog.InfoS("macvz-cri stopped cleanly")
 	return nil
+}
+
+// setupStreaming builds and starts the CRI-P6 exec/port-forward streaming server
+// (#78) and wires it onto the CRI server. An empty addr leaves streaming off, in
+// which case exec and port-forward return a clear FailedPrecondition. The returned
+// stop function shuts the streaming server down on adapter exit. The server runs
+// in the background; a fatal serve error is logged (the gRPC server stays up so the
+// rest of the CRI surface keeps working).
+func setupStreaming(srv *criserver.Server, addr string) (func(), error) {
+	if addr == "" {
+		klog.InfoS("CRI streaming disabled; exec and port-forward will return FailedPrecondition")
+		return func() {}, nil
+	}
+	cfg := streaming.DefaultConfig
+	cfg.Addr = addr
+	streamServer, err := streaming.NewServer(cfg, srv.StreamingRuntime())
+	if err != nil {
+		return nil, fmt.Errorf("build CRI streaming server on %q: %w", addr, err)
+	}
+	srv.SetStreamingServer(streamServer)
+	go func() {
+		// Start blocks until Stop; http.ErrServerClosed is the clean-shutdown signal.
+		if err := streamServer.Start(true); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			klog.ErrorS(err, "CRI streaming server stopped with error; exec/port-forward unavailable")
+		}
+	}()
+	klog.InfoS("CRI streaming server started", "addr", addr)
+	return func() { _ = streamServer.Stop() }, nil
 }
 
 // setupPodNetwork builds the CRI-P5 Pod networking dependencies (#77) when both a

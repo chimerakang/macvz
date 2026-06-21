@@ -304,6 +304,24 @@ public host-side attach success is not enough to build an honest guest rootfs
 attachment primitive. The next route-C/runtime research should pivot to NBD or
 guest-side rootfs exposure/pull/unpack.
 
+### R2: Rootfs Exposure Fallback Research (#94)
+
+R2 completed the fallback comparison in
+[CRI_RUNTIME_R2_ROOTFS_EXPOSURE.md](CRI_RUNTIME_R2_ROOTFS_EXPOSURE.md).
+
+The key finding is that Apple Containerization already has a concrete NBD path
+for pre-create storage: `Mount.block(...)` accepts NBD URLs,
+`VZNetworkBlockDeviceStorageDeviceAttachment` attaches them as virtio block
+devices, `AttachedFilesystem` assigns deterministic `/dev/vd*` guest paths, and
+upstream integration tests cover NBD volume identity, shared Pod volumes,
+persistence, and concurrent writers.
+
+The boundary is equally important: this is pre-create VM configuration, not a
+post-create rootfs hotplug answer. It can support the next small PoC and improve
+the limited/predeclared LinuxPod research path, but it does not solve kubelet's
+normal `RunPodSandbox` before later `CreateContainer` ordering. Guest-side
+rootfs staging remains the longer-term design needed for a full Pod VM runtime.
+
 ### C5: Swift Helper Daemon Prototype
 
 Only if R0 later selects a LinuxPod-based bridge as a valid runtime building

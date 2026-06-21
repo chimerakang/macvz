@@ -46,6 +46,14 @@ hotplug for rootfs attachments. The active route should pivot to NBD or
 guest-side rootfs exposure/pull/unpack while keeping the shipped Virtual Kubelet
 provider unchanged.
 
+R2 (#94) selected a deliberately narrow next step: prove NBD-backed rootfs
+identity for predeclared LinuxPod containers before attempting larger
+guest-agent work. NBD is attractive because Apple Containerization already maps
+NBD URLs to VZ network block device attachments and deterministic `/dev/vd*`
+guest paths. It remains a partial answer only: it is pre-create configuration,
+so a full kubelet-compatible Pod VM runtime still needs guest-side rootfs
+staging or another explicit post-create mechanism.
+
 ## Phase Plan
 
 | Phase | Goal | Exit Criteria |

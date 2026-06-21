@@ -226,3 +226,6 @@ block hotplug.
   guest did not observe a new USB/SCSI/block device.
 - **CRI-R2 (#94):** NBD or guest-side rootfs exposure fallback study. This is
   now the active next primitive because R1 did not produce a reliable mapping.
+  Complete: [CRI_RUNTIME_R2_ROOTFS_EXPOSURE.md](CRI_RUNTIME_R2_ROOTFS_EXPOSURE.md)
+  selects a narrow pre-create NBD rootfs identity PoC as R3, while keeping
+  guest-side rootfs staging as the long-term answer for normal kubelet ordering.

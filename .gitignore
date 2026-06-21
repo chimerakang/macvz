@@ -2,6 +2,7 @@
 /bin/
 /dist/
 /macvz-kubelet
+/macvz-cri
 *.exe
 *.test
 *.out

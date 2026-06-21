@@ -103,6 +103,127 @@ connection and `Status`, followed by a sandbox spike that proves whether a
 single-container Pod can be honestly represented without breaking kubelet
 expectations.
 
+## CRI-P1: Minimal CRI Server Skeleton
+
+CRI-P1 ships an **experimental** CRI server skeleton. It is not the default
+MacVz runtime mode and is intentionally separate from the shipped Virtual
+Kubelet provider (`cmd/macvz-kubelet`). It exists to prove the CRI server
+process, gRPC wiring, and basic RuntimeService/ImageService responses are
+compatible enough for `kubelet`/`crictl` to connect.
+
+- Command: `cmd/macvz-cri` (build with `make cri` → `bin/macvz-cri`).
+- Package: `pkg/criserver` implements `RuntimeServiceServer` and
+  `ImageServiceServer` from `k8s.io/cri-api/pkg/apis/runtime/v1`.
+- Listen: `--listen unix:///tmp/macvz-cri.sock` (a bare absolute path also works).
+
+What the skeleton answers:
+
+- `Version` — CRI handshake (`RuntimeApiVersion: v1`, name `macvz`).
+- `Status` — `RuntimeReady=true` (the server is up) and `NetworkReady=false`
+  with an explicit reason, since CNI/Pod networking is out of scope for this
+  phase. `--verbose` adds an `experimental`/`track` info map.
+- `ListPodSandbox`, `ListContainers`, `ListImages` — empty lists.
+- `ImageFsInfo` — empty (no image store tracked).
+- Every other CRI method returns `codes.Unimplemented` via the embedded
+  `Unimplemented*Server` defaults.
+
+Deliberately **not** in scope here: Pod sandboxes, image pulls, starting
+`apple/container` workloads, and any host networking. The skeleton carries no
+`apple/container` assumptions.
+
+Quick check:
+
+```sh
+make cri
+./bin/macvz-cri --listen unix:///tmp/macvz-cri.sock &
+crictl --runtime-endpoint unix:///tmp/macvz-cri.sock version
+crictl --runtime-endpoint unix:///tmp/macvz-cri.sock info
+```
+
+## CRI-P2: State-Only Pod Sandbox Spike
+
+CRI-P2 extends the same experimental adapter (`cmd/macvz-cri`, `pkg/criserver`)
+with a **state-only** Pod sandbox lifecycle. A sandbox here is a metadata record
+with a lifecycle — it pulls no images, boots no micro-VM, and touches no host
+networking. The goal is to validate the kubelet/`crictl` sandbox lifecycle and
+status contract before committing to any data-plane work.
+
+Implemented `RuntimeService` methods:
+
+- `RunPodSandbox` — generates a 64-hex-char sandbox ID, records CRI metadata
+  (namespace/name/UID/attempt), labels, annotations, hostname, log directory,
+  DNS config, and runtime handler, and marks the sandbox `READY`. It validates
+  that namespace, name, and UID are present (`InvalidArgument` otherwise).
+- `StopPodSandbox` — transitions to `NOTREADY`; idempotent, and a no-op success
+  for an already-stopped or absent sandbox (kubelet calls Stop repeatedly).
+- `RemovePodSandbox` — deletes the record; idempotent for an absent sandbox.
+- `PodSandboxStatus` — returns the record, or `NotFound` if absent. The
+  `Network` field is deliberately `nil`: the state-only model owns no Pod IP and
+  must not fake one.
+- `ListPodSandbox` — supports the CRI filter (id, state, label selector).
+
+State store (`pkg/criserver/store`):
+
+- One JSON file per sandbox, written atomically (temp + rename), under
+  `--state-dir` (default `~/.macvz/cri/sandboxes`). An empty `--state-dir` runs
+  in memory only.
+- Records survive an adapter restart, satisfying the CRI restart-tolerance
+  expectation. A corrupt record on load is skipped (counted, logged), not fatal.
+
+Sandbox-to-Pod mapping: each record stores the Kubernetes namespace, name, and
+UID, so a sandbox ID maps unambiguously back to its Pod identity.
+
+Honesty boundary: container creation (`CreateContainer`/`StartContainer`), CNI
+ADD/DEL, image pulls, and host networking all remain `Unimplemented` via the
+embedded `Unimplemented*Server`. The spike never returns a fake success for a
+capability it does not have.
+
+Validated end-to-end over a real gRPC Unix socket (a `crictl` stand-in, since
+`crictl` is not installed on the dev host): `runp → pods → inspectp → stopp →
+rmp` round-trips correctly, `inspectp` reports `network=<nil>`, and
+`CreateContainer` returns `Unimplemented`. With `crictl` installed the same flow
+is:
+
+```sh
+make cri
+./bin/macvz-cri --listen unix:///tmp/macvz-cri.sock &
+crictl --runtime-endpoint unix:///tmp/macvz-cri.sock runp sandbox.json
+crictl --runtime-endpoint unix:///tmp/macvz-cri.sock pods
+crictl --runtime-endpoint unix:///tmp/macvz-cri.sock inspectp <id>
+crictl --runtime-endpoint unix:///tmp/macvz-cri.sock stopp <id>
+crictl --runtime-endpoint unix:///tmp/macvz-cri.sock rmp <id>
+```
+
+### CRI-P2 Decision
+
+The state-only sandbox model is **honest and credible enough to continue**, with
+one explicit caveat to carry into CRI-P3.
+
+The kubelet/`crictl` sandbox lifecycle (run/stop/remove/status/list), its
+idempotency requirements, restart tolerance, and the sandbox-ID-to-Pod-identity
+mapping are all satisfiable without lying to the client. The risk named in
+CRI-P0 — that MacVz has no native CRI sandbox object — is resolved: a
+MacVz-owned metadata record is a faithful sandbox identity/lifecycle owner.
+
+What the spike does **not** yet prove, and what CRI-P3 must decide, is the
+**container-to-sandbox topology**. `apple/container` runs one Linux micro-VM per
+container, but a Kubernetes Pod sandbox is expected to own shared network
+identity and shared volumes for all its containers. The realistic next model to
+try is:
+
+- **single-container Pod restriction for the first kubelet spike** — one sandbox
+  owns exactly one `apple/container` micro-VM. This is the smallest honest step:
+  it sidesteps the shared-network/shared-volume problem entirely while proving
+  the create/start/stop/remove container path end-to-end through kubelet. A
+  multi-container Pod is rejected with a clear, explicit error rather than
+  silently mismodeled.
+
+The **pause-like sandbox VM plus workload VMs** model (mirroring a pause
+container) is the eventual target for honest multi-container Pods, but it
+requires shared-netns semantics across micro-VMs that `apple/container` does not
+expose today; it is deferred until the single-container path is proven and the
+CRI-P5 networking story exists. The CRI route is **not** stopped.
+
 ## Reproducible Probe
 
 Run:

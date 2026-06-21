@@ -27,6 +27,11 @@ netd: ## Build the privileged network helper daemon into bin/macvz-netd
 	@mkdir -p $(BIN_DIR)
 	go build -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/macvz-netd ./cmd/macvz-netd
 
+.PHONY: cri
+cri: ## Build the experimental CRI feasibility server into bin/macvz-cri
+	@mkdir -p $(BIN_DIR)
+	go build -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/macvz-cri ./cmd/macvz-cri
+
 .PHONY: bench
 bench: ## Build the density/RAM benchmark harness into bin/mvz-bench
 	@mkdir -p $(BIN_DIR)

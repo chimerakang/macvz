@@ -45,8 +45,8 @@ architecture from Virtual Kubelet provider to kubelet CRI runtime integration.
 | Phase | Title | Status |
 | --- | --- | --- |
 | CRI-P0 | Map `apple/container` and MacVz runtime surfaces to CRI, name hard blockers | ✅ Complete |
-| CRI-P1 | Build a minimal CRI server skeleton that answers kubelet `Status` | ⬜ Planned |
-| CRI-P2 | Spike Pod sandbox lifecycle over `apple/container` | ⬜ Planned |
+| CRI-P1 | Build a minimal CRI server skeleton that answers kubelet `Status` | ✅ Complete |
+| CRI-P2 | Spike Pod sandbox lifecycle over `apple/container` | ✅ Complete |
 | CRI-P3 | Run a single-container Pod through kubelet and the CRI adapter | ⬜ Planned |
 | CRI-P4 | Implement CRI ImageService pull/list/status/remove | ⬜ Planned |
 | CRI-P5 | Integrate CNI/Pod networking lifecycle | ⬜ Planned |

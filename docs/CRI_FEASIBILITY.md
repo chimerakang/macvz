@@ -62,6 +62,14 @@ a building block but keeps the main CRI gap unchanged: `CreateContainer` after
 `RunPodSandbox` still needs guest-side rootfs staging or another real
 post-create mechanism.
 
+R4 (#96) proved the next smaller piece: after `pod.create()`, the running Pod VM
+can be reached through the VM agent and a guest-side command can stage a
+rootfs-like tree with an explicit request identity. The direct staged marker was
+visible from the guest, but an agent-created bind mount was not visible to a
+later exec in the already-running utility container. That keeps the CRI gap
+open, but narrows it: the next runtime question is VM-agent-created process
+execution in the intended sandbox namespace, not host block-device discovery.
+
 ## Phase Plan
 
 | Phase | Goal | Exit Criteria |

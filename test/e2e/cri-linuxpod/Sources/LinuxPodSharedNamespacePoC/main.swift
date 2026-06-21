@@ -36,7 +36,7 @@ struct LinuxPodSharedNamespacePoC: AsyncParsableCommand {
     @Option(help: "TCP port inside the shared Pod namespace.")
     var port: Int = 18080
 
-    @Option(help: "Probe to run: c1 for pre-create two-container semantics, c2 for post-create addContainer ordering, c4 for HotplugProvider boundary, r1 for guest-side hotplug device discovery, r3 for NBD pre-create rootfs identity.")
+    @Option(help: "Probe to run: c1 for pre-create two-container semantics, c2 for post-create addContainer ordering, c4 for HotplugProvider boundary, r1 for guest-side hotplug device discovery, r3 for NBD pre-create rootfs identity, r4 for guest-side late rootfs staging.")
     var probe: String = "c1"
 
     @Flag(help: "Enable Rosetta for linux/amd64 images.")
@@ -120,8 +120,19 @@ struct LinuxPodSharedNamespacePoC: AsyncParsableCommand {
             )
             return
         }
+        if probe == "r4" {
+            try await runGuestRootfsStagingProbe(
+                imageStore: imageStore,
+                vmm: vmm,
+                logger: logger,
+                startedAt: startedAt,
+                logsURL: logsURL,
+                rootfsURL: rootfsURL
+            )
+            return
+        }
         guard probe == "c1" else {
-            throw ValidationError("unsupported probe \(probe); expected c1, c2, c4, r1, or r3")
+            throw ValidationError("unsupported probe \(probe); expected c1, c2, c4, r1, r3, or r4")
         }
 
         let podID = "macvz-poc-\(Int(startedAt.timeIntervalSince1970))"
@@ -1303,6 +1314,372 @@ struct LinuxPodSharedNamespacePoC: AsyncParsableCommand {
         return "nbdRootfsPrecreateSucceeded"
     }
 
+    private func runGuestRootfsStagingProbe(
+        imageStore: ImageStore,
+        vmm: VZVirtualMachineManager,
+        logger: Logger,
+        startedAt: Date,
+        logsURL: URL,
+        rootfsURL: URL
+    ) async throws {
+        let podID = "macvz-r4-\(Int(startedAt.timeIntervalSince1970))"
+        let pod = try LinuxPod(podID, vmm: vmm, logger: logger) { config in
+            config.cpus = 2
+            config.memoryInBytes = 1024 * 1024 * 1024
+            config.hostname = "macvz-runtime-r4"
+            config.bootLog = .file(path: logsURL.appendingPathComponent("boot.log"))
+        }
+
+        let baseImage = try await imageStore.get(reference: image, pull: true)
+        let utilityRootfs = try await unpackRootfs(baseImage, at: rootfsURL.appendingPathComponent("utility.ext4"))
+        let utilityLog = try FileLogWriter(path: logsURL.appendingPathComponent("utility.log"), stream: "stdout")
+        let utilityErr = try FileLogWriter(path: logsURL.appendingPathComponent("utility.log"), stream: "stderr")
+        let execLog = try FileLogWriter(path: logsURL.appendingPathComponent("exec.log"), stream: "stdout")
+
+        var podCreated = false
+        var utilityStarted = false
+        var transportAvailable = false
+        var attempts: [GuestRootfsStagingAttemptSummary] = []
+        var errors: [String: String] = [:]
+
+        do {
+            try await pod.addContainer("utility", rootfs: utilityRootfs) { config in
+                config.process.arguments = ["/bin/sh", "-c", "exec sleep 300"]
+                config.process.environmentVariables = ["PATH=\(LinuxProcessConfiguration.defaultPath)"]
+                config.process.workingDirectory = "/"
+                config.process.stdout = utilityLog
+                config.process.stderr = utilityErr
+                config.useInit = true
+            }
+
+            try await pod.create()
+            podCreated = true
+            try await pod.startContainer("utility")
+            utilityStarted = true
+
+            attempts = try await pod.withVirtualMachineInstance { vm in
+                let agent = try await vm.dialAgent()
+                var collectedAttempts: [GuestRootfsStagingAttemptSummary] = []
+                for requestID in ["late-alpha", "late-beta"] {
+                    let attempt = try await runGuestRootfsStagingAttempt(
+                        pod: pod,
+                        agent: agent,
+                        requestID: requestID,
+                        execLog: execLog
+                    )
+                    collectedAttempts.append(attempt)
+                    if attempt.outcome != "guestSideStagingSucceeded" {
+                        break
+                    }
+                }
+                try? await agent.close()
+                return collectedAttempts
+            }
+            transportAvailable = true
+
+            if utilityStarted {
+                try? await pod.stopContainer("utility")
+            }
+            try await pod.stop()
+            try close(utilityLog, utilityErr, execLog)
+
+            let result = GuestRootfsStagingSummary(
+                podID: podID,
+                image: image,
+                kernel: kernel,
+                workDir: workDir,
+                durationSeconds: Date().timeIntervalSince(startedAt),
+                podCreated: podCreated,
+                utilityStarted: utilityStarted,
+                transportAvailable: transportAvailable,
+                attempts: attempts,
+                outcome: guestRootfsStagingOutcome(
+                    podCreated: podCreated,
+                    utilityStarted: utilityStarted,
+                    transportAvailable: transportAvailable,
+                    attempts: attempts
+                ),
+                note: "guest-side staging avoids guessed guest block devices, but it is not yet a full late-container process creation path",
+                errors: errors,
+                logs: [
+                    "utility": logsURL.appendingPathComponent("utility.log").path,
+                    "exec": logsURL.appendingPathComponent("exec.log").path,
+                    "boot": logsURL.appendingPathComponent("boot.log").path,
+                ]
+            )
+            print(try result.jsonString())
+        } catch {
+            if !transportAvailable {
+                errors["transport"] = describe(error)
+            } else {
+                errors["probe"] = describe(error)
+            }
+            if utilityStarted {
+                try? await pod.stopContainer("utility")
+            }
+            if podCreated {
+                try? await pod.stop()
+            }
+            try? close(utilityLog, utilityErr, execLog)
+
+            let result = GuestRootfsStagingSummary(
+                podID: podID,
+                image: image,
+                kernel: kernel,
+                workDir: workDir,
+                durationSeconds: Date().timeIntervalSince(startedAt),
+                podCreated: podCreated,
+                utilityStarted: utilityStarted,
+                transportAvailable: transportAvailable,
+                attempts: attempts,
+                outcome: guestRootfsStagingOutcome(
+                    podCreated: podCreated,
+                    utilityStarted: utilityStarted,
+                    transportAvailable: transportAvailable,
+                    attempts: attempts
+                ),
+                note: "guest-side staging avoids guessed guest block devices, but it is not yet a full late-container process creation path",
+                errors: errors,
+                logs: [
+                    "utility": logsURL.appendingPathComponent("utility.log").path,
+                    "exec": logsURL.appendingPathComponent("exec.log").path,
+                    "boot": logsURL.appendingPathComponent("boot.log").path,
+                ]
+            )
+            print(try result.jsonString())
+        }
+    }
+
+    private func runGuestRootfsStagingAttempt(
+        pod: LinuxPod,
+        agent: some VirtualMachineAgent,
+        requestID: String,
+        execLog: FileLogWriter
+    ) async throws -> GuestRootfsStagingAttemptSummary {
+        let escapedID = requestID.replacingOccurrences(of: "/", with: "_")
+        let stageBase = "/run/macvz-r4/staged/\(escapedID)"
+        let rootfsPath = "\(stageBase)/rootfs"
+        let mountTarget = "/run/macvz-r4/mounts/\(escapedID)"
+        let identityPath = "\(rootfsPath)/etc/macvz-r4-identity"
+        let requestPath = "\(rootfsPath)/metadata/request-id"
+        var stageSucceeded = false
+        var mountSucceeded = false
+        var identityVerified = false
+        var cleanupSucceeded = false
+        var verifyOutput = ""
+        var cleanupOutput = ""
+        var errors: [String: String] = [:]
+
+        do {
+            try await agent.mkdir(path: rootfsPath, all: true, perms: 0o755)
+            try await agent.mkdir(path: mountTarget, all: true, perms: 0o755)
+            let stage = try await execCapture(
+                pod,
+                containerID: "utility",
+                processID: "r4-stage-\(escapedID)",
+                script: guestRootfsStageScript(
+                    requestID: requestID,
+                    rootfsPath: rootfsPath,
+                    identityPath: identityPath,
+                    requestPath: requestPath
+                ),
+                log: execLog
+            )
+            if stage.exitCode != 0 {
+                throw ValidationError("stage command exited with \(stage.exitCode): \(stage.output)")
+            }
+            try await agent.sync()
+            stageSucceeded = true
+        } catch {
+            errors["stage"] = describe(error)
+        }
+
+        if stageSucceeded {
+            do {
+                try await agent.mount(ContainerizationOCI.Mount(
+                    type: "none",
+                    source: rootfsPath,
+                    destination: mountTarget,
+                    options: ["bind"]
+                ))
+                mountSucceeded = true
+            } catch {
+                errors["mount"] = describe(error)
+            }
+        }
+
+        if mountSucceeded {
+            let verify = try await execCapture(
+                pod,
+                containerID: "utility",
+                processID: "r4-verify-\(escapedID)",
+                script: guestRootfsVerifyScript(
+                    requestID: requestID,
+                    mountTarget: mountTarget,
+                    identityPath: identityPath
+                ),
+                log: execLog
+            )
+            verifyOutput = verify.output
+            identityVerified = verify.exitCode == 0
+            if verify.exitCode != 0 {
+                errors["identity"] = "exit \(verify.exitCode): \(verify.output)"
+            }
+        }
+
+        if mountSucceeded {
+            do {
+                try await agent.umount(path: mountTarget, flags: 0)
+            } catch {
+                errors["umount"] = describe(error)
+            }
+        }
+
+        let cleanup = try await execCapture(
+            pod,
+            containerID: "utility",
+            processID: "r4-cleanup-\(escapedID)",
+            script: guestRootfsCleanupScript(stageBase: stageBase, mountTarget: mountTarget),
+            log: execLog
+        )
+        cleanupOutput = cleanup.output
+        cleanupSucceeded = cleanup.exitCode == 0
+        if cleanup.exitCode != 0 {
+            errors["cleanup"] = "exit \(cleanup.exitCode): \(cleanup.output)"
+        }
+
+        return GuestRootfsStagingAttemptSummary(
+            requestID: requestID,
+            stagePath: rootfsPath,
+            mountTarget: mountTarget,
+            stageSucceeded: stageSucceeded,
+            mountSucceeded: mountSucceeded,
+            identityVerified: identityVerified,
+            cleanupSucceeded: cleanupSucceeded,
+            verifyOutput: verifyOutput,
+            cleanupOutput: cleanupOutput,
+            outcome: guestRootfsStagingAttemptOutcome(
+                stageSucceeded: stageSucceeded,
+                mountSucceeded: mountSucceeded,
+                identityVerified: identityVerified,
+                cleanupSucceeded: cleanupSucceeded
+            ),
+            errors: errors
+        )
+    }
+
+    private func guestRootfsVerifyScript(requestID: String, mountTarget: String, identityPath: String) -> String {
+        """
+        set -u
+        expected=\(shellSingleQuoted("macvz-r4-id=\(requestID)"))
+        mounted_identity=\(shellSingleQuoted("\(mountTarget)/etc/macvz-r4-identity"))
+        direct_identity=\(shellSingleQuoted(identityPath))
+        mount_target=\(shellSingleQuoted(mountTarget))
+        direct_value="$(cat "${direct_identity}" 2>/dev/null)"
+        direct_status=$?
+        mounted_value="$(cat "${mounted_identity}" 2>/dev/null)"
+        mounted_status=$?
+        mount_line="$(grep " ${mount_target} " /proc/mounts 2>/dev/null)"
+        mount_status=$?
+        echo "direct_status=${direct_status}"
+        echo "direct_identity=${direct_value}"
+        echo "mounted_status=${mounted_status}"
+        echo "mounted_identity=${mounted_value}"
+        echo "mount_status=${mount_status}"
+        echo "mount_line=${mount_line}"
+        echo "mount_target_listing=$(ls -la "${mount_target}" 2>/dev/null | tr '\\n' ';' || true)"
+        if [ "${direct_status}" != "0" ] || [ "${direct_value}" != "${expected}" ]; then
+          exit 41
+        fi
+        if [ "${mounted_status}" != "0" ] || [ "${mounted_value}" != "${expected}" ]; then
+          exit 42
+        fi
+        if [ "${mount_status}" != "0" ]; then
+          exit 43
+        fi
+        """
+    }
+
+    private func guestRootfsStageScript(
+        requestID: String,
+        rootfsPath: String,
+        identityPath: String,
+        requestPath: String
+    ) -> String {
+        """
+        set -eu
+        rootfs_path=\(shellSingleQuoted(rootfsPath))
+        identity_path=\(shellSingleQuoted(identityPath))
+        request_path=\(shellSingleQuoted(requestPath))
+        request_id=\(shellSingleQuoted(requestID))
+        mkdir -p "${rootfs_path}/etc" "${rootfs_path}/metadata"
+        printf 'macvz-r4-id=%s\\n' "${request_id}" > "${identity_path}"
+        printf '%s\\n' "${request_id}" > "${request_path}"
+        sync
+        test -f "${identity_path}"
+        test -f "${request_path}"
+        echo "stage_ok request=${request_id} rootfs=${rootfs_path}"
+        """
+    }
+
+    private func guestRootfsCleanupScript(stageBase: String, mountTarget: String) -> String {
+        """
+        set -eu
+        stage_base=\(shellSingleQuoted(stageBase))
+        mount_target=\(shellSingleQuoted(mountTarget))
+        rm -rf "${stage_base}" "${mount_target}"
+        if [ -e "${stage_base}" ] || [ -e "${mount_target}" ]; then
+          echo "cleanup_failed stage=${stage_base} target=${mount_target}"
+          exit 31
+        fi
+        echo "cleanup_ok stage=${stage_base} target=${mount_target}"
+        """
+    }
+
+    private func guestRootfsStagingAttemptOutcome(
+        stageSucceeded: Bool,
+        mountSucceeded: Bool,
+        identityVerified: Bool,
+        cleanupSucceeded: Bool
+    ) -> String {
+        if !stageSucceeded {
+            return "rootfsCopyUnpackFailed"
+        }
+        if !mountSucceeded {
+            return "mountBindFailed"
+        }
+        if !identityVerified {
+            return "stagedRootfsIdentityMismatch"
+        }
+        if !cleanupSucceeded {
+            return "cleanupFailed"
+        }
+        return "guestSideStagingSucceeded"
+    }
+
+    private func guestRootfsStagingOutcome(
+        podCreated: Bool,
+        utilityStarted: Bool,
+        transportAvailable: Bool,
+        attempts: [GuestRootfsStagingAttemptSummary]
+    ) -> String {
+        if !podCreated || !utilityStarted || !transportAvailable {
+            return "guestStagingTransportUnavailable"
+        }
+        guard let first = attempts.first else {
+            return "guestStagingTransportUnavailable"
+        }
+        if first.outcome != "guestSideStagingSucceeded" {
+            return first.outcome
+        }
+        guard attempts.count > 1 else {
+            return "guestSideStagingSucceeded"
+        }
+        return attempts.allSatisfy { $0.outcome == "guestSideStagingSucceeded" }
+            ? "guestSideStagingSucceeded"
+            : (attempts.first { $0.outcome != "guestSideStagingSucceeded" }?.outcome ?? "guestSideStagingSucceeded")
+    }
+
     private func readTextFile(_ url: URL) throws -> String {
         String(decoding: try Data(contentsOf: url), as: UTF8.self)
     }
@@ -1479,6 +1856,42 @@ private struct NBDRootfsIdentitySummary: Encodable {
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         return String(decoding: try encoder.encode(self), as: UTF8.self)
     }
+}
+
+private struct GuestRootfsStagingSummary: Encodable {
+    let podID: String
+    let image: String
+    let kernel: String
+    let workDir: String
+    let durationSeconds: TimeInterval
+    let podCreated: Bool
+    let utilityStarted: Bool
+    let transportAvailable: Bool
+    let attempts: [GuestRootfsStagingAttemptSummary]
+    let outcome: String
+    let note: String
+    let errors: [String: String]
+    let logs: [String: String]
+
+    func jsonString() throws -> String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        return String(decoding: try encoder.encode(self), as: UTF8.self)
+    }
+}
+
+private struct GuestRootfsStagingAttemptSummary: Encodable {
+    let requestID: String
+    let stagePath: String
+    let mountTarget: String
+    let stageSucceeded: Bool
+    let mountSucceeded: Bool
+    let identityVerified: Bool
+    let cleanupSucceeded: Bool
+    let verifyOutput: String
+    let cleanupOutput: String
+    let outcome: String
+    let errors: [String: String]
 }
 
 private struct GuestBlockDevice: Encodable {

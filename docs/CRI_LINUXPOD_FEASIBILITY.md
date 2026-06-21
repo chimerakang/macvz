@@ -338,6 +338,25 @@ LinuxPod containers and for future Pod volume work. Do not treat it as the full
 CRI answer. The next phase should test guest-side rootfs staging inside an
 already-running Pod VM.
 
+### R4: Guest-Side Rootfs Staging (#96)
+
+R4 completed on 2026-06-21 UTC. The report is
+[CRI_RUNTIME_R4_GUEST_STAGING_REPORT.md](CRI_RUNTIME_R4_GUEST_STAGING_REPORT.md).
+
+Result: **post-create guest-side file staging works, but agent-created bind
+mount visibility is not yet enough for a late-container rootfs**. The probe
+booted one LinuxPod with a predeclared utility container, dialed the running VM
+agent after `pod.create()`, staged a rootfs-like tree with explicit request ID
+`late-alpha`, and verified the direct marker from inside the guest. The direct
+identity was visible as `macvz-r4-id=late-alpha`.
+
+The VM agent accepted the bind mount for the staged rootfs, but a later exec in
+the utility container did not observe the mount target or a `/proc/mounts` line.
+This points to a namespace boundary between agent-level mounts and already
+running container execs. The next step should test VM-agent-created process
+execution from the staged rootfs rather than relying on an existing utility
+container to observe the mount.
+
 ### C5: Swift Helper Daemon Prototype
 
 Only if R0 later selects a LinuxPod-based bridge as a valid runtime building

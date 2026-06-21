@@ -138,3 +138,25 @@ block for the LinuxPod research path. It still does not solve normal kubelet
 ordering, because the containers and rootfs attachments must be known before
 `pod.create()`. The next useful primitive is therefore guest-side rootfs staging
 inside an already-running Pod VM.
+
+## R4 Result
+
+R4 completed on 2026-06-21 UTC. The live probe is published at
+[CRI_RUNTIME_R4_GUEST_STAGING_REPORT.md](CRI_RUNTIME_R4_GUEST_STAGING_REPORT.md).
+
+Outcome: `stagedRootfsIdentityMismatch`.
+
+The probe booted one LinuxPod with a predeclared utility container, then dialed
+the running VM agent after `pod.create()`. Guest-side staging through a temporary
+guest command worked: the direct staged marker was visible as
+`macvz-r4-id=late-alpha`, and no guessed `/dev/*` path was used.
+
+The remaining boundary is mount namespace visibility. The VM agent accepted the
+bind mount for `/run/macvz-r4/mounts/late-alpha`, but a later exec inside the
+predeclared utility container did not see the mount target or a corresponding
+`/proc/mounts` entry. This means R4 proves post-create file staging, but not yet
+a full late-container rootfs primitive.
+
+The next probe should bypass the already-running utility container as the
+observer and use the VM agent to create/start a process in the intended sandbox
+namespace from the staged rootfs.

@@ -42,8 +42,13 @@ case "${PROBE}" in
     REPORT_TITLE="CRI-R3 NBD-Backed Pre-Create Rootfs Identity Report (#95)"
     WORK_DIR="${MACVZ_LINUXPOD_WORK_DIR:-/tmp/macvz-runtime-r3}"
     ;;
+  r4)
+    DEFAULT_REPORT_PATH="${ROOT_DIR}/docs/CRI_RUNTIME_R4_GUEST_STAGING_REPORT.md"
+    REPORT_TITLE="CRI-R4 Guest-Side Rootfs Staging Report (#96)"
+    WORK_DIR="${MACVZ_LINUXPOD_WORK_DIR:-/tmp/macvz-runtime-r4}"
+    ;;
   *)
-    echo "unsupported MACVZ_LINUXPOD_PROBE=${PROBE}; expected c1, c2, c4, r1, or r3" >&2
+    echo "unsupported MACVZ_LINUXPOD_PROBE=${PROBE}; expected c1, c2, c4, r1, r3, or r4" >&2
     exit 1
     ;;
 esac
@@ -63,6 +68,7 @@ This gated Swift harness can run:
   - c4 (#91): consumer HotplugProvider boundary probe
   - r1 (#93): guest-side hotplug block-device discovery probe
   - r3 (#95): NBD-backed pre-create rootfs identity probe
+  - r4 (#96): guest-side late rootfs staging probe
 
 Selected probe: ${PROBE}
 
@@ -103,6 +109,13 @@ R3 flow:
      rootfs mount evidence, and read the markers back from the host-side ext4
      backing files
 
+R4 flow:
+  1. boot one LinuxPod with a predeclared utility container
+  2. after pod.create() and utility start, dial the VM agent
+  3. stage rootfs-like directories inside the guest with explicit request IDs
+  4. bind mount each staged rootfs, verify identity through the running utility
+     container, clean it up, and retry with a second request ID
+
 Set MACVZ_LINUXPOD_VMNET=1 to also attach a vmnet interface. The default
 keeps this C1 probe focused on LinuxPod shared-namespace behavior.
 
@@ -128,6 +141,7 @@ Run live:
   MACVZ_LINUXPOD_POC=1 make cri-linuxpod-c4
   MACVZ_LINUXPOD_POC=1 make cri-linuxpod-r1
   MACVZ_LINUXPOD_POC=1 make cri-linuxpod-r3
+  MACVZ_LINUXPOD_POC=1 make cri-linuxpod-r4
 EOF
   exit 0
 fi
@@ -246,7 +260,7 @@ EOF
 - [x] No guessed /dev/sdX or /dev/vdX path is counted as success.
 
 EOF
-  else
+  elif [[ "${PROBE}" == "r3" ]]; then
     cat >>"${REPORT_PATH}" <<EOF
 - [x] Two rootfs ext4 images were served through local NBD Unix sockets, or the setup failure was recorded.
 - [x] Two LinuxPod containers were pre-registered before pod.create() with NBD-backed rootfs mounts.
@@ -255,6 +269,15 @@ EOF
 - [x] Host-side ext4 reads verify each container wrote to its own backing rootfs image.
 - [x] The report states that pre-create NBD rootfs does not solve post-create CreateContainer ordering.
 - [x] No guessed /dev/sdX or /dev/vdX path is counted as success.
+
+EOF
+  else
+    cat >>"${REPORT_PATH}" <<EOF
+- [x] One LinuxPod was created with a predeclared utility container.
+- [x] Guest agent transport was attempted only after pod.create() and utility start.
+- [x] Rootfs-like guest staging records stage/copy, bind mount, identity verification, cleanup, and retry boundaries.
+- [x] Identity is checked by explicit request ID, not by guessed /dev/sdX or /dev/vdX names.
+- [x] The report distinguishes guest staging transport unavailable, rootfs copy/unpack failure, identity mismatch, bind failure, cleanup failure, and success.
 
 EOF
   fi

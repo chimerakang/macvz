@@ -78,9 +78,22 @@ type Options struct {
 	// #77). Nil leaves IP allocation off. Satisfied by *network.PodIPAM. Both
 	// PodNetwork and IPAM must be set for the Pod network path to be usable.
 	IPAM PodIPAllocator
+	// Mounts governs which kubelet-provided host mounts are bound into a micro-VM
+	// (CRI-P7, #79). The zero value is conservative: only kubelet-managed projected
+	// and emptyDir volumes are allowed, and arbitrary hostPath is rejected until an
+	// allowlist is configured.
+	Mounts MountPolicy
 	// Now overrides the clock for CreatedAt timestamps in tests. Nil uses
 	// time.Now.
 	Now func() time.Time
+	// MultiContainer opts into the experimental multi-container Pod probe (CRI-P9
+	// follow-up, #82). The default (false) keeps the honest single-container
+	// restriction. When true, a second container is admitted only if the runtime
+	// implements the pause-VM shared-netns create/join capability
+	// (SharedPodNetworkRuntime); apple/container does not, so the probe still
+	// rejects — but with a diagnostic naming the exact missing primitive rather
+	// than a flat one-container error.
+	MultiContainer bool
 }
 
 // Server is the experimental MacVz CRI server. It implements the CRI
@@ -100,8 +113,12 @@ type Server struct {
 	imageRuntime     ImageRuntime
 	podNet           PodNetwork
 	ipam             PodIPAllocator
+	mountPolicy      MountPolicy
 	lifecycleMu      sync.Mutex
 	now              func() time.Time
+	// multiContainer enables the experimental multi-container Pod probe (#82). See
+	// Options.MultiContainer and multicontainer.go.
+	multiContainer bool
 
 	// streamServer mints the per-request streaming URLs kubelet redirects exec and
 	// port-forward clients to (CRI-P6, #78). Nil leaves those surfaces returning a
@@ -154,7 +171,9 @@ func New(opts Options) *Server {
 		imageRuntime:     opts.Images,
 		podNet:           opts.PodNetwork,
 		ipam:             opts.IPAM,
+		mountPolicy:      opts.Mounts,
 		now:              now,
+		multiContainer:   opts.MultiContainer,
 		logPumps:         make(map[string]*logPump),
 		vmIPPollAttempts: defaultVMIPPollAttempts,
 		vmIPPollInterval: defaultVMIPPollInterval,
@@ -213,10 +232,11 @@ func (s *Server) Status(_ context.Context, req *runtimeapi.StatusRequest) (*runt
 	resp := &runtimeapi.StatusResponse{Status: status}
 	if req.GetVerbose() {
 		resp.Info = map[string]string{
-			"experimental": "true",
-			"track":        "CRI feasibility (docs/CRI_FEASIBILITY.md)",
-			"runtimeName":  s.runtimeName,
-			"network":      s.networkInfo(),
+			"experimental":   "true",
+			"track":          "CRI feasibility (docs/CRI_FEASIBILITY.md)",
+			"runtimeName":    s.runtimeName,
+			"network":        s.networkInfo(),
+			"multiContainer": s.multiContainerInfo(),
 		}
 	}
 	return resp, nil

@@ -51,8 +51,10 @@ architecture from Virtual Kubelet provider to kubelet CRI runtime integration.
 | CRI-P4 | Implement CRI ImageService pull/list/status/remove | ✅ Complete |
 | CRI-P5 | Integrate CNI/Pod networking lifecycle | ✅ Complete |
 | CRI-P6 | Implement logs, exec, attach, port-forward, and stats surfaces | ✅ Complete |
-| CRI-P7 | Validate volumes, projected data, probes, and restart recovery | ⬜ Planned |
-| CRI-P8 | Harden k3s compatibility, install, cleanup, and soak behavior | ⬜ Planned |
+| CRI-P7 | Validate volumes, projected data, probes, and restart recovery | ✅ Complete |
+| CRI-P8 | Harden k3s compatibility, install, cleanup, and soak behavior | ✅ Complete |
+| CRI-P9 | Make the route-two go/no-go decision and migration plan | ✅ Complete (no-go for replacement; experimental side path) |
+| CRI-P9 follow-up (#82) | Multi-container Pod feasibility: pause-VM shared-netns spike | ✅ Complete (blocked on missing `apple/container` primitive; flag-gated adapter path ready) |
 
 **CRI-P5 evidence (#77):** Pod networking is wired through the same primitives as
 the shipped provider — `network.PodIPAM` for Pod IPs and `podnet.Router` for the
@@ -86,6 +88,89 @@ when a sample is unavailable. Hermetic coverage in
 `cmd/macvz-cri` exposes `--streaming-addr` (default `127.0.0.1:0`; exec/port-forward
 return `FailedPrecondition` when empty). See
 [CRI_FEASIBILITY.md](CRI_FEASIBILITY.md) CRI-P6.
+
+**CRI-P7 evidence (#79):** Kubelet-driven Pod inputs and lifecycle behavior are
+honest over the CRI path. In CRI mode the kubelet materializes projected
+ConfigMap/Secret/Downward/SA-token and `emptyDir` content on the host and passes
+them as bind mounts; `pkg/criserver/mounts.go` translates each into a
+`types.Mount` (host bind or guest tmpfs for a Memory `emptyDir`) under a
+conservative policy — mounts under the kubelet pods dir
+(`--kubelet-pods-dir`, default `/var/lib/kubelet/pods`) are always allowed, any
+other `hostPath` must be within a `--volume-host-path-allowed` prefix (empty
+disables arbitrary hostPath), prefix matching is segment-aware, and bidirectional
+propagation is rejected. Mounts are persisted and surface in
+`ContainerStatus.Mounts`. Probes are kubelet-driven: HTTP/TCP from the kubelet
+against the Pod IP (CRI-P5), exec via `ExecSync` (CRI-P6). `restartPolicy` is
+honored by reporting exits faithfully and allowing recreate once the prior
+container has Exited (only a live container blocks a new one).
+`Server.RecoverContainers` (`pkg/criserver/recover.go`) reconciles persisted
+containers against live workloads and resumes log pumps on restart without
+duplicating or orphaning a workload, alongside `RecoverNetwork` for Pod IP/state.
+Hermetic coverage in `pkg/criserver/{mounts,recover}_test.go`; gated live smoke in
+`pkg/criserver/volumes_integration_test.go`
+(`MACVZ_CRI_INTEGRATION=1 go test ./pkg/criserver -run 'Test.*Volume|Test.*Probe|Test.*Restart|Test.*Recovery'`).
+Non-goals (multi-container shared volumes, subPath, dynamic PV) stay out of scope.
+See [CRI_FEASIBILITY.md](CRI_FEASIBILITY.md) CRI-P7.
+
+**CRI-P8 evidence (#80):** The experimental adapter is hardened into an
+operator-facing k3s runtime path for single-container, non-host-namespace Pods.
+`macvz-cri --preflight` (`cmd/macvz-cri/preflight.go`) reports runtime-dependency
+status (apple/container CLI, socket, state dir, Pod networking, mount policy) as
+`OK`/`WARN`/`FAIL` without mutating host state; its check logic is pure over
+injectable probes and unit-tested. Unsupported Pod shapes
+(`hostNetwork`/`hostPID`/`hostIPC`) are rejected by `RunPodSandbox` with a clear
+`InvalidArgument` naming the spec field (`pkg/criserver/diagnose.go`).
+`scripts/macvz-cri-install.sh` installs/uninstalls the adapter as a per-user
+LaunchAgent — idempotent, preflighted, `KeepAlive`, with `uninstall`/`--purge`
+leaving no stale socket/binary/state (`MACVZ_DRY_RUN=1` for rehearsal), and with
+XML-escaped plist arguments plus `MACVZ_CRI_EXTRA_ARGS_FILE` for one-argument-per-line
+extra flags when values contain spaces. The gated `test/e2e/cri-k3s/run.sh`
+(`MACVZ_INTEGRATION=1`) drives the `crictl` compatibility suite — explicit
+ImageService pull, lifecycle, logs, exec probe, projected config mount,
+unsupported-shape rejection, adapter restart recovery, and cleanup verification —
+and `test/e2e/cri-k3s/soak.sh` pulls once then runs a bounded create/delete soak
+sampling adapter RSS with leak/orphan guards. k3s wiring is documented in
+`test/e2e/cri-k3s/README.md`; `make cri-k3s`/`make cri-soak` are convenience
+targets. Full `kubectl` fixture deployment and Service reachability remain CRI-P9
+go/no-go evidence. No production-ready claim is made: the route-two go/no-go
+(multi-container support, host-namespace workloads, real-hardware soak) is
+deferred to CRI-P9. The Virtual Kubelet path is unchanged. See
+[CRI_FEASIBILITY.md](CRI_FEASIBILITY.md) CRI-P8.
+
+**CRI-P9 decision (#81):** The route-two go/no-go gate resolves to a **conditional
+no-go for replacement, not a stop**: keep CRI as a documented experimental
+`develop` side path; the shipped Virtual Kubelet provider remains the only
+supported production runtime. The CRI adapter is honest and useful for the
+single-container, non-host-namespace Pod class (P1–P8 have hermetic coverage plus
+gated component/live harnesses; `go test ./...`, `go vet ./...`, `make build`,
+`make cri` green), but two blockers fundamental to `apple/container` — not the adapter —
+prevent a general node runtime: **multi-container Pods** (no shared-netns pause
+model across micro-VMs) and **host-namespace Pods** (`hostNetwork`/`hostPID`/
+`hostIPC`). The third gate, a **sustained real-hardware k3s soak**, has a harness
+(`test/e2e/cri-k3s/`) but no run yet. Decision flips to **go** only when all three
+clear; README positioning is unchanged because the user-facing architecture does
+not change. Follow-up issues track the three blockers (#82 multi-container,
+#83 real-hardware soak, #84 host-namespace). Full decision package
+(supported/unsupported workload shapes, gaps vs. Virtual Kubelet and vs. ordinary
+CRI runtimes, k3s failure modes, operational + security model, migration and
+fallback plans) is in [CRI_FEASIBILITY.md](CRI_FEASIBILITY.md) CRI-P9.
+
+**CRI-P9 follow-up (#82):** The multi-container blocker is confirmed
+**architectural, not a missing flag**: `apple/container` runs one Linux kernel
+per container, and a network namespace is per-kernel, so two micro-VMs cannot
+share one. The exact missing primitive is *the ability to run a second OCI image
+(own rootfs, lifecycle, limits) inside an existing Pod sandbox VM sharing that
+VM's network namespace* — the pause-VM model used by Kata/Firecracker CRI
+runtimes — recorded in code as `missingSharedNetnsPrimitive`. The adapter ships a
+flag-gated path (`--experimental-multi-container`, `SharedPodNetworkRuntime` in
+`pkg/criserver/multicontainer.go`): off by default it keeps the honest
+one-container rejection; on, it admits a second container only if the runtime
+implements `CreateInPodSandbox` (apple/container does not, so it rejects with a
+diagnostic naming the gap). A hermetic test proves the adapter routes the second
+container through that join operation with the first workload ID as the sandbox VM
+target. An L3-shared-network approximation was rejected as dishonest (distinct
+IPs break the single-Pod-IP/localhost contract). See
+[CRI_FEASIBILITY.md](CRI_FEASIBILITY.md) "CRI-P9 Follow-up (#82)".
 
 ## Current Validation Snapshot
 

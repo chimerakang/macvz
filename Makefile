@@ -32,6 +32,14 @@ cri: ## Build the experimental CRI feasibility server into bin/macvz-cri
 	@mkdir -p $(BIN_DIR)
 	go build -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/macvz-cri ./cmd/macvz-cri
 
+.PHONY: cri-k3s
+cri-k3s: cri ## Run the CRI-P8 k3s compatibility suite (set MACVZ_INTEGRATION=1 to run live)
+	./test/e2e/cri-k3s/run.sh
+
+.PHONY: cri-soak
+cri-soak: cri ## Run the CRI-P8 bounded soak (set MACVZ_INTEGRATION=1 to run live)
+	./test/e2e/cri-k3s/soak.sh
+
 .PHONY: bench
 bench: ## Build the density/RAM benchmark harness into bin/mvz-bench
 	@mkdir -p $(BIN_DIR)

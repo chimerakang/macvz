@@ -61,6 +61,11 @@ type Container struct {
 	Labels      map[string]string `json:"labels,omitempty"`
 	Annotations map[string]string `json:"annotations,omitempty"`
 	LogPath     string            `json:"logPath,omitempty"`
+	// Mounts are the kubelet-provided filesystem mounts realized for this
+	// container (CRI-P7, #79). They are persisted so ContainerStatus can report
+	// them faithfully and so a restarted adapter recovers the same view without
+	// re-deriving it from the runtime.
+	Mounts []Mount `json:"mounts,omitempty"`
 	State       ContainerState    `json:"state"`
 	CreatedAt   int64             `json:"createdAt"`            // unix nanoseconds
 	StartedAt   int64             `json:"startedAt,omitempty"`  // unix nanoseconds
@@ -68,6 +73,19 @@ type Container struct {
 	ExitCode    int32             `json:"exitCode,omitempty"`
 	Reason      string            `json:"reason,omitempty"`
 	Message     string            `json:"message,omitempty"`
+}
+
+// Mount is a persisted filesystem mount realized for a container (CRI-P7, #79).
+// It mirrors the subset of the CRI Mount the adapter acts on: a host source bound
+// into the guest at a target path, or a guest-local tmpfs when Tmpfs is set. The
+// kubelet has already materialized projected ConfigMap/Secret/Downward/SA-token
+// and emptyDir content on the host before passing these, so the record captures
+// what was mounted, not how it was projected.
+type Mount struct {
+	HostPath      string `json:"hostPath,omitempty"`
+	ContainerPath string `json:"containerPath"`
+	ReadOnly      bool   `json:"readOnly,omitempty"`
+	Tmpfs         bool   `json:"tmpfs,omitempty"`
 }
 
 // DeriveWorkloadID maps a CRI container ID to a deterministic apple/container
@@ -248,5 +266,8 @@ func cloneContainer(c *Container) Container {
 	cp.Env = cloneStringMap(c.Env)
 	cp.Labels = cloneStringMap(c.Labels)
 	cp.Annotations = cloneStringMap(c.Annotations)
+	if c.Mounts != nil {
+		cp.Mounts = append([]Mount(nil), c.Mounts...)
+	}
 	return cp
 }

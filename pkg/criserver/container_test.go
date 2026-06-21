@@ -3,6 +3,7 @@ package criserver
 import (
 	"context"
 	"io"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -242,6 +243,43 @@ func TestCreateStartStopRemoveHappyPath(t *testing.T) {
 	}
 	if _, err := s.ContainerStatus(ctx, &runtimeapi.ContainerStatusRequest{ContainerId: id}); status.Code(err) != codes.NotFound {
 		t.Errorf("ContainerStatus after remove: code = %v, want NotFound", status.Code(err))
+	}
+}
+
+// TestContainerStatusReportsAbsoluteLogPath asserts the CRI contract that
+// ContainerStatus reports the log path as the sandbox log_directory joined with
+// the container's relative log_path. crictl/kubelet resolve this path directly,
+// so a relative value (e.g. "app.log") makes `crictl logs` fail to find the file.
+func TestContainerStatusReportsAbsoluteLogPath(t *testing.T) {
+	rt := newFakeRuntime()
+	s := New(Options{Runtime: rt})
+	ctx := context.Background()
+
+	const logDir = "/var/log/pods/default_pod_uid-1"
+	sbResp, err := s.RunPodSandbox(ctx, &runtimeapi.RunPodSandboxRequest{
+		Config: &runtimeapi.PodSandboxConfig{
+			Metadata:     &runtimeapi.PodSandboxMetadata{Name: "pod", Namespace: "default", Uid: "uid-1"},
+			LogDirectory: logDir,
+		},
+	})
+	if err != nil {
+		t.Fatalf("RunPodSandbox: %v", err)
+	}
+
+	cReq := createReq(sbResp.GetPodSandboxId(), "app")
+	cReq.Config.LogPath = "app/0.log"
+	cResp, err := s.CreateContainer(ctx, cReq)
+	if err != nil {
+		t.Fatalf("CreateContainer: %v", err)
+	}
+
+	st, err := s.ContainerStatus(ctx, &runtimeapi.ContainerStatusRequest{ContainerId: cResp.GetContainerId()})
+	if err != nil {
+		t.Fatalf("ContainerStatus: %v", err)
+	}
+	want := filepath.Join(logDir, "app/0.log")
+	if got := st.GetStatus().GetLogPath(); got != want {
+		t.Errorf("LogPath = %q, want absolute %q", got, want)
 	}
 }
 

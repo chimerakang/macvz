@@ -193,6 +193,32 @@ func TestPortForwardTargetResolvesVMIP(t *testing.T) {
 	}
 }
 
+func TestPortForwardTargetSkipsExitedRestartHistory(t *testing.T) {
+	rt := newFakeRuntime()
+	rt.startIP = "192.168.64.20"
+	s, sandboxID := newServerWithRuntime(t, rt)
+	ctx := context.Background()
+
+	first := startedContainer(t, s, sandboxID)
+	if _, err := s.StopContainer(ctx, &runtimeapi.StopContainerRequest{ContainerId: first}); err != nil {
+		t.Fatalf("StopContainer(first): %v", err)
+	}
+
+	rt.startIP = "192.168.64.21"
+	second := startedContainer(t, s, sandboxID)
+	if second == first {
+		t.Fatalf("restart returned same container id")
+	}
+
+	host, err := s.portForwardTarget(ctx, sandboxID)
+	if err != nil {
+		t.Fatalf("portForwardTarget: %v", err)
+	}
+	if host != "192.168.64.21" {
+		t.Errorf("portForwardTarget = %q, want running replacement VM IP", host)
+	}
+}
+
 func TestStreamingPortForwardProxiesBytes(t *testing.T) {
 	rt := newFakeRuntime()
 	// Stand up a local echo server and report its address as the VM IP so the

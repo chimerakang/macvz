@@ -33,6 +33,14 @@ func (s *Server) RunPodSandbox(_ context.Context, req *runtimeapi.RunPodSandboxR
 	if md.GetName() == "" || md.GetNamespace() == "" || md.GetUid() == "" {
 		return nil, status.Error(codes.InvalidArgument, "RunPodSandbox: metadata name, namespace, and uid are required")
 	}
+	// Reject Pod shapes the isolated micro-VM model cannot honor (CRI-P8, #80)
+	// before reserving any state, so the operator gets one clear diagnostic rather
+	// than a Pod that boots while silently ignoring its host-sharing request.
+	if reason, bad := unsupportedSandboxShape(cfg); bad {
+		return nil, status.Errorf(codes.InvalidArgument,
+			"RunPodSandbox: Pod %s/%s uses a shape the experimental CRI adapter cannot honor: %s",
+			md.GetNamespace(), md.GetName(), reason)
+	}
 
 	id, err := store.NewID()
 	if err != nil {

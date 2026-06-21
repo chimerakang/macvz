@@ -51,6 +51,27 @@ type podNetConfig struct {
 
 func (c podNetConfig) enabled() bool { return c.podCIDR != "" && c.iface != "" }
 
+// mountConfig collects the CRI-P7 mount-policy flags (#79). It governs which
+// kubelet-provided host mounts the adapter binds into a micro-VM.
+type mountConfig struct {
+	kubeletPodsDir  string
+	hostPathAllowed []string
+}
+
+// stringList is a repeatable string flag (one value per occurrence), used for the
+// hostPath allowlist so an operator can opt into multiple host prefixes.
+type stringList []string
+
+func (l *stringList) String() string { return strings.Join(*l, ",") }
+
+func (l *stringList) Set(v string) error {
+	if v == "" {
+		return fmt.Errorf("value must not be empty")
+	}
+	*l = append(*l, v)
+	return nil
+}
+
 // defaultListen is the CRI socket endpoint used when --listen is not provided.
 const defaultListen = "unix:///tmp/macvz-cri.sock"
 
@@ -64,13 +85,17 @@ const streamingStartTimeout = 5 * time.Second
 
 func main() {
 	var (
-		listen        string
-		stateDir      string
-		runtimeBinary string
-		rosetta       bool
-		showVersion   bool
-		streamingAddr string
-		pn            podNetConfig
+		listen          string
+		stateDir        string
+		runtimeBinary   string
+		rosetta         bool
+		showVersion     bool
+		doPreflight     bool
+		streamingAddr   string
+		kubeletPodsDir  string
+		hostPathAllowed stringList
+		multiContainer  bool
+		pn              podNetConfig
 	)
 	flag.StringVar(&listen, "listen", defaultListen,
 		"CRI gRPC endpoint to serve (unix:///path/to.sock or an absolute socket path)")
@@ -92,6 +117,14 @@ func main() {
 		"macvz-netd privileged helper socket for pf/route operations (empty runs pfctl/route directly, requiring root)")
 	flag.BoolVar(&pn.enableForwarding, "pod-network-enable-forwarding", false,
 		"enable IPv4 forwarding when starting the Pod network path")
+	flag.StringVar(&kubeletPodsDir, "kubelet-pods-dir", "",
+		"kubelet per-Pod volume root whose mounts (projected volumes, emptyDir) are always allowed (empty uses /var/lib/kubelet/pods)")
+	flag.Var(&hostPathAllowed, "volume-host-path-allowed",
+		"absolute host path prefix a hostPath volume may mount under, outside the kubelet pods dir (repeatable; empty disables arbitrary hostPath)")
+	flag.BoolVar(&doPreflight, "preflight", false,
+		"check runtime dependencies (apple/container CLI, socket, state dir, networking) and exit without serving (CRI-P8 operator diagnostics)")
+	flag.BoolVar(&multiContainer, "experimental-multi-container", false,
+		"opt into the experimental multi-container Pod probe (#82): admits a second container only if the runtime implements pause-VM shared-netns create/join support; apple/container does not, so this turns the one-container rejection into a diagnostic naming the missing primitive")
 	flag.BoolVar(&showVersion, "version", false, "print version and exit")
 
 	klog.InitFlags(nil)
@@ -102,10 +135,27 @@ func main() {
 		return
 	}
 
+	mc := mountConfig{kubeletPodsDir: kubeletPodsDir, hostPathAllowed: hostPathAllowed}
+
+	if doPreflight {
+		if err := runPreflight(preflightConfig{
+			listen:        listen,
+			stateDir:      stateDir,
+			runtimeBinary: runtimeBinary,
+			pn:            pn,
+			mc:            mc,
+		}); err != nil {
+			klog.Flush()
+			os.Exit(1)
+		}
+		klog.Flush()
+		return
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	if err := run(ctx, listen, stateDir, runtimeBinary, rosetta, streamingAddr, pn); err != nil {
+	if err := run(ctx, listen, stateDir, runtimeBinary, rosetta, streamingAddr, pn, mc, multiContainer); err != nil {
 		klog.ErrorS(err, "macvz-cri exited with error")
 		klog.Flush()
 		os.Exit(1)
@@ -113,7 +163,7 @@ func main() {
 	klog.Flush()
 }
 
-func run(ctx context.Context, listen, stateDir, runtimeBinary string, rosetta bool, streamingAddr string, pn podNetConfig) error {
+func run(ctx context.Context, listen, stateDir, runtimeBinary string, rosetta bool, streamingAddr string, pn podNetConfig, mc mountConfig, multiContainer bool) error {
 	socketPath, err := socketPath(listen)
 	if err != nil {
 		return err
@@ -174,10 +224,19 @@ func run(ctx context.Context, listen, stateDir, runtimeBinary string, rosetta bo
 		Images:         driver,
 		PodNetwork:     podNet,
 		IPAM:           ipam,
+		Mounts: criserver.MountPolicy{
+			KubeletPodsDir:          mc.kubeletPodsDir,
+			HostPathAllowedPrefixes: mc.hostPathAllowed,
+		},
+		MultiContainer: multiContainer,
 	})
 	// Rebuild Pod IP reservations and re-attach surviving sandboxes so a restart
 	// neither leaks addresses nor wipes other Pods' host rules. No-op when off.
 	srv.RecoverNetwork(ctx)
+	// Reconcile persisted containers against live workloads and resume log pumps so
+	// a restart keeps the kubelet's container view consistent (CRI-P7, #79). No-op
+	// without a runtime configured.
+	srv.RecoverContainers(ctx)
 
 	// Wire the CRI-P6 streaming server (#78) so `kubectl exec`/`port-forward` work.
 	// It is built with the CRI server's streaming runtime as its backend, then set

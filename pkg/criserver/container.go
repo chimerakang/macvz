@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"path/filepath"
 	"time"
 
 	"github.com/chimerakang/macvz/internal/types"
@@ -93,10 +94,33 @@ func (s *Server) CreateContainer(ctx context.Context, req *runtimeapi.CreateCont
 	if sb.State != store.StateReady {
 		return nil, status.Errorf(codes.FailedPrecondition, "CreateContainer: sandbox %q is not Ready", sandboxID)
 	}
-	if existing := s.containers.ListBySandbox(sandboxID); len(existing) > 0 {
-		return nil, status.Errorf(codes.FailedPrecondition,
-			"CreateContainer: sandbox %q already has a container (%s); CRI-P3 supports one container per Pod sandbox",
-			sandboxID, existing[0].ID)
+	var joinRuntime SharedPodNetworkRuntime
+	var joinSandboxWorkloadID string
+	// One container per sandbox (CRI-P3), but a restartPolicy restart is a new
+	// container created after the previous one Exited. The kubelet normally removes
+	// the dead container first, yet tolerating a lingering Exited record here makes
+	// the restart path robust: only a still-live (Created/Running) container blocks a
+	// new one, so restartPolicy behavior is honest rather than wedged.
+	for _, existing := range s.containers.ListBySandbox(sandboxID) {
+		if existing.State != store.ContainerExited {
+			// A live container already owns this sandbox. By default this is the
+			// honest one-container-per-Pod rejection; the experimental #82 probe
+			// turns it into a capability statement naming the missing
+			// apple/container primitive. See admitAdditionalContainer.
+			rt, sandboxWorkloadID, err := s.admitAdditionalContainer(sandboxID, existing)
+			if err != nil {
+				return nil, err
+			}
+			if joinRuntime == nil {
+				joinRuntime = rt
+				joinSandboxWorkloadID = sandboxWorkloadID
+			}
+		}
+	}
+
+	rtMounts, recMounts, err := s.translateMounts(cfg.GetMounts())
+	if err != nil {
+		return nil, err
 	}
 
 	id, err := store.NewID()
@@ -116,6 +140,7 @@ func (s *Server) CreateContainer(ctx context.Context, req *runtimeapi.CreateCont
 		Labels:      cfg.GetLabels(),
 		Annotations: cfg.GetAnnotations(),
 		LogPath:     cfg.GetLogPath(),
+		Mounts:      recMounts,
 		State:       store.ContainerCreated,
 		CreatedAt:   s.now().UnixNano(),
 	}
@@ -151,9 +176,16 @@ func (s *Server) CreateContainer(ctx context.Context, req *runtimeapi.CreateCont
 		Command: cfg.GetCommand(),
 		Args:    cfg.GetArgs(),
 		Env:     c.Env,
+		Mounts:  rtMounts,
 	}
-	if _, err := s.containerRuntime.Create(ctx, spec); err != nil {
-		return nil, runtimeError("CreateContainer", "create workload", err)
+	var createErr error
+	if joinRuntime != nil {
+		_, createErr = joinRuntime.CreateInPodSandbox(ctx, joinSandboxWorkloadID, spec)
+	} else {
+		_, createErr = s.containerRuntime.Create(ctx, spec)
+	}
+	if createErr != nil {
+		return nil, runtimeError("CreateContainer", "create workload", createErr)
 	}
 
 	// Persist only after the workload exists. If persistence fails, reclaim the
@@ -305,12 +337,21 @@ func (s *Server) ContainerStatus(ctx context.Context, req *runtimeapi.ContainerS
 			}
 		}
 	}
-	resp := &runtimeapi.ContainerStatusResponse{Status: toCRIContainerStatus(&c)}
+	// Resolve the absolute log path (sandbox log_directory + container log_path)
+	// so the status honors the CRI contract `crictl logs`/kubelet depend on.
+	var logPathAbs string
+	if c.LogPath != "" {
+		if sb, ok := s.sandboxes.Get(c.SandboxID); ok && sb.LogDirectory != "" {
+			logPathAbs = filepath.Join(sb.LogDirectory, c.LogPath)
+		}
+	}
+	resp := &runtimeapi.ContainerStatusResponse{Status: toCRIContainerStatus(&c, logPathAbs)}
 	if req.GetVerbose() {
 		resp.Info = map[string]string{
 			"model":      "single-container-pod-spike",
 			"workloadID": c.WorkloadID,
 			"sandboxID":  c.SandboxID,
+			"mounts":     mountSummary(c.Mounts),
 		}
 	}
 	return resp, nil
@@ -479,7 +520,17 @@ func toCRIContainerState(st store.ContainerState) runtimeapi.ContainerState {
 	}
 }
 
-func toCRIContainerStatus(c *store.Container) *runtimeapi.ContainerStatus {
+// toCRIContainerStatus renders a stored container as a CRI ContainerStatus.
+// logPathAbs is the absolute on-host log path (sandbox log_directory joined with
+// the container's relative log_path); the CRI contract requires ContainerStatus
+// to report the absolute path so that `crictl logs` and the kubelet can resolve
+// it without knowing the sandbox log_directory. When it is empty (no logging
+// configured) the stored relative path is reported as-is.
+func toCRIContainerStatus(c *store.Container, logPathAbs string) *runtimeapi.ContainerStatus {
+	logPath := c.LogPath
+	if logPathAbs != "" {
+		logPath = logPathAbs
+	}
 	return &runtimeapi.ContainerStatus{
 		Id:          c.ID,
 		Metadata:    &runtimeapi.ContainerMetadata{Name: c.Metadata.Name, Attempt: c.Metadata.Attempt},
@@ -494,7 +545,8 @@ func toCRIContainerStatus(c *store.Container) *runtimeapi.ContainerStatus {
 		Message:     c.Message,
 		Labels:      c.Labels,
 		Annotations: c.Annotations,
-		LogPath:     c.LogPath,
+		LogPath:     logPath,
+		Mounts:      toCRIMounts(c.Mounts),
 	}
 }
 

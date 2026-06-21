@@ -249,14 +249,32 @@ func (s *Server) portForwardTarget(ctx context.Context, sandboxID string) (strin
 	if len(containers) == 0 {
 		return "", status.Errorf(codes.FailedPrecondition, "port-forward: sandbox %q has no container", sandboxID)
 	}
-	c := containers[0]
-	if st, err := s.containerRuntime.Status(ctx, c.WorkloadID); err == nil {
-		if st.Phase != runtime.PhaseRunning {
-			return "", status.Errorf(codes.FailedPrecondition, "port-forward: sandbox %q container is not running (%s)", sandboxID, st.Phase)
+	foundLive := false
+	for i := range containers {
+		c := containers[i]
+		if c.State == store.ContainerExited {
+			continue
 		}
-		if st.IP != "" {
-			return st.IP, nil
+		foundLive = true
+		if c.State != store.ContainerRunning {
+			return "", status.Errorf(codes.FailedPrecondition,
+				"port-forward: sandbox %q container %q is %s, expected Running", sandboxID, c.ID, c.State)
 		}
+		if st, err := s.containerRuntime.Status(ctx, c.WorkloadID); err == nil {
+			if st.Phase != runtime.PhaseRunning {
+				return "", status.Errorf(codes.FailedPrecondition,
+					"port-forward: sandbox %q container %q is not running (%s)", sandboxID, c.ID, st.Phase)
+			}
+			if st.IP != "" {
+				return st.IP, nil
+			}
+		}
+		if sb.Network.VMIP != "" {
+			return sb.Network.VMIP, nil
+		}
+	}
+	if !foundLive {
+		return "", status.Errorf(codes.FailedPrecondition, "port-forward: sandbox %q has no running container", sandboxID)
 	}
 	if sb.Network.VMIP != "" {
 		return sb.Network.VMIP, nil

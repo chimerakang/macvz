@@ -64,7 +64,7 @@ architecture from Virtual Kubelet provider to kubelet CRI runtime integration.
 | CRI-C2 (#89) | LinuxPod kubelet ordering and post-create container probe | ✅ Complete (live probe returns `unsupported: "hotplug not supported"`; all containers must be registered before `pod.create()` or use explicit stop/recreate fallback) |
 | CRI-C3 (#90) | Decide LinuxPod backend limits and next sandbox strategy | ✅ Complete (route C stays experimental; no helper daemon/full CRI claim until hotplug boundary is proven or a limited model is explicitly accepted) |
 | CRI-C4 (#91) | Probe LinuxPod HotplugProvider boundary on current apple/containerization | ✅ Complete (provider can be installed/called and USB mass-storage attach succeeds, but public APIs do not yield a deterministic guest block path for late rootfs mount) |
-| CRI-C5 (#92) | Design limited LinuxPod backend or stop/recreate semantics after hotplug boundary | ⬜ Planned |
+| CRI-R0 (#92) | Research Pod VM runtime architecture for full kubelet semantics | ⬜ Planned |
 
 **CRI-P5 evidence (#77):** Pod networking is wired through the same primitives as
 the shipped provider — `network.PodIPAM` for Pod IPs and `podnet.Router` for the
@@ -236,9 +236,12 @@ default implementation returns `unsupported`, and the default
 installed a consumer provider and proved that post-create `addContainer` reaches
 it; public VZ USB mass-storage attach succeeds, but no public API provides a
 deterministic Linux guest block path for the attached ext4 rootfs, so MacVz
-refuses to return a guessed `AttachedFilesystem`. Route C therefore remains
-implementation-paused until #92 chooses a limited/predeclared-container
-backend or explicit stop/recreate semantics. See
+refuses to return a guessed `AttachedFilesystem`. Route C therefore should not
+advance as a thin limited LinuxPod wrapper. #92 starts the deeper runtime
+research track: define what MacVz would need to own or extend to become a true
+Pod VM runtime on Apple Silicon, including sandbox VM lifecycle, guest-agent
+contract, deterministic rootfs hotplug/device discovery, CRI mapping, networking,
+and recovery. See
 [CRI_LINUXPOD_POC_REPORT.md](CRI_LINUXPOD_POC_REPORT.md),
 [CRI_LINUXPOD_C2_REPORT.md](CRI_LINUXPOD_C2_REPORT.md),
 [CRI_LINUXPOD_C3_DECISION.md](CRI_LINUXPOD_C3_DECISION.md),

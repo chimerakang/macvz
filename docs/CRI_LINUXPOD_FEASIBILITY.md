@@ -251,10 +251,32 @@ refused to return a guessed `AttachedFilesystem`, so `addContainer` failed befor
 the late container could start. See
 [CRI_LINUXPOD_C4_REPORT.md](CRI_LINUXPOD_C4_REPORT.md).
 
+### R0: Pod VM Runtime Architecture Research (#92)
+
+After C4, the main research path no longer treats a deliberately limited
+LinuxPod backend as the next meaningful destination. A predeclared-container
+backend might still be useful as a comparison harness or smoke-test tool, but it
+would not answer the core question: how MacVz becomes a true Pod VM runtime that
+supports kubelet's normal sandbox/container ordering.
+
+#92 is therefore a runtime architecture research phase:
+
+- define the Pod VM lifecycle MacVz would need to own or extend;
+- define the guest-agent contract for mount/unmount, process lifecycle, exec,
+  logs, stats, cleanup, and recovery;
+- treat deterministic rootfs hotplug/device discovery as a first-class design
+  problem;
+- compare options such as VZ USB, NBD, virtiofs, guest-side unpack, and upstream
+  `apple/containerization` contribution;
+- study Kata Containers, firecracker-containerd, containerd Runtime v2 shims,
+  `vminitd`, and nearby macOS/Apple Silicon projects;
+- produce the next tiny PoC issue for one runtime primitive, not a full runtime
+  rewrite.
+
 ### C5: Swift Helper Daemon Prototype
 
-Only if the project explicitly accepts a limited/predeclared-container model:
-limited/predeclared-container model:
+Only if R0 later selects a LinuxPod-based bridge as a valid runtime building
+block:
 
 - expose a small local socket API for `CreatePod`, `AddContainer`,
   `StartContainer`, `StopContainer`, `StopPod`, `Exec`, `Stats`, and `Status`;
@@ -264,8 +286,8 @@ limited/predeclared-container model:
 
 ### C6: Experimental `macvz-cri --runtime-backend=linuxpod`
 
-Only if C5 is stable enough and the C2/C4 ordering limitation is represented
-honestly in CRI behavior:
+Only if C5 is stable enough and the C2/C4 ordering limitation is either resolved
+or represented honestly in CRI behavior:
 
 - add a new backend behind an explicit experimental flag;
 - keep the current CLI-backed backend untouched;
@@ -282,16 +304,17 @@ accepted ordering limits:
 - keep `Attach`/`PortForward` honest if still unsupported;
 - run longer soak only after basic semantics pass.
 
-## Recommendation After C3
+## Recommendation After C4
 
-Pause route-C implementation work until #92 chooses a limited model or a
-stop/recreate model. The currently accepted position is:
+Pause route-C implementation work while #92 researches the true runtime core.
+The currently accepted position is:
 
 - keep LinuxPod as a research-only proof of the shared sandbox primitive;
 - do not build a helper daemon on the assumption that hotplug is viable;
-- design either a limited/predeclared-container backend or explicit
-  stop/recreate semantics before implementation resumes;
-- keep a MacVz-owned sandbox VM runtime as a later fallback, not the next issue.
+- do not make the limited/predeclared-container backend the main path unless it
+  is explicitly scoped as a comparison harness;
+- research the Pod VM runtime architecture needed for full kubelet semantics;
+- keep the shipped Virtual Kubelet provider unchanged while this research runs.
 
 ## References
 
@@ -311,6 +334,8 @@ stop/recreate model. The currently accepted position is:
 - [CRI_LINUXPOD_C4_REPORT.md](CRI_LINUXPOD_C4_REPORT.md): consumer-installed
   HotplugProvider reaches public USB attach but cannot resolve a deterministic
   guest block path for LinuxPod rootfs hotplug.
+- Issue #92: runtime architecture research for a true Pod VM runtime instead of
+  a thin limited LinuxPod wrapper.
 - `vanchonlee/krust-cri`: public experimental macOS CRI runtime over
   Apple Containerization `LinuxPod`.
 - Kata Containers and firecracker-containerd: mature references for per-Pod VM,

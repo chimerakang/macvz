@@ -1080,10 +1080,13 @@ a `HotplugProvider`, post-create `LinuxPod.addContainer(...)` does call it, and
 public VZ USB mass-storage attach succeeds for the late ext4 image. The boundary
 is the next step: public APIs did not provide a deterministic Linux guest block
 path for that attached rootfs, so the probe refused to return a guessed
-`AttachedFilesystem` and the late container did not start. MacVz must now choose
-in #92 between a deliberately limited predeclared-container backend, an explicit
-stop/recreate smoke fallback, or deferring route C while keeping the Virtual
-Kubelet path as the shipped product.
+`AttachedFilesystem` and the late container did not start. The next step is not
+to polish a deliberately limited LinuxPod wrapper. #92 starts a runtime research
+track for the core engineering MacVz would need to become a true Pod VM runtime:
+sandbox VM lifecycle, guest-agent contract, deterministic rootfs
+hotplug/device discovery, multi-container process lifecycle, Pod networking, CRI
+mapping, recovery, and the boundary between reusable `apple/containerization`
+pieces and MacVz-owned code. The shipped Virtual Kubelet path remains unchanged.
 
 ## CRI-P9 Follow-up (#86): Unblock Honest Multi-Container Pods
 

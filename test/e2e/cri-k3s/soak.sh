@@ -135,8 +135,10 @@ pull_image() {
 sample() {
 	local i="$1" rss sandboxes containers
 	rss="$(adapter_rss_kb)"
-	sandboxes="$(crt pods -q 2>/dev/null | grep -c . || echo 0)"
-	containers="$(crt ps -a -q 2>/dev/null | grep -c . || echo 0)"
+	# wc -l, not `grep -c . || echo 0` (which double-counts on an empty list and
+	# writes a multiline value into the CSV — see the orphan guard below).
+	sandboxes="$(crt pods -q 2>/dev/null | wc -l | tr -d ' ')"
+	containers="$(crt ps -a -q 2>/dev/null | wc -l | tr -d ' ')"
 	printf '%s,%s,%s,%s\n' "$i" "$rss" "$sandboxes" "$containers" >>"$OUT_DIR/samples.csv"
 	[ "$FIRST_RSS" = 0 ] && FIRST_RSS="$rss"
 	LAST_RSS="$rss"
@@ -156,9 +158,12 @@ main_live() {
 	done
 
 	# Orphan guard: nothing should remain in the CRI view after the last cycle.
+	# Count with `wc -l`, not `grep -c . || echo 0`: grep exits non-zero on an empty
+	# (zero-pod) list, so the `|| echo 0` fires *in addition* to grep's own "0",
+	# yielding a multiline "0\n0" that spuriously fails the [ = 0 ] comparison.
 	local rem_c rem_p
-	rem_c="$(crt ps -a -q 2>/dev/null | grep -c . || echo 0)"
-	rem_p="$(crt pods -q 2>/dev/null | grep -c . || echo 0)"
+	rem_c="$(crt ps -a -q 2>/dev/null | wc -l | tr -d ' ')"
+	rem_p="$(crt pods -q 2>/dev/null | wc -l | tr -d ' ')"
 	if [ "$rem_c" = 0 ] && [ "$rem_p" = 0 ]; then
 		pass "no orphaned containers/sandboxes after $ITERATIONS cycles"
 	else

@@ -70,6 +70,14 @@ later exec in the already-running utility container. That keeps the CRI gap
 open, but narrows it: the next runtime question is VM-agent-created process
 execution in the intended sandbox namespace, not host block-device discovery.
 
+R5 (#97) tested that VM-agent process path. A root-level VM process is explicitly
+unimplemented by the current `vminitd` path, and the fallback
+`containerID=utility` path can create/start a process but did not execute from
+the staged rootfs identity. The outcome was `processStartedButIdentityMismatch`.
+This keeps the full kubelet-compatible path blocked on a real guest-side
+container/rootfs creation primitive, not on host block-device discovery or
+wrapper-level CRI API work.
+
 ## Phase Plan
 
 | Phase | Goal | Exit Criteria |

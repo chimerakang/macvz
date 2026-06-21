@@ -36,7 +36,7 @@ struct LinuxPodSharedNamespacePoC: AsyncParsableCommand {
     @Option(help: "TCP port inside the shared Pod namespace.")
     var port: Int = 18080
 
-    @Option(help: "Probe to run: c1 for pre-create two-container semantics, c2 for post-create addContainer ordering, c4 for HotplugProvider boundary, r1 for guest-side hotplug device discovery, r3 for NBD pre-create rootfs identity, r4 for guest-side late rootfs staging.")
+    @Option(help: "Probe to run: c1 for pre-create two-container semantics, c2 for post-create addContainer ordering, c4 for HotplugProvider boundary, r1 for guest-side hotplug device discovery, r3 for NBD pre-create rootfs identity, r4 for guest-side late rootfs staging, r5 for VM-agent process execution from staged rootfs.")
     var probe: String = "c1"
 
     @Flag(help: "Enable Rosetta for linux/amd64 images.")
@@ -131,8 +131,19 @@ struct LinuxPodSharedNamespacePoC: AsyncParsableCommand {
             )
             return
         }
+        if probe == "r5" {
+            try await runStagedRootfsProcessProbe(
+                imageStore: imageStore,
+                vmm: vmm,
+                logger: logger,
+                startedAt: startedAt,
+                logsURL: logsURL,
+                rootfsURL: rootfsURL
+            )
+            return
+        }
         guard probe == "c1" else {
-            throw ValidationError("unsupported probe \(probe); expected c1, c2, c4, r1, r3, or r4")
+            throw ValidationError("unsupported probe \(probe); expected c1, c2, c4, r1, r3, r4, or r5")
         }
 
         let podID = "macvz-poc-\(Int(startedAt.timeIntervalSince1970))"
@@ -1680,6 +1691,479 @@ struct LinuxPodSharedNamespacePoC: AsyncParsableCommand {
             : (attempts.first { $0.outcome != "guestSideStagingSucceeded" }?.outcome ?? "guestSideStagingSucceeded")
     }
 
+    private func runStagedRootfsProcessProbe(
+        imageStore: ImageStore,
+        vmm: VZVirtualMachineManager,
+        logger: Logger,
+        startedAt: Date,
+        logsURL: URL,
+        rootfsURL: URL
+    ) async throws {
+        let podID = "macvz-r5-\(Int(startedAt.timeIntervalSince1970))"
+        let pod = try LinuxPod(podID, vmm: vmm, logger: logger) { config in
+            config.cpus = 2
+            config.memoryInBytes = 1024 * 1024 * 1024
+            config.hostname = "macvz-runtime-r5"
+            config.bootLog = .file(path: logsURL.appendingPathComponent("boot.log"))
+        }
+
+        let baseImage = try await imageStore.get(reference: image, pull: true)
+        let utilityRootfs = try await unpackRootfs(baseImage, at: rootfsURL.appendingPathComponent("utility.ext4"))
+        let utilityLog = try FileLogWriter(path: logsURL.appendingPathComponent("utility.log"), stream: "stdout")
+        let utilityErr = try FileLogWriter(path: logsURL.appendingPathComponent("utility.log"), stream: "stderr")
+        let execLog = try FileLogWriter(path: logsURL.appendingPathComponent("exec.log"), stream: "stdout")
+
+        var podCreated = false
+        var utilityStarted = false
+        var transportAvailable = false
+        var attempt: StagedRootfsProcessAttemptSummary?
+        var errors: [String: String] = [:]
+
+        do {
+            try await pod.addContainer("utility", rootfs: utilityRootfs) { config in
+                config.process.arguments = ["/bin/sh", "-c", "exec sleep 300"]
+                config.process.environmentVariables = ["PATH=\(LinuxProcessConfiguration.defaultPath)"]
+                config.process.workingDirectory = "/"
+                config.process.stdout = utilityLog
+                config.process.stderr = utilityErr
+                config.useInit = true
+            }
+
+            try await pod.create()
+            podCreated = true
+            try await pod.startContainer("utility")
+            utilityStarted = true
+
+            attempt = try await pod.withVirtualMachineInstance { vm in
+                let agent = try await vm.dialAgent()
+                let result = try await runStagedRootfsProcessAttempt(
+                    pod: pod,
+                    agent: agent,
+                    podID: podID,
+                    requestID: "late-alpha",
+                    execLog: execLog
+                )
+                try? await agent.close()
+                return result
+            }
+            transportAvailable = true
+
+            if utilityStarted {
+                try? await pod.stopContainer("utility")
+            }
+            try await pod.stop()
+            try close(utilityLog, utilityErr, execLog)
+
+            let result = StagedRootfsProcessSummary(
+                podID: podID,
+                image: image,
+                kernel: kernel,
+                workDir: workDir,
+                durationSeconds: Date().timeIntervalSince(startedAt),
+                podCreated: podCreated,
+                utilityStarted: utilityStarted,
+                transportAvailable: transportAvailable,
+                attempt: attempt,
+                outcome: stagedRootfsProcessOutcome(
+                    podCreated: podCreated,
+                    utilityStarted: utilityStarted,
+                    transportAvailable: transportAvailable,
+                    attempt: attempt
+                ),
+                note: "R5 tests VM-agent process execution from a post-create staged rootfs; it does not implement the production CRI image pipeline",
+                errors: errors,
+                logs: [
+                    "utility": logsURL.appendingPathComponent("utility.log").path,
+                    "exec": logsURL.appendingPathComponent("exec.log").path,
+                    "boot": logsURL.appendingPathComponent("boot.log").path,
+                ]
+            )
+            print(try result.jsonString())
+        } catch {
+            if !transportAvailable {
+                errors["transport"] = describe(error)
+            } else {
+                errors["probe"] = describe(error)
+            }
+            if utilityStarted {
+                try? await pod.stopContainer("utility")
+            }
+            if podCreated {
+                try? await pod.stop()
+            }
+            try? close(utilityLog, utilityErr, execLog)
+
+            let result = StagedRootfsProcessSummary(
+                podID: podID,
+                image: image,
+                kernel: kernel,
+                workDir: workDir,
+                durationSeconds: Date().timeIntervalSince(startedAt),
+                podCreated: podCreated,
+                utilityStarted: utilityStarted,
+                transportAvailable: transportAvailable,
+                attempt: attempt,
+                outcome: stagedRootfsProcessOutcome(
+                    podCreated: podCreated,
+                    utilityStarted: utilityStarted,
+                    transportAvailable: transportAvailable,
+                    attempt: attempt
+                ),
+                note: "R5 tests VM-agent process execution from a post-create staged rootfs; it does not implement the production CRI image pipeline",
+                errors: errors,
+                logs: [
+                    "utility": logsURL.appendingPathComponent("utility.log").path,
+                    "exec": logsURL.appendingPathComponent("exec.log").path,
+                    "boot": logsURL.appendingPathComponent("boot.log").path,
+                ]
+            )
+            print(try result.jsonString())
+        }
+    }
+
+    private func runStagedRootfsProcessAttempt(
+        pod: LinuxPod,
+        agent: some VirtualMachineAgent,
+        podID: String,
+        requestID: String,
+        execLog: FileLogWriter
+    ) async throws -> StagedRootfsProcessAttemptSummary {
+        let escapedID = requestID.replacingOccurrences(of: "/", with: "_")
+        let processID = "r5-process-\(escapedID)"
+        let stageBase = "/run/macvz-r5/staged/\(escapedID)"
+        let rootfsPath = "\(stageBase)/rootfs"
+        let identityPath = "\(rootfsPath)/etc/macvz-r5-identity"
+        let resultPath = "\(rootfsPath)/macvz-r5-result"
+        var stageSucceeded = false
+        var processCreateSucceeded = false
+        var processStartSucceeded = false
+        var processExitCode: Int32?
+        var resultVerified = false
+        var namespaceVerified = false
+        var cleanupSucceeded = false
+        var stageOutput = ""
+        var verifyOutput = ""
+        var cleanupOutput = ""
+        var errors: [String: String] = [:]
+        var processContainerID: String?
+
+        do {
+            let stage = try await execCapture(
+                pod,
+                containerID: "utility",
+                processID: "r5-stage-\(escapedID)",
+                script: stagedProcessRootfsStageScript(
+                    requestID: requestID,
+                    rootfsPath: rootfsPath,
+                    identityPath: identityPath
+                ),
+                log: execLog
+            )
+            stageOutput = stage.output
+            if stage.exitCode != 0 {
+                throw ValidationError("stage command exited with \(stage.exitCode): \(stage.output)")
+            }
+            try await agent.sync()
+            stageSucceeded = true
+        } catch {
+            errors["stage"] = describe(error)
+        }
+
+        if stageSucceeded {
+            let spec = stagedRootfsProcessSpec(
+                podID: podID,
+                requestID: requestID,
+                rootfsPath: rootfsPath
+            )
+            do {
+                try await agent.createProcess(
+                    id: processID,
+                    containerID: nil,
+                    stdinPort: nil,
+                    stdoutPort: nil,
+                    stderrPort: nil,
+                    ociRuntimePath: nil,
+                    configuration: spec,
+                    options: nil
+                )
+                processCreateSucceeded = true
+            } catch {
+                let rootCreateError = describe(error)
+                errors["createProcessRoot"] = rootCreateError
+                if rootCreateError.contains("processes in the root of the vm not implemented") {
+                    do {
+                        try await agent.createProcess(
+                            id: processID,
+                            containerID: "utility",
+                            stdinPort: nil,
+                            stdoutPort: nil,
+                            stderrPort: nil,
+                            ociRuntimePath: nil,
+                            configuration: spec,
+                            options: nil
+                        )
+                        processContainerID = "utility"
+                        processCreateSucceeded = true
+                    } catch {
+                        errors["createProcessUtility"] = describe(error)
+                    }
+                }
+            }
+        }
+
+        if processCreateSucceeded {
+            do {
+                _ = try await agent.startProcess(id: processID, containerID: processContainerID)
+                processStartSucceeded = true
+                let status = try await agent.waitProcess(id: processID, containerID: processContainerID, timeoutInSeconds: 10)
+                processExitCode = status.exitCode
+                if status.exitCode != 0 {
+                    errors["processExit"] = "exit \(status.exitCode)"
+                }
+            } catch {
+                errors["startOrWaitProcess"] = describe(error)
+            }
+        }
+
+        if processCreateSucceeded {
+            do {
+                try await agent.deleteProcess(id: processID, containerID: processContainerID)
+            } catch {
+                errors["deleteProcess"] = describe(error)
+            }
+        }
+
+        if stageSucceeded {
+            let verify = try await execCapture(
+                pod,
+                containerID: "utility",
+                processID: "r5-verify-\(escapedID)",
+                script: stagedProcessRootfsVerifyScript(
+                    requestID: requestID,
+                    resultPath: resultPath
+                ),
+                log: execLog
+            )
+            verifyOutput = verify.output
+            let state = parseStagedProcessVerifyOutput(verify.output)
+            resultVerified = verify.exitCode == 0 && state.identityMatched
+            namespaceVerified = state.rootfsMatched
+            if verify.exitCode != 0 {
+                errors["verify"] = "exit \(verify.exitCode): \(verify.output)"
+            }
+        }
+
+        let cleanup = try await execCapture(
+            pod,
+            containerID: "utility",
+            processID: "r5-cleanup-\(escapedID)",
+            script: stagedProcessRootfsCleanupScript(stageBase: stageBase),
+            log: execLog
+        )
+        cleanupOutput = cleanup.output
+        cleanupSucceeded = cleanup.exitCode == 0
+        if cleanup.exitCode != 0 {
+            errors["cleanup"] = "exit \(cleanup.exitCode): \(cleanup.output)"
+        }
+
+        return StagedRootfsProcessAttemptSummary(
+            requestID: requestID,
+            processID: processID,
+            processContainerID: processContainerID,
+            stagePath: rootfsPath,
+            resultPath: resultPath,
+            stageSucceeded: stageSucceeded,
+            processCreateSucceeded: processCreateSucceeded,
+            processStartSucceeded: processStartSucceeded,
+            processExitCode: processExitCode,
+            resultVerified: resultVerified,
+            namespaceVerified: namespaceVerified,
+            cleanupSucceeded: cleanupSucceeded,
+            stageOutput: stageOutput,
+            verifyOutput: verifyOutput,
+            cleanupOutput: cleanupOutput,
+            outcome: stagedRootfsProcessAttemptOutcome(
+                stageSucceeded: stageSucceeded,
+                processCreateSucceeded: processCreateSucceeded,
+                processStartSucceeded: processStartSucceeded,
+                processExitCode: processExitCode,
+                resultVerified: resultVerified,
+                namespaceVerified: namespaceVerified,
+                cleanupSucceeded: cleanupSucceeded
+            ),
+            errors: errors
+        )
+    }
+
+    private func stagedRootfsProcessSpec(
+        podID: String,
+        requestID: String,
+        rootfsPath: String
+    ) -> ContainerizationOCI.Spec {
+        ContainerizationOCI.Spec(
+            version: "1.0.2",
+            process: ContainerizationOCI.Process(
+                args: [
+                    "/bin/sh",
+                    "-c",
+                    """
+                    set -eu
+                    identity="$(cat /etc/macvz-r5-identity)"
+                    {
+                      echo "identity=${identity}"
+                      echo "expected=macvz-r5-id=\(requestID)"
+                      echo "pwd=$(pwd)"
+                      echo "proc_root=$(readlink /proc/self/root 2>/dev/null || true)"
+                      echo "root_mount=$(grep ' / ' /proc/mounts 2>/dev/null || true)"
+                      echo "root_listing=$(ls -1 / 2>/dev/null | tr '\\n' ',' || true)"
+                    } > /macvz-r5-result
+                    test "${identity}" = "macvz-r5-id=\(requestID)"
+                    """,
+                ],
+                cwd: "/",
+                env: ["PATH=\(LinuxProcessConfiguration.defaultPath)"]
+            ),
+            hostname: "macvz-r5-\(requestID)",
+            mounts: [
+                ContainerizationOCI.Mount(type: "proc", source: "proc", destination: "/proc"),
+                ContainerizationOCI.Mount(type: "tmpfs", source: "tmpfs", destination: "/dev", options: ["nosuid", "mode=755", "size=65536k"]),
+                ContainerizationOCI.Mount(type: "devpts", source: "devpts", destination: "/dev/pts", options: ["nosuid", "noexec", "newinstance", "gid=5", "mode=0620", "ptmxmode=0666"]),
+                ContainerizationOCI.Mount(type: "sysfs", source: "sysfs", destination: "/sys", options: ["nosuid", "noexec", "nodev"]),
+                ContainerizationOCI.Mount(type: "tmpfs", source: "tmpfs", destination: "/dev/shm", options: ["nosuid", "noexec", "nodev", "mode=1777", "size=65536k"]),
+            ],
+            root: ContainerizationOCI.Root(path: rootfsPath, readonly: false),
+            linux: ContainerizationOCI.Linux(
+                resources: ContainerizationOCI.LinuxResources(),
+                cgroupsPath: "/container/pod/\(podID)/\(requestID)",
+                namespaces: [
+                    ContainerizationOCI.LinuxNamespace(type: .cgroup),
+                    ContainerizationOCI.LinuxNamespace(type: .ipc),
+                    ContainerizationOCI.LinuxNamespace(type: .mount),
+                    ContainerizationOCI.LinuxNamespace(type: .pid),
+                    ContainerizationOCI.LinuxNamespace(type: .uts),
+                ]
+            )
+        )
+    }
+
+    private func stagedProcessRootfsStageScript(
+        requestID: String,
+        rootfsPath: String,
+        identityPath: String
+    ) -> String {
+        """
+        set -eu
+        rootfs_path=\(shellSingleQuoted(rootfsPath))
+        identity_path=\(shellSingleQuoted(identityPath))
+        request_id=\(shellSingleQuoted(requestID))
+        rm -rf "${rootfs_path}"
+        mkdir -p "${rootfs_path}"
+        for path in /bin /etc /lib /usr; do
+          if [ -e "${path}" ]; then
+            cp -a "${path}" "${rootfs_path}/"
+          fi
+        done
+        mkdir -p "${rootfs_path}/proc" "${rootfs_path}/sys" "${rootfs_path}/dev" "${rootfs_path}/tmp" "${rootfs_path}/run"
+        printf 'macvz-r5-id=%s\\n' "${request_id}" > "${identity_path}"
+        chmod 1777 "${rootfs_path}/tmp"
+        sync
+        test -x "${rootfs_path}/bin/sh"
+        test -f "${identity_path}"
+        echo "stage_ok request=${request_id} rootfs=${rootfs_path}"
+        """
+    }
+
+    private func stagedProcessRootfsVerifyScript(requestID: String, resultPath: String) -> String {
+        """
+        set -u
+        expected=\(shellSingleQuoted("macvz-r5-id=\(requestID)"))
+        result_path=\(shellSingleQuoted(resultPath))
+        if [ ! -f "${result_path}" ]; then
+          echo "result_missing=${result_path}"
+          exit 51
+        fi
+        cat "${result_path}"
+        if ! grep -q "^identity=${expected}$" "${result_path}"; then
+          exit 52
+        fi
+        if ! grep -q "^proc_root=/run/macvz-r5/staged/\(requestID)/rootfs$" "${result_path}"; then
+          exit 53
+        fi
+        echo "verify_ok request=\(requestID)"
+        """
+    }
+
+    private func stagedProcessRootfsCleanupScript(stageBase: String) -> String {
+        """
+        set -eu
+        stage_base=\(shellSingleQuoted(stageBase))
+        rm -rf "${stage_base}"
+        if [ -e "${stage_base}" ]; then
+          echo "cleanup_failed stage=${stage_base}"
+          exit 61
+        fi
+        echo "cleanup_ok stage=${stage_base}"
+        """
+    }
+
+    private func parseStagedProcessVerifyOutput(_ output: String) -> StagedProcessVerifyState {
+        var state = StagedProcessVerifyState()
+        for line in output.split(whereSeparator: \.isNewline).map(String.init) {
+            if line.hasPrefix("identity=macvz-r5-id=") {
+                state.identityMatched = true
+            }
+            if line.hasPrefix("proc_root=/run/macvz-r5/staged/") {
+                state.rootfsMatched = true
+            }
+        }
+        return state
+    }
+
+    private func stagedRootfsProcessAttemptOutcome(
+        stageSucceeded: Bool,
+        processCreateSucceeded: Bool,
+        processStartSucceeded: Bool,
+        processExitCode: Int32?,
+        resultVerified: Bool,
+        namespaceVerified: Bool,
+        cleanupSucceeded: Bool
+    ) -> String {
+        if !stageSucceeded {
+            return "stagedRootfsUnavailableToAgentProcess"
+        }
+        if !processCreateSucceeded {
+            return "processCreationFailed"
+        }
+        if !processStartSucceeded {
+            return "processStartedButIdentityMismatch"
+        }
+        if processExitCode != 0 {
+            return "processStartedButIdentityMismatch"
+        }
+        if !resultVerified {
+            return "processStartedButIdentityMismatch"
+        }
+        if !namespaceVerified {
+            return "processNamespaceRootfsMismatch"
+        }
+        if !cleanupSucceeded {
+            return "cleanupFailed"
+        }
+        return "stagedRootfsProcessExecutionSucceeded"
+    }
+
+    private func stagedRootfsProcessOutcome(
+        podCreated: Bool,
+        utilityStarted: Bool,
+        transportAvailable: Bool,
+        attempt: StagedRootfsProcessAttemptSummary?
+    ) -> String {
+        if !podCreated || !utilityStarted || !transportAvailable {
+            return "vmAgentProcessApiUnavailable"
+        }
+        return attempt?.outcome ?? "vmAgentProcessApiUnavailable"
+    }
+
     private func readTextFile(_ url: URL) throws -> String {
         String(decoding: try Data(contentsOf: url), as: UTF8.self)
     }
@@ -1894,6 +2378,48 @@ private struct GuestRootfsStagingAttemptSummary: Encodable {
     let errors: [String: String]
 }
 
+private struct StagedRootfsProcessSummary: Encodable {
+    let podID: String
+    let image: String
+    let kernel: String
+    let workDir: String
+    let durationSeconds: TimeInterval
+    let podCreated: Bool
+    let utilityStarted: Bool
+    let transportAvailable: Bool
+    let attempt: StagedRootfsProcessAttemptSummary?
+    let outcome: String
+    let note: String
+    let errors: [String: String]
+    let logs: [String: String]
+
+    func jsonString() throws -> String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        return String(decoding: try encoder.encode(self), as: UTF8.self)
+    }
+}
+
+private struct StagedRootfsProcessAttemptSummary: Encodable {
+    let requestID: String
+    let processID: String
+    let processContainerID: String?
+    let stagePath: String
+    let resultPath: String
+    let stageSucceeded: Bool
+    let processCreateSucceeded: Bool
+    let processStartSucceeded: Bool
+    let processExitCode: Int32?
+    let resultVerified: Bool
+    let namespaceVerified: Bool
+    let cleanupSucceeded: Bool
+    let stageOutput: String
+    let verifyOutput: String
+    let cleanupOutput: String
+    let outcome: String
+    let errors: [String: String]
+}
+
 private struct GuestBlockDevice: Encodable {
     let name: String
     let sectors: Int64
@@ -1911,6 +2437,11 @@ private struct DiscoveryOutputState {
     var mountSucceeded = false
     var markerVerified = false
     var unmountSucceeded = false
+}
+
+private struct StagedProcessVerifyState {
+    var identityMatched = false
+    var rootfsMatched = false
 }
 
 private struct HotplugProbeSnapshot {

@@ -357,6 +357,29 @@ running container execs. The next step should test VM-agent-created process
 execution from the staged rootfs rather than relying on an existing utility
 container to observe the mount.
 
+### R5: VM-Agent Process From Staged Rootfs (#97)
+
+R5 completed on 2026-06-21 UTC. The report is
+[CRI_RUNTIME_R5_STAGED_PROCESS_REPORT.md](CRI_RUNTIME_R5_STAGED_PROCESS_REPORT.md).
+
+Result: **VM-agent process creation is not yet a late-container rootfs
+primitive**. The probe staged a rootfs-like tree inside the running Pod VM after
+`pod.create()`, then attempted to create/start a VM-agent process with an OCI
+spec whose `root.path` pointed at the staged rootfs.
+
+The root-of-VM process path failed with the explicit upstream boundary
+`processes in the root of the vm not implemented`. A fallback using
+`containerID=utility` did create and start a process, but that process exited
+with code 1 and did not write the expected identity/result file into the staged
+rootfs. The observed outcome is `processStartedButIdentityMismatch`.
+
+Decision: R5 closes the immediate "can we just call VM-agent createProcess with
+a staged rootfs?" question as **not proven / currently blocked**. Container-scoped
+process creation behaves like an exec-like path, not a demonstrated arbitrary
+late rootfs launch path. The next research step should inspect or extend the
+guest/vminitd container creation path itself rather than adding more wrapper
+logic around existing `execInContainer` behavior.
+
 ### C5: Swift Helper Daemon Prototype
 
 Only if R0 later selects a LinuxPod-based bridge as a valid runtime building

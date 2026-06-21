@@ -160,3 +160,33 @@ a full late-container rootfs primitive.
 The next probe should bypass the already-running utility container as the
 observer and use the VM agent to create/start a process in the intended sandbox
 namespace from the staged rootfs.
+
+## R5 Result
+
+R5 completed on 2026-06-21 UTC. The live probe is published at
+[CRI_RUNTIME_R5_STAGED_PROCESS_REPORT.md](CRI_RUNTIME_R5_STAGED_PROCESS_REPORT.md).
+
+Outcome: `processStartedButIdentityMismatch`.
+
+The probe booted one LinuxPod with a predeclared keeper utility container, staged
+a minimal busybox rootfs under `/run/macvz-r5/staged/late-alpha/rootfs` after
+`pod.create()`, and then called the VM agent process APIs with an OCI spec whose
+root pointed at that staged path.
+
+The root-level VM process path is explicitly unavailable in the current
+`vminitd` path:
+
+```text
+processes in the root of the vm not implemented
+```
+
+The fallback `containerID=utility` path did create and start a process, but the
+process exited with code 1 and did not write the expected result file into the
+staged rootfs. That means container-scoped agent process creation works as an
+exec-like operation, but this probe did not prove that it can launch a new
+container process from an arbitrary post-create staged rootfs.
+
+R5 therefore narrows the remaining gap: post-create file staging works, but the
+current public agent/LinuxPod path still lacks a proven "prepare rootfs, then
+start a new container process from that rootfs" primitive for normal kubelet
+ordering.

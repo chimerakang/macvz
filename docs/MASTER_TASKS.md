@@ -49,10 +49,25 @@ architecture from Virtual Kubelet provider to kubelet CRI runtime integration.
 | CRI-P2 | Spike Pod sandbox lifecycle over `apple/container` | ✅ Complete |
 | CRI-P3 | Run a single-container Pod through the CRI adapter | ✅ Complete |
 | CRI-P4 | Implement CRI ImageService pull/list/status/remove | ✅ Complete |
-| CRI-P5 | Integrate CNI/Pod networking lifecycle | ⬜ Planned |
+| CRI-P5 | Integrate CNI/Pod networking lifecycle | ✅ Complete |
 | CRI-P6 | Implement logs, exec, attach, port-forward, and stats surfaces | ⬜ Planned |
 | CRI-P7 | Validate volumes, projected data, probes, and restart recovery | ⬜ Planned |
 | CRI-P8 | Harden k3s compatibility, install, cleanup, and soak behavior | ⬜ Planned |
+
+**CRI-P5 evidence (#77):** Pod networking is wired through the same primitives as
+the shipped provider — `network.PodIPAM` for Pod IPs and `podnet.Router` for the
+host pf binat path — reached via narrow interfaces in `pkg/criserver/network.go`.
+`RunPodSandbox` reserves the Pod IP and rejects duplicate live sandboxes for the
+same Pod key; `StartContainer` attaches the path once the micro-VM address
+appears; `PodSandboxStatus.Network.Ip` and `Status.NetworkReady` are reported
+only when actually ready; direct container stop/remove and self-exit reconcile
+detach the path while sandbox remove releases the IP; teardown is idempotent and
+`Server.RecoverNetwork` rebuilds reservations and re-attaches surviving sandboxes
+after a restart. Hermetic coverage in `pkg/criserver/network_test.go`; gated live
+smoke in `pkg/criserver/network_integration_test.go`
+(`MACVZ_INTEGRATION=1 go test ./pkg/criserver -run 'Test.*Network|Test.*Sandbox'`).
+`cmd/macvz-cri` exposes `--pod-cidr`/`--pod-network-interface` (networking off
+until both are set). See [CRI_FEASIBILITY.md](CRI_FEASIBILITY.md) CRI-P5.
 
 ## Current Validation Snapshot
 

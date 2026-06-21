@@ -184,6 +184,22 @@ func (s *Server) StartContainer(ctx context.Context, req *runtimeapi.StartContai
 	if err := s.containers.Put(&c); err != nil {
 		return nil, status.Errorf(codes.Internal, "StartContainer: persist: %v", err)
 	}
+
+	// Attach the Pod network path now that the micro-VM is booting (CRI-P5, #77).
+	// The container start path is where the host-only VM address first becomes
+	// observable, so this is where the binat rule is programmed and the sandbox's
+	// Pod IP becomes reportable. A failure here unwinds the start: the workload is
+	// stopped and the container is marked Exited with a clear reason rather than
+	// left Running behind an unreachable Pod IP.
+	sb, sbOK := s.sandboxes.Get(c.SandboxID)
+	if s.networkEnabled() {
+		if sbOK && sb.Network.PodIP != "" {
+			if err := s.attachSandboxNetwork(ctx, &sb, c.WorkloadID); err != nil {
+				s.unwindContainerStart(ctx, &c)
+				return nil, err
+			}
+		}
+	}
 	klog.V(4).InfoS("CRI StartContainer", "containerID", id, "workloadID", c.WorkloadID)
 	return &runtimeapi.StartContainerResponse{}, nil
 }
@@ -260,6 +276,11 @@ func (s *Server) ContainerStatus(ctx context.Context, req *runtimeapi.ContainerS
 	if reconciled, changed := s.reconcile(ctx, c); changed {
 		if err := s.containers.Put(&reconciled); err == nil {
 			c = reconciled
+			if c.State == store.ContainerExited {
+				if err := s.detachContainerNetwork(ctx, c.SandboxID, "ContainerStatus"); err != nil {
+					return nil, err
+				}
+			}
 		}
 	}
 	resp := &runtimeapi.ContainerStatusResponse{Status: toCRIContainerStatus(&c)}
@@ -356,7 +377,7 @@ func (s *Server) removeSandboxContainers(ctx context.Context, sandboxID string, 
 
 func (s *Server) stopContainerRecord(ctx context.Context, c store.Container, timeout time.Duration, method string) error {
 	if c.State == store.ContainerExited {
-		return nil
+		return s.detachContainerNetwork(ctx, c.SandboxID, method)
 	}
 	if s.containerRuntime == nil {
 		return errRuntimeNotConfigured(method)
@@ -383,6 +404,9 @@ func (s *Server) stopContainerRecord(ctx context.Context, c store.Container, tim
 	if err := s.containers.Put(&c); err != nil {
 		return status.Errorf(codes.Internal, "%s: persist container %q: %v", method, c.ID, err)
 	}
+	if err := s.detachContainerNetwork(ctx, c.SandboxID, method); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -393,8 +417,25 @@ func (s *Server) removeContainerRecord(ctx context.Context, c store.Container, m
 	if err := s.containerRuntime.Destroy(ctx, c.WorkloadID); err != nil && !errors.Is(err, runtime.ErrNotFound) {
 		return runtimeError(method, "destroy workload", err)
 	}
+	if err := s.detachContainerNetwork(ctx, c.SandboxID, method); err != nil {
+		return err
+	}
 	if err := s.containers.Delete(c.ID); err != nil {
 		return status.Errorf(codes.Internal, "%s: delete container %q: %v", method, c.ID, err)
+	}
+	return nil
+}
+
+func (s *Server) detachContainerNetwork(ctx context.Context, sandboxID string, method string) error {
+	if !s.networkEnabled() {
+		return nil
+	}
+	if err := s.detachSandboxNetwork(ctx, sandboxID); err != nil {
+		st, ok := status.FromError(err)
+		if !ok {
+			return status.Errorf(codes.Internal, "%s: detach network: %v", method, err)
+		}
+		return status.Error(st.Code(), method+": "+st.Message())
 	}
 	return nil
 }

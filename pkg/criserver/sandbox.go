@@ -39,6 +39,25 @@ func (s *Server) RunPodSandbox(_ context.Context, req *runtimeapi.RunPodSandboxR
 		return nil, status.Errorf(codes.Internal, "RunPodSandbox: %v", err)
 	}
 
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+
+	// Reserve the Pod IP now (CRI-P5, #77). The host-only VM address — and thus the
+	// binat attach — only exists once the container starts, so RunPodSandbox only
+	// reserves the address; the network is reported ready (PodSandboxStatus.Network)
+	// after the attach on the container start path. When IPAM is disabled this is a
+	// no-op and the sandbox runs without a Pod IP, exactly as before CRI-P5.
+	podKey := md.GetNamespace() + "/" + md.GetName()
+	if existing, ok := s.sandboxByKey(podKey); ok {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"RunPodSandbox: Pod %q already has sandbox %q; CRI-P5 supports one sandbox per Pod key",
+			podKey, existing.ID)
+	}
+	podIP, hadIP, err := s.allocateSandboxIP(podKey)
+	if err != nil {
+		return nil, err
+	}
+
 	sb := &store.Sandbox{
 		ID:             id,
 		State:          store.StateReady,
@@ -58,12 +77,19 @@ func (s *Server) RunPodSandbox(_ context.Context, req *runtimeapi.RunPodSandboxR
 		sb.DNS.Searches = dns.GetSearches()
 		sb.DNS.Options = dns.GetOptions()
 	}
+	sb.Network.PodIP = podIP
 
 	if err := s.sandboxes.Put(sb); err != nil {
+		// The record did not persist, so this sandbox owns nothing. Release a
+		// freshly-allocated IP so it does not leak; keep a pre-existing reservation
+		// (from restart recovery or a prior sandbox) intact.
+		if podIP != "" && !hadIP {
+			s.ipam.Release(podKey)
+		}
 		return nil, status.Errorf(codes.Internal, "RunPodSandbox: persist: %v", err)
 	}
 	klog.V(4).InfoS("CRI RunPodSandbox", "id", id,
-		"namespace", md.GetNamespace(), "name", md.GetName(), "uid", md.GetUid())
+		"namespace", md.GetNamespace(), "name", md.GetName(), "uid", md.GetUid(), "podIP", podIP)
 	return &runtimeapi.RunPodSandboxResponse{PodSandboxId: id}, nil
 }
 
@@ -79,6 +105,12 @@ func (s *Server) StopPodSandbox(ctx context.Context, req *runtimeapi.StopPodSand
 	defer s.lifecycleMu.Unlock()
 
 	if err := s.stopSandboxContainers(ctx, req.GetPodSandboxId(), "StopPodSandbox"); err != nil {
+		return nil, err
+	}
+	// Reclaim the Pod network path once the container is stopped (CRI-P5, #77). The
+	// Pod IP reservation is retained until RemovePodSandbox so a stop/start cycle
+	// keeps the same address. Detach is idempotent.
+	if err := s.detachSandboxNetwork(ctx, req.GetPodSandboxId()); err != nil {
 		return nil, err
 	}
 	if _, err := s.sandboxes.SetState(req.GetPodSandboxId(), store.StateNotReady); err != nil {
@@ -99,6 +131,15 @@ func (s *Server) RemovePodSandbox(ctx context.Context, req *runtimeapi.RemovePod
 
 	if err := s.removeSandboxContainers(ctx, req.GetPodSandboxId(), "RemovePodSandbox"); err != nil {
 		return nil, err
+	}
+	// Tear down the network path (in case StopPodSandbox was skipped) and release
+	// the Pod IP before deleting the record (CRI-P5, #77), so removal leaks neither
+	// host pf state nor an address. Both steps are idempotent.
+	if err := s.detachSandboxNetwork(ctx, req.GetPodSandboxId()); err != nil {
+		return nil, err
+	}
+	if sb, ok := s.sandboxes.Get(req.GetPodSandboxId()); ok {
+		s.releaseSandboxIP(&sb)
 	}
 	if err := s.sandboxes.Delete(req.GetPodSandboxId()); err != nil {
 		return nil, status.Errorf(codes.Internal, "RemovePodSandbox: %v", err)
@@ -167,7 +208,7 @@ func toCRIMetadata(sb *store.Sandbox) *runtimeapi.PodSandboxMetadata {
 }
 
 func toCRIStatus(sb *store.Sandbox) *runtimeapi.PodSandboxStatus {
-	return &runtimeapi.PodSandboxStatus{
+	st := &runtimeapi.PodSandboxStatus{
 		Id:             sb.ID,
 		Metadata:       toCRIMetadata(sb),
 		State:          toCRIState(sb.State),
@@ -175,8 +216,15 @@ func toCRIStatus(sb *store.Sandbox) *runtimeapi.PodSandboxStatus {
 		Labels:         sb.Labels,
 		Annotations:    sb.Annotations,
 		RuntimeHandler: sb.RuntimeHandler,
-		// Network is intentionally nil: the state-only model owns no Pod IP.
 	}
+	// Report the Pod IP only once the network path is actually attached (CRI-P5,
+	// #77). A reserved-but-not-attached IP (sandbox started, container not yet up)
+	// is deliberately withheld so the status never claims reachability the host
+	// cannot yet deliver.
+	if sb.Network.Attached && sb.Network.PodIP != "" {
+		st.Network = &runtimeapi.PodSandboxNetworkStatus{Ip: sb.Network.PodIP}
+	}
+	return st
 }
 
 // matchesFilter applies a CRI PodSandboxFilter (id, state, label selector). A nil

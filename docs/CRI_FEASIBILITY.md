@@ -391,6 +391,95 @@ tractable. A kubelet join attempt against the current image+container surface is
 a reasonable exploratory smoke but is expected to stall at Pod networking. The
 CRI route remains **not** stopped.
 
+## CRI-P5: Pod Networking Lifecycle
+
+CRI-P5 gives the experimental adapter an honest Pod networking lifecycle (#77).
+It deliberately **reuses the shipped Virtual Kubelet networking primitives**
+rather than inventing a CRI-only path: Pod IPs come from `network.PodIPAM` (the
+node's Kubernetes-assigned Pod CIDR, #20) and the host packet-filter path comes
+from `podnet.Router` (one pf `binat` rule per micro-VM, #22). The CRI adapter
+reaches both through narrow interfaces (`PodNetwork`, `PodIPAllocator` in
+`pkg/criserver/network.go`) so the orchestration is testable against fakes and so
+the provider and adapter share identical allocation/attach semantics.
+
+**Where each step happens.** CRI splits the lifecycle differently from the
+provider, which allocates the IP, boots the VM, observes its address, and
+attaches in one `CreatePod`. In CRI:
+
+| CRI method | Networking action |
+| --- | --- |
+| `RunPodSandbox` | Reserve a Pod IP from IPAM, keyed by Pod identity (`namespace/name`). No attach yet — there is no micro-VM. |
+| `StartContainer` | After the workload starts, poll for the micro-VM's host-only address, then program the `binat` rule via the Router and record the attachment. This is the first point the VM IP exists. |
+| `PodSandboxStatus` | Report `Network.Ip` **only** once the path is actually attached; a reserved-but-unattached IP is withheld. |
+| `Status` | `NetworkReady=true` **only** when both IPAM and the Router are wired (a half-configured path can't produce a reachable Pod). |
+| `StopContainer` / `RemoveContainer` / self-exit reconcile | Detach the Pod network path when the single backing micro-VM reaches a terminal or removed state; retain the Pod IP reservation until sandbox removal. |
+| `StopPodSandbox` | Detach the path idempotently; retain the IP reservation so a stop/start keeps the same address. |
+| `RemovePodSandbox` | Detach, release the Pod IP, delete the record — each step idempotent. |
+
+Design decisions:
+
+- **Pod IP is keyed by Pod identity, not sandbox ID.** Keying IPAM and the Router
+  by `namespace/name` (matching the provider's `podKey`) keeps a Pod's address
+  stable when its sandbox is recreated. CRI-P5 keeps the one-sandbox-per-Pod,
+  one-container-per-sandbox restriction and rejects a second live sandbox for the
+  same Pod key; multi-container shared networking is still out of scope.
+- **Nothing is faked.** `PodSandboxStatus.Network` stays nil until the binat rule
+  is live, and `NetworkReady` is false (with an explicit reason) whenever the
+  dependency is missing or half-configured. A missing VM address (DHCP not yet
+  acquired) surfaces as `Unavailable` so the caller retries.
+- **Failed attach unwinds the start.** If the VM address never appears or the
+  Router rejects the rule, `StartContainer` stops the workload and marks the
+  container `Exited` with reason `NetworkSetupFailed`, rather than leaving it
+  `Running` behind an unreachable Pod IP.
+- **Restart is leak-free.** `Server.RecoverNetwork` (called once at adapter
+  startup, after the Router is `Start`ed) re-reserves each persisted sandbox's Pod
+  IP and re-attaches every sandbox that was attached before the restart. The
+  Router rebuilds its anchor wholesale on every change, so without re-attaching
+  the surviving endpoints the next `Attach`/`Detach` would drop other Pods' rules.
+- **No manual repair on the normal path.** The Router's existing cold-start guards
+  (stripping apple/container's scoped vmnet default route, tolerating an absent
+  pf anchor) are inherited unchanged, so the documented test path needs no manual
+  `route`/`pfctl` steps.
+
+Wiring: `cmd/macvz-cri` gains `--pod-cidr` and `--pod-network-interface` (plus
+optional `--pod-network-mesh-interface`, `--pod-network-helper-socket`, and
+`--pod-network-enable-forwarding`). Pod networking is **off unless both
+`--pod-cidr` and `--pod-network-interface` are set**; until then sandboxes run
+without a Pod IP and `Status` reports `NetworkReady=false`, exactly as before
+CRI-P5. The privileged pf/route operations route through `macvz-netd` when a
+helper socket is given, mirroring `macvz-kubelet`.
+
+Testing: hermetic tests (`pkg/criserver/network_test.go`) cover the sandbox
+network lifecycle success, the withheld-then-reported Pod IP, idempotent
+stop/remove, direct `StopContainer`/`RemoveContainer` detach, self-exit detach
+during status reconciliation, failed-attach cleanup, missing-VM-IP unwind,
+restart recovery (reserve + re-attach from disk-persisted state), `NetworkReady`
+reporting (including the half-configured case), duplicate Pod-key rejection, and
+the networking-off path. A gated live smoke test (`MACVZ_INTEGRATION=1`,
+`pkg/criserver/network_integration_test.go`) runs a real apple/container micro-VM
+behind a real `podnet.Router` and asserts the sandbox reports its real Pod IP
+through `PodSandboxStatus`, then that removal releases it:
+
+```sh
+MACVZ_INTEGRATION=1 go test ./pkg/criserver -run 'Test.*Network|Test.*Sandbox' -count=1
+# requires root (pf/route) or MACVZ_CRI_POD_HELPER_SOCKET=<macvz-netd socket>
+# tunables: MACVZ_CRI_POD_CIDR (default 10.244.0.0/24), MACVZ_CRI_POD_IFACE (default bridge100)
+```
+
+### CRI-P5 Decision
+
+Pod networking is **proven and honest** over the CRI path: a sandbox/container
+receives a real Pod IP from the same IPAM the shipped provider uses, the host
+binat path is programmed through the same Router, and the Pod IP is reported only
+once it is actually reachable. Restart recovery, idempotent teardown, and
+failed-attach cleanup all hold without manual repair.
+
+Carry into **CRI-P6**: with an honest Pod IP and `PodSandboxStatus.Network`, a
+real kubelet/k3s node join is now worthwhile. The next blockers are the streaming
+surfaces — logs, exec, attach, port-forward — and container stats, which kubelet
+exercises immediately after a Pod goes Ready. The CRI route remains **not**
+stopped.
+
 ## Reproducible Probe
 
 Run:

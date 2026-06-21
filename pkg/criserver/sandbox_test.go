@@ -127,6 +127,24 @@ func TestRunPodSandboxValidation(t *testing.T) {
 	}
 }
 
+func TestRunPodSandboxRejectsDuplicatePodKey(t *testing.T) {
+	s := New(Options{})
+	ctx := context.Background()
+	first := mustRun(t, s, "default", "web", "uid-web")
+
+	_, err := s.RunPodSandbox(ctx, runReq("default", "web", "uid-web-retry"))
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("duplicate RunPodSandbox code = %v, want FailedPrecondition", status.Code(err))
+	}
+	list, err := s.ListPodSandbox(ctx, &runtimeapi.ListPodSandboxRequest{})
+	if err != nil {
+		t.Fatalf("ListPodSandbox: %v", err)
+	}
+	if len(list.GetItems()) != 1 || list.GetItems()[0].GetId() != first {
+		t.Fatalf("duplicate RunPodSandbox changed sandbox list: %+v", list.GetItems())
+	}
+}
+
 func TestListPodSandboxFilters(t *testing.T) {
 	s := New(Options{})
 	ctx := context.Background()

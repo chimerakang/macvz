@@ -69,6 +69,15 @@ type Options struct {
 	// When set, CreateContainer no longer pulls implicitly; it verifies the image
 	// was already pulled via the ImageService, matching the CRI client contract.
 	Images ImageRuntime
+	// PodNetwork wires a sandbox's micro-VM into the MacVz Pod network path so the
+	// Pod is reachable at its assigned Pod IP across the mesh (CRI-P5, #77). Nil
+	// leaves Pod networking off: sandboxes run without a Pod IP and Status reports
+	// NetworkReady=false honestly. Satisfied by *podnet.Router.
+	PodNetwork PodNetwork
+	// IPAM allocates Pod IPs from the node's Kubernetes-assigned Pod CIDR (CRI-P5,
+	// #77). Nil leaves IP allocation off. Satisfied by *network.PodIPAM. Both
+	// PodNetwork and IPAM must be set for the Pod network path to be usable.
+	IPAM PodIPAllocator
 	// Now overrides the clock for CreatedAt timestamps in tests. Nil uses
 	// time.Now.
 	Now func() time.Time
@@ -89,8 +98,15 @@ type Server struct {
 	containers       *store.ContainerStore
 	containerRuntime ContainerRuntime
 	imageRuntime     ImageRuntime
+	podNet           PodNetwork
+	ipam             PodIPAllocator
 	lifecycleMu      sync.Mutex
 	now              func() time.Time
+
+	// vmIPPoll* bound how long StartContainer waits for the micro-VM's host-only
+	// address before attaching the Pod network. Tests shorten them.
+	vmIPPollAttempts int
+	vmIPPollInterval time.Duration
 }
 
 // New builds a CRI skeleton server with the given options.
@@ -124,7 +140,11 @@ func New(opts Options) *Server {
 		containers:       containers,
 		containerRuntime: opts.Runtime,
 		imageRuntime:     opts.Images,
+		podNet:           opts.PodNetwork,
+		ipam:             opts.IPAM,
 		now:              now,
+		vmIPPollAttempts: defaultVMIPPollAttempts,
+		vmIPPollInterval: defaultVMIPPollInterval,
 	}
 }
 
@@ -147,34 +167,43 @@ func (s *Server) Version(_ context.Context, req *runtimeapi.VersionRequest) (*ru
 	}, nil
 }
 
-// Status reports runtime readiness conditions for `crictl info`. The skeleton
-// reports RuntimeReady=true (the CRI server process is up) but NetworkReady=false
-// with an explicit reason, because CNI/Pod networking is out of scope for CRI-P1.
-// This is deliberately honest: nothing here would actually run a networked Pod.
+// Status reports runtime readiness conditions for `crictl info`. RuntimeReady is
+// true once the CRI server process is up. NetworkReady reflects whether the MacVz
+// Pod networking dependency (IPAM + the pf binat path) is actually wired (CRI-P5,
+// #77): true only when both are configured and thus usable, false with an explicit
+// reason otherwise. This is deliberately honest — NetworkReady is never set true
+// for a path that could not produce a reachable Pod.
 func (s *Server) Status(_ context.Context, req *runtimeapi.StatusRequest) (*runtimeapi.StatusResponse, error) {
 	klog.V(4).InfoS("CRI Status", "verbose", req.GetVerbose())
+	netReady := s.networkEnabled()
+	netCond := &runtimeapi.RuntimeCondition{
+		Type:    runtimeapi.NetworkReady,
+		Status:  netReady,
+		Reason:  "NetworkPluginNotConfigured",
+		Message: "Pod networking is not wired; sandboxes run without a Pod IP",
+	}
+	if netReady {
+		netCond.Reason = "MacVzPodNetwork"
+		netCond.Message = "MacVz Pod networking (IPAM + pf binat) is configured and usable"
+	}
 	status := &runtimeapi.RuntimeStatus{
 		Conditions: []*runtimeapi.RuntimeCondition{
 			{
 				Type:    runtimeapi.RuntimeReady,
 				Status:  true,
-				Reason:  "MacVzCriSkeleton",
-				Message: "experimental MacVz CRI skeleton is serving; no workloads are run in this phase",
+				Reason:  "MacVzCriReady",
+				Message: "experimental MacVz CRI adapter is serving",
 			},
-			{
-				Type:    runtimeapi.NetworkReady,
-				Status:  false,
-				Reason:  "NetworkPluginNotConfigured",
-				Message: "Pod networking/CNI is out of scope for the CRI-P1 skeleton",
-			},
+			netCond,
 		},
 	}
 	resp := &runtimeapi.StatusResponse{Status: status}
 	if req.GetVerbose() {
 		resp.Info = map[string]string{
 			"experimental": "true",
-			"track":        "CRI-P1 skeleton (docs/CRI_FEASIBILITY.md)",
+			"track":        "CRI feasibility (docs/CRI_FEASIBILITY.md)",
 			"runtimeName":  s.runtimeName,
+			"network":      s.networkInfo(),
 		}
 	}
 	return resp, nil

@@ -29,6 +29,9 @@ type fakeRuntime struct {
 	pullErr, createErr, startErr, stopErr, destroyErr, statusErr error
 	// statusOverride, when set for a workload id, is returned by Status.
 	statusOverride map[string]runtime.Status
+	// startIP, when set, is the host-only address Start records on the workload so
+	// the CRI-P5 network attach path can observe a VM IP in hermetic tests.
+	startIP string
 }
 
 func newFakeRuntime() *fakeRuntime {
@@ -66,7 +69,7 @@ func (f *fakeRuntime) Start(_ context.Context, id string) error {
 		return f.startErr
 	}
 	f.started = append(f.started, id)
-	f.statuses[id] = runtime.Status{ID: id, Phase: runtime.PhaseRunning, StartedAt: time.Now()}
+	f.statuses[id] = runtime.Status{ID: id, Phase: runtime.PhaseRunning, StartedAt: time.Now(), IP: f.startIP}
 	return nil
 }
 

@@ -28,10 +28,25 @@ import (
 	"github.com/chimerakang/macvz/internal/version"
 	"github.com/chimerakang/macvz/pkg/criserver"
 	"github.com/chimerakang/macvz/pkg/criserver/store"
+	"github.com/chimerakang/macvz/pkg/network"
+	"github.com/chimerakang/macvz/pkg/network/podnet"
 	"github.com/chimerakang/macvz/pkg/runtime/container"
 	"google.golang.org/grpc"
 	"k8s.io/klog/v2"
 )
+
+// podNetConfig collects the CRI-P5 Pod networking flags (#77). Pod networking is
+// off unless both PodCIDR and Interface are set; until then the adapter runs
+// sandboxes without a Pod IP and reports NetworkReady=false honestly.
+type podNetConfig struct {
+	podCIDR          string
+	iface            string
+	meshInterface    string
+	helperSocket     string
+	enableForwarding bool
+}
+
+func (c podNetConfig) enabled() bool { return c.podCIDR != "" && c.iface != "" }
 
 // defaultListen is the CRI socket endpoint used when --listen is not provided.
 const defaultListen = "unix:///tmp/macvz-cri.sock"
@@ -43,6 +58,7 @@ func main() {
 		runtimeBinary string
 		rosetta       bool
 		showVersion   bool
+		pn            podNetConfig
 	)
 	flag.StringVar(&listen, "listen", defaultListen,
 		"CRI gRPC endpoint to serve (unix:///path/to.sock or an absolute socket path)")
@@ -52,6 +68,16 @@ func main() {
 		"apple/container CLI to drive container workloads (empty resolves \"container\" via PATH)")
 	flag.BoolVar(&rosetta, "rosetta", false,
 		"allow booting linux/amd64 images via Rosetta-for-Linux translation")
+	flag.StringVar(&pn.podCIDR, "pod-cidr", "",
+		"node Pod CIDR for CRI-P5 Pod IP allocation (empty = Pod networking off)")
+	flag.StringVar(&pn.iface, "pod-network-interface", "",
+		"vmnet bridge backing the micro-VMs for the Pod network binat path (required with --pod-cidr to enable Pod networking)")
+	flag.StringVar(&pn.meshInterface, "pod-network-mesh-interface", "",
+		"WireGuard mesh interface for cross-node Pod binat rules (optional)")
+	flag.StringVar(&pn.helperSocket, "pod-network-helper-socket", "",
+		"macvz-netd privileged helper socket for pf/route operations (empty runs pfctl/route directly, requiring root)")
+	flag.BoolVar(&pn.enableForwarding, "pod-network-enable-forwarding", false,
+		"enable IPv4 forwarding when starting the Pod network path")
 	flag.BoolVar(&showVersion, "version", false, "print version and exit")
 
 	klog.InitFlags(nil)
@@ -65,7 +91,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	if err := run(ctx, listen, stateDir, runtimeBinary, rosetta); err != nil {
+	if err := run(ctx, listen, stateDir, runtimeBinary, rosetta, pn); err != nil {
 		klog.ErrorS(err, "macvz-cri exited with error")
 		klog.Flush()
 		os.Exit(1)
@@ -73,7 +99,7 @@ func main() {
 	klog.Flush()
 }
 
-func run(ctx context.Context, listen, stateDir, runtimeBinary string, rosetta bool) error {
+func run(ctx context.Context, listen, stateDir, runtimeBinary string, rosetta bool, pn podNetConfig) error {
 	socketPath, err := socketPath(listen)
 	if err != nil {
 		return err
@@ -117,6 +143,14 @@ func run(ctx context.Context, listen, stateDir, runtimeBinary string, rosetta bo
 
 	driver := container.New(container.Config{Binary: runtimeBinary, Rosetta: rosetta})
 
+	// Wire the Pod network path (CRI-P5, #77) only when explicitly configured. The
+	// returned cleanup flushes host pf state on shutdown; it is a no-op when off.
+	podNet, ipam, netCleanup, err := setupPodNetwork(ctx, pn)
+	if err != nil {
+		return err
+	}
+	defer netCleanup()
+
 	grpcServer := grpc.NewServer()
 	srv := criserver.New(criserver.Options{
 		RuntimeVersion: version.Version,
@@ -124,7 +158,12 @@ func run(ctx context.Context, listen, stateDir, runtimeBinary string, rosetta bo
 		Containers:     containers,
 		Runtime:        driver,
 		Images:         driver,
+		PodNetwork:     podNet,
+		IPAM:           ipam,
 	})
+	// Rebuild Pod IP reservations and re-attach surviving sandboxes so a restart
+	// neither leaks addresses nor wipes other Pods' host rules. No-op when off.
+	srv.RecoverNetwork(ctx)
 	srv.Register(grpcServer)
 
 	klog.InfoS("starting experimental macvz-cri server",
@@ -147,6 +186,55 @@ func run(ctx context.Context, listen, stateDir, runtimeBinary string, rosetta bo
 	}
 	klog.InfoS("macvz-cri stopped cleanly")
 	return nil
+}
+
+// setupPodNetwork builds the CRI-P5 Pod networking dependencies (#77) when both a
+// Pod CIDR and a vmnet interface are configured: a PodIPAM over the node's Pod
+// CIDR and a started podnet.Router for the host pf binat path. It returns nil
+// interfaces and a no-op cleanup when Pod networking is off, so the adapter runs
+// sandboxes without a Pod IP and reports NetworkReady=false honestly.
+//
+// The returned values are interface-typed (not concrete pointers) so the "off"
+// case yields true nils — a concrete typed-nil would make the server believe Pod
+// networking is wired.
+func setupPodNetwork(ctx context.Context, pn podNetConfig) (criserver.PodNetwork, criserver.PodIPAllocator, func(), error) {
+	noop := func() {}
+	if !pn.enabled() {
+		if pn.podCIDR != "" || pn.iface != "" {
+			klog.InfoS("Pod networking partially configured; both --pod-cidr and --pod-network-interface are required to enable it",
+				"podCIDR", pn.podCIDR, "interface", pn.iface)
+		} else {
+			klog.InfoS("Pod networking disabled; sandboxes run without a Pod IP")
+		}
+		return nil, nil, noop, nil
+	}
+
+	ipam, err := network.NewPodIPAM(pn.podCIDR)
+	if err != nil {
+		return nil, nil, noop, fmt.Errorf("build pod IPAM over %q: %w", pn.podCIDR, err)
+	}
+
+	var pnOpts []podnet.Option
+	if pn.helperSocket != "" {
+		pnOpts = append(pnOpts, podnet.WithHelperSocket(pn.helperSocket))
+	}
+	router := podnet.New(podnet.Config{
+		Interface:        pn.iface,
+		MeshInterface:    pn.meshInterface,
+		EnableForwarding: pn.enableForwarding,
+	}, pnOpts...)
+	if err := router.Start(ctx); err != nil {
+		return nil, nil, noop, fmt.Errorf("start pod network path: %w", err)
+	}
+	klog.InfoS("Pod networking enabled for CRI adapter",
+		"podCIDR", ipam.CIDR(), "interface", pn.iface, "meshInterface", pn.meshInterface)
+
+	cleanup := func() {
+		if err := router.Stop(context.Background()); err != nil {
+			klog.ErrorS(err, "failed to stop pod network path")
+		}
+	}
+	return router, ipam, cleanup, nil
 }
 
 // socketPath extracts the filesystem path from a CRI endpoint. It accepts the

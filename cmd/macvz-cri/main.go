@@ -1,9 +1,10 @@
 // Command macvz-cri runs an experimental, minimal Kubernetes CRI server for the
-// MacVz CRI feasibility track (docs/CRI_FEASIBILITY.md, CRI-P1..P3).
+// MacVz CRI feasibility track (docs/CRI_FEASIBILITY.md, CRI-P1..P4).
 //
 // It listens on a Unix socket and serves the CRI RuntimeService/ImageService so
-// kubelet or crictl can connect, run the sandbox lifecycle, and drive a single
-// container per Pod sandbox as an apple/container micro-VM (CRI-P3). It stays
+// kubelet or crictl can connect, run the sandbox lifecycle, drive a single
+// container per Pod sandbox as an apple/container micro-VM (CRI-P3), and manage
+// images through the ImageService (pull/status/list/remove, CRI-P4). It stays
 // narrow: one container per sandbox, no shared Pod network, no shared volumes —
 // see pkg/criserver.
 //
@@ -122,6 +123,7 @@ func run(ctx context.Context, listen, stateDir, runtimeBinary string, rosetta bo
 		Sandboxes:      sandboxes,
 		Containers:     containers,
 		Runtime:        driver,
+		Images:         driver,
 	})
 	srv.Register(grpcServer)
 

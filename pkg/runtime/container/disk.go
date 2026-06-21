@@ -55,15 +55,25 @@ func (d *Driver) ImageCacheUsage(ctx context.Context) (runtime.ImageCacheUsage, 
 	return parseImageCache(out, time.Now())
 }
 
-// imageListEntry is the subset of `container image ls --format json` the driver
-// consumes. apple/container reports each cached image's total size in bytes;
-// some builds nest the size under a platform variant, so both are summed.
+// imageListEntry is the subset of `container image ls/inspect --format json` the
+// driver consumes. apple/container reports each cached image's total size in
+// bytes; some builds nest the size under a platform variant, so both are summed.
+// The digest fields are optional (best-effort across CLI builds) and only used
+// to derive a stable image ID for the CRI ImageService (#76); their absence
+// degrades the ID to the reference rather than failing.
 type imageListEntry struct {
-	Reference string     `json:"reference"`
-	Name      string     `json:"name"`
-	Size      byteSize   `json:"size"`
-	Variants  []struct { // present on multi-platform builds
-		Size byteSize `json:"size"`
+	Reference  string `json:"reference"`
+	Name       string `json:"name"`
+	Digest     string `json:"digest"`
+	Descriptor struct {
+		Digest string `json:"digest"`
+	} `json:"descriptor"`
+	Size     byteSize   `json:"size"`
+	Variants []struct { // present on multi-platform builds
+		Size       byteSize `json:"size"`
+		Descriptor struct {
+			Digest string `json:"digest"`
+		} `json:"descriptor"`
 	} `json:"variants"`
 }
 

@@ -35,7 +35,10 @@ func TestLiveSingleContainerLifecycle(t *testing.T) {
 		t.Fatalf("apple/container not ready: %v", err)
 	}
 
-	s := New(Options{Runtime: driver})
+	// Wire both the container runtime and the ImageService so this exercises the
+	// CRI-P4 path: the image is pulled via PullImage, and CreateContainer then
+	// relies on it being present rather than pulling implicitly.
+	s := New(Options{Runtime: driver, Images: driver})
 
 	sbResp, err := s.RunPodSandbox(ctx, &runtimeapi.RunPodSandboxRequest{
 		Config: &runtimeapi.PodSandboxConfig{
@@ -46,6 +49,12 @@ func TestLiveSingleContainerLifecycle(t *testing.T) {
 		t.Fatalf("RunPodSandbox: %v", err)
 	}
 	sandboxID := sbResp.GetPodSandboxId()
+
+	if _, err := s.PullImage(ctx, &runtimeapi.PullImageRequest{
+		Image: &runtimeapi.ImageSpec{Image: liveImage},
+	}); err != nil {
+		t.Fatalf("PullImage: %v", err)
+	}
 
 	cResp, err := s.CreateContainer(ctx, &runtimeapi.CreateContainerRequest{
 		PodSandboxId: sandboxID,

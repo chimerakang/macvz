@@ -7,14 +7,17 @@
 // RemovePodSandbox, PodSandboxStatus, ListPodSandbox (see sandbox.go). CRI-P3
 // adds a single-container Pod lifecycle — CreateContainer, StartContainer,
 // StopContainer, RemoveContainer, ContainerStatus, ListContainers — that drives
-// one apple/container micro-VM per sandbox (see container.go). Both lifecycles
-// are backed by the restart-tolerant stores in pkg/criserver/store.
+// one apple/container micro-VM per sandbox (see container.go). CRI-P4 adds the
+// ImageService — PullImage, ImageStatus, ListImages, RemoveImage, ImageFsInfo —
+// over the apple/container image store (see image.go), moving image lifecycle
+// off CreateContainer and onto the CRI client. All lifecycles are backed by the
+// restart-tolerant stores in pkg/criserver/store.
 //
 // The scope stays narrow: one container per sandbox, no shared Pod network, no
 // shared volumes, and no multi-container support (a second container is rejected
-// with an explicit error). Every CRI method this phase does not model returns
-// codes.Unimplemented, and the container surface returns FailedPrecondition when
-// no runtime is wired — never a fake success.
+// with an explicit error). Every CRI method these phases do not model returns
+// codes.Unimplemented; the container and image surfaces return FailedPrecondition
+// when no runtime is wired — never a fake success.
 //
 // This path is intentionally separate from the shipped Virtual Kubelet provider
 // (cmd/macvz-kubelet) and is not the default MacVz runtime mode.
@@ -59,6 +62,13 @@ type Options struct {
 	// inert: each method returns FailedPrecondition rather than faking success, so
 	// the default skeleton still serves sandbox-only flows honestly.
 	Runtime ContainerRuntime
+	// Images drives the apple/container image store behind the CRI ImageService
+	// (#76): PullImage, ImageStatus, ListImages, RemoveImage, ImageFsInfo. Nil
+	// leaves the image surface honest-but-inert — Pull/Status/Remove return
+	// FailedPrecondition and List/FsInfo report empty rather than faking data.
+	// When set, CreateContainer no longer pulls implicitly; it verifies the image
+	// was already pulled via the ImageService, matching the CRI client contract.
+	Images ImageRuntime
 	// Now overrides the clock for CreatedAt timestamps in tests. Nil uses
 	// time.Now.
 	Now func() time.Time
@@ -78,6 +88,7 @@ type Server struct {
 	sandboxes        *store.Store
 	containers       *store.ContainerStore
 	containerRuntime ContainerRuntime
+	imageRuntime     ImageRuntime
 	lifecycleMu      sync.Mutex
 	now              func() time.Time
 }
@@ -112,6 +123,7 @@ func New(opts Options) *Server {
 		sandboxes:        sandboxes,
 		containers:       containers,
 		containerRuntime: opts.Runtime,
+		imageRuntime:     opts.Images,
 		now:              now,
 	}
 }
@@ -166,16 +178,4 @@ func (s *Server) Status(_ context.Context, req *runtimeapi.StatusRequest) (*runt
 		}
 	}
 	return resp, nil
-}
-
-// ListImages returns an empty list. The skeleton manages no images.
-func (s *Server) ListImages(_ context.Context, _ *runtimeapi.ListImagesRequest) (*runtimeapi.ListImagesResponse, error) {
-	return &runtimeapi.ListImagesResponse{Images: nil}, nil
-}
-
-// ImageFsInfo returns no filesystem usage. The skeleton has no image store.
-// An empty (non-error) response keeps `crictl info` and kubelet image GC probes
-// from erroring while honestly reporting that nothing is tracked.
-func (s *Server) ImageFsInfo(_ context.Context, _ *runtimeapi.ImageFsInfoRequest) (*runtimeapi.ImageFsInfoResponse, error) {
-	return &runtimeapi.ImageFsInfoResponse{}, nil
 }

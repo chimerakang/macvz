@@ -110,9 +110,23 @@ func (s *Server) CreateContainer(ctx context.Context, req *runtimeapi.CreateCont
 	c.Pod.UID = sb.Metadata.UID
 	c.Pod.Namespace = sb.Metadata.Namespace
 
-	// Pull first so an arch-incompatible image fails with a clear error before a
-	// workload is provisioned (the driver verifies the arm64 variant in Pull).
-	if err := s.containerRuntime.Pull(ctx, image, nil); err != nil {
+	// Image acquisition: once the ImageService is wired (CRI-P4), kubelet and
+	// crictl pull via PullImage before CreateContainer, so we must not pull
+	// implicitly here — that would duplicate ImageService behavior. Instead verify
+	// the image is already present and fail with a clear FailedPrecondition if not.
+	// With no ImageService configured (the container-runtime-only skeleton), fall
+	// back to pulling here so the single-container path still works end to end.
+	if s.imageRuntime != nil {
+		if _, err := s.imageRuntime.ImageStatus(ctx, image); err != nil {
+			if errors.Is(err, runtime.ErrNotFound) {
+				return nil, status.Errorf(codes.FailedPrecondition,
+					"CreateContainer: image %q is not present; pull it via the ImageService (PullImage) before creating the container", image)
+			}
+			return nil, runtimeError("CreateContainer", "inspect image", err)
+		}
+	} else if err := s.containerRuntime.Pull(ctx, image, nil); err != nil {
+		// Pull verifies the arm64 variant, so an arch-incompatible image fails with
+		// a clear error before a workload is provisioned.
 		return nil, runtimeError("CreateContainer", "pull image", err)
 	}
 

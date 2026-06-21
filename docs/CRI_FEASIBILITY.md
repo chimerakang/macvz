@@ -323,6 +323,74 @@ Carry into **CRI-P4/P5**:
   **pause-like sandbox VM plus workload VMs** model for honest multi-container
   Pods become tractable. The CRI route remains **not** stopped.
 
+## CRI-P4: ImageService
+
+CRI-P4 moves image lifecycle off `CreateContainer` (where CRI-P3 pulled
+implicitly) and onto the CRI `ImageService`, where kubelet and `crictl` expect
+it. The adapter now implements all five image methods over the apple/container
+image store (`pkg/criserver/image.go`, driven by the new
+`runtime.ImageManager` capability in `pkg/runtime/container/image.go`):
+
+| CRI method | apple/container command | Notes |
+| --- | --- | --- |
+| `PullImage` | `image pull` (+ optional `registry login/logout`) | Reuses the driver's arch-verifying `Pull`; returns a runtime-usable image ref. |
+| `ImageStatus` | `image inspect` | Absent image → empty, non-error response (CRI contract). |
+| `ListImages` | `image ls --format json` | Honours the reference filter (ID / RepoTag / RepoDigest). |
+| `RemoveImage` | `image delete` | Idempotent: removing an absent image succeeds. |
+| `ImageFsInfo` | `image ls` + `statfs(2)` | Reports image-cache used bytes + data-root mountpoint/inodes, or degrades to an empty response — never fabricated values. |
+
+Design decisions:
+
+- **`CreateContainer` no longer pulls** when the ImageService is wired. It
+  verifies the image is already present via `ImageStatus` and returns
+  `FailedPrecondition` if not, directing the caller to `PullImage` first — the
+  normal kubelet/`crictl` order. A container-runtime-only configuration (no
+  ImageService) keeps the CRI-P3 fallback of pulling in `CreateContainer`, so
+  the single-container spike still works standalone.
+- **Image ID is honest and runtime-usable.** apple/container's image metadata
+  does not map cleanly onto CRI's fields, so the ID prefers a repo digest
+  (`name@sha256:...`) that kubelet can feed back into `CreateContainer` and
+  `RemoveImage`; it degrades to the canonical reference when no digest is
+  available, rather than fabricating one. `RepoDigests` includes the repo digest
+  and, when useful for matching, the raw digest.
+- **Registry auth is implemented for username/password.** CRI `AuthConfig`
+  username/password (or a base64 `user:password` in `Auth`) maps to the existing
+  `runtime.RegistryAuth` login/pull/logout flow (#49), which serialises per
+  registry server. When `ServerAddress` is empty the registry host is derived
+  from the image reference (Docker Hub short names default to `docker.io`).
+  **Token credentials** (`IdentityToken`/`RegistryToken`) are **not** supported —
+  apple/container's `registry login` takes only username/password — so they are
+  rejected with an explicit `Unimplemented` rather than silently dropped.
+- **`arm64`/Rosetta policy is preserved.** Pull still goes through the driver's
+  `selectPlatform` arch verification, so an image with no bootable variant fails
+  at `PullImage` with the same actionable `ErrIncompatibleArch` as before.
+
+Testing: hermetic tests cover the driver image methods against the fake CLI
+runner (`pkg/runtime/container/image_test.go`) and the CRI ImageService against a
+fake image runtime, including auth mapping, the filter, the FsInfo degrade paths,
+and the `CreateContainer` no-implicit-pull behaviour
+(`pkg/criserver/image_test.go`). A gated live test
+(`MACVZ_CRI_INTEGRATION=1`, `pkg/criserver/image_integration_test.go`) drives
+`PullImage → ImageStatus → ListImages → ImageFsInfo → RemoveImage` against a real
+apple/container service, and the single-container lifecycle live test now pulls
+through the ImageService first.
+
+### CRI-P4 Decision
+
+The image lifecycle is **proven and honest** over the CRI ImageService. The
+adapter no longer pulls implicitly, registry username/password auth is wired
+through the existing driver flow, and every surface that cannot report real data
+(token auth, absent digests, unsampleable image filesystem) degrades explicitly
+rather than faking a value.
+
+Carry into **CRI-P5**: Pod networking is the remaining blocker before a real
+kubelet/k3s node join is worthwhile — a Pod IP, CNI ADD/DEL (or the MacVz
+podNetwork equivalent), and `PodSandboxStatus.Network`. Only once that exists
+does the pause-like sandbox-VM model for honest multi-container Pods become
+tractable. A kubelet join attempt against the current image+container surface is
+a reasonable exploratory smoke but is expected to stall at Pod networking. The
+CRI route remains **not** stopped.
+
 ## Reproducible Probe
 
 Run:

@@ -1065,6 +1065,18 @@ or stop/recreate fallback. vmnet/Pod IP networking, bridge validation, CRI gap
 analysis, and k3s in-loop soak also remain open. The CRI track stays an isolated
 `develop` spike.
 
+#90 resolves the immediate route-C strategy question: do not build a
+production-shaped LinuxPod helper daemon yet. Source inspection on
+`apple/containerization` 0.34.0 shows that the post-create container path is a
+real hotplug boundary: `LinuxPod.addContainer` can call into a
+`HotplugProvider`, but the default VZ manager path does not install one, and the
+default VM implementation reports `unsupported`. An open upstream issue
+(`apple/containerization#767`) reports the same public-consumer gap. The next
+smallest experiment is therefore #91, a hotplug-provider boundary probe, not a
+full backend. If that probe fails, MacVz must choose between a deliberately limited
+predeclared-container backend, an explicit stop/recreate smoke fallback, or
+deferring route C while keeping the Virtual Kubelet path as the shipped product.
+
 ## CRI-P9 Follow-up (#86): Unblock Honest Multi-Container Pods
 
 #82 established *why* multi-container Pods are blocked. #86 is the work to turn

@@ -210,9 +210,41 @@ adapter must either:
 Do not build a production-shaped Swift helper daemon until this ordering
 limitation has an accepted product/roadmap answer.
 
-### C3: Swift Helper Daemon Prototype
+### C3: Backend Limit Decision
 
-Only if the project accepts a limited route-C workload model despite C2:
+C3 chooses the next honest route after C1/C2, before any helper daemon or CRI
+backend work starts. The decision is recorded in
+[CRI_LINUXPOD_C3_DECISION.md](CRI_LINUXPOD_C3_DECISION.md).
+
+C3 result:
+
+- keep LinuxPod as route-C research evidence, not as a production backend;
+- do not build a production-shaped Swift helper daemon yet;
+- do not claim full kubelet/k3s CRI compatibility;
+- allow a deliberately limited backend only behind an experimental flag, after
+  one more hotplug boundary probe;
+- treat stop/recreate only as an explicitly reported smoke-test fallback.
+
+### C4: Hotplug Provider Boundary Probe (#91)
+
+The next smallest experiment is not a helper daemon. It is a Swift probe that
+installs a consumer-provided `VZInstanceExtension` / `HotplugProvider` on the
+current `apple/containerization` checkout and records whether post-create
+`LinuxPod.addContainer(...)` can be made real with public APIs.
+
+Acceptance:
+
+- a custom provider is installed on the VZ-backed VM instance;
+- post-create `addContainer` reaches that provider;
+- the probe either starts the late container using a real ext4/block rootfs
+  attachment, or records the exact public API boundary that prevents it;
+- no fake `AttachedFilesystem` or guessed guest `/dev/...` path is counted as a
+  success.
+
+### C5: Swift Helper Daemon Prototype
+
+Only if C4 proves a viable hotplug path, or the project explicitly accepts a
+limited/predeclared-container model:
 
 - expose a small local socket API for `CreatePod`, `AddContainer`,
   `StartContainer`, `StopContainer`, `StopPod`, `Exec`, `Stats`, and `Status`;
@@ -220,9 +252,9 @@ Only if the project accepts a limited route-C workload model despite C2:
 - do not implement a full CRI server in Swift;
 - keep Go `macvz-cri` as the kubelet-facing boundary.
 
-### C4: Experimental `macvz-cri --runtime-backend=linuxpod`
+### C6: Experimental `macvz-cri --runtime-backend=linuxpod`
 
-Only if C3 is stable enough and the C2 ordering limitation is represented
+Only if C5 is stable enough and the C2/C4 ordering limitation is represented
 honestly in CRI behavior:
 
 - add a new backend behind an explicit experimental flag;
@@ -230,7 +262,7 @@ honestly in CRI behavior:
 - run hermetic CRI lifecycle tests against a fake helper;
 - run gated live tests against the Swift helper.
 
-### C5: k3s In-Loop Evidence
+### C7: k3s In-Loop Evidence
 
 Only after the backend can run a real two-container Pod shape within the
 accepted ordering limits:
@@ -240,15 +272,16 @@ accepted ordering limits:
 - keep `Attach`/`PortForward` honest if still unsupported;
 - run longer soak only after basic semantics pass.
 
-## Recommendation After C2
+## Recommendation After C3
 
-Pause route-C implementation work until the project chooses one of these paths:
+Pause route-C implementation work until C4 answers the public hotplug boundary.
+The currently accepted position is:
 
 - keep LinuxPod as a research-only proof of the shared sandbox primitive;
-- design a deliberately limited LinuxPod backend that requires predeclared
-  containers and rejects late adds;
-- wait for upstream LinuxPod hotplug support; or
-- move the long-term CRI ambition back toward a MacVz-owned sandbox VM runtime.
+- do one focused hotplug-provider boundary probe;
+- do not build a helper daemon until either hotplug is viable or the project
+  explicitly accepts a limited/predeclared-container backend;
+- keep a MacVz-owned sandbox VM runtime as a later fallback, not the next issue.
 
 ## References
 
@@ -263,6 +296,8 @@ Pause route-C implementation work until the project chooses one of these paths:
   CRI `PortForward`.
 - `apple/containerization#767`: post-create `LinuxPod.addContainer` hotplug is
   not currently proven for public VZ-backed ext4/block rootfs consumers.
+- [CRI_LINUXPOD_C3_DECISION.md](CRI_LINUXPOD_C3_DECISION.md): MacVz route-C
+  backend limit decision after C1/C2.
 - `vanchonlee/krust-cri`: public experimental macOS CRI runtime over
   Apple Containerization `LinuxPod`.
 - Kata Containers and firecracker-containerd: mature references for per-Pod VM,

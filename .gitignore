@@ -19,6 +19,8 @@ go.work.sum
 *.qcow2
 *.log
 /test/e2e/two-node/generated/
+/test/e2e/cri-linuxpod/.build/
+/test/e2e/cri-linuxpod/containerization/
 
 # Env & secrets
 .env

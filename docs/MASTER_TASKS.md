@@ -59,7 +59,8 @@ architecture from Virtual Kubelet provider to kubelet CRI runtime integration.
 | CRI-P9 follow-up (#84) | Host-namespace workload feasibility / honest scheduling exclusion | ✅ Complete (taint/label opt-in scheme + loud RunPodSandbox backstop) |
 | CRI-P9 follow-up (#85) | Real kubelet/k3s fixture deployment and multi-day in-loop soak | 🟡 Harness/fixture/runbook built (`test/e2e/cri-k3s/k3s-inloop.sh`, `docs/CRI_K3S_INLOOP_REPORT.md`); gated live run operator-pending |
 | CRI-P9 follow-up (#86) | Unblock honest multi-container Pods when `apple/container` exposes shared sandbox namespaces | 🟡 Capability re-verified absent (1.0.0); adapter-side honest path prepared behind `--experimental-multi-container` (join-in-sandbox-VM, one Pod IP, leak-free, owner-first drain guarded); blocked on runtime primitive with stable sandbox namespace lifetime |
-| CRI runtime feasibility (#87) | Validate `apple/containerization` `LinuxPod` as the route-C Pod sandbox backend | 🟡 Open — prioritize `LinuxPod` proof over MacVz-owned runtime; self-owned sandbox runtime is fallback only |
+| CRI runtime feasibility (#87) | Validate `apple/containerization` `LinuxPod` as the route-C Pod sandbox backend | 🟡 C0 complete and C1 shared-namespace PoC passed; self-owned sandbox runtime remains fallback only |
+| CRI-C1 (#88) | Minimal LinuxPod two-container shared-namespace PoC | ✅ Complete (live LinuxPod two-container localhost/exec/stats/stop-order run passed; vmnet/PodIP probe remains a later network gate) |
 
 **CRI-P5 evidence (#77):** Pod networking is wired through the same primitives as
 the shipped provider — `network.PodIPAM` for Pod IPs and `podnet.Router` for the
@@ -201,19 +202,26 @@ sandbox runtime as fallback only. See [CRI_FEASIBILITY.md](CRI_FEASIBILITY.md)
 
 **CRI runtime feasibility (#87):** Route C is now the active research path:
 validate `apple/containerization` `LinuxPod` before considering a MacVz-owned
-sandbox runtime. `LinuxPod` is an experimental Swift API that can place multiple
-Linux containers in one VM, with separate rootfs/processes and shared VM
-CPU/memory/network; upstream integration tests already cover multiple/concurrent
-containers, exec, stats, per-container limits, filesystem isolation, optional
-shared PID namespace, and shared-network sysctl evidence. The work now is to
-prove the Kubernetes-facing contract MacVz needs: one Pod IP, localhost
-reachability across containers, sandbox lifetime independent of any single
-container, kubelet-compatible `RunPodSandbox`/`CreateContainer` ordering,
-logs/exec/stats, and the current upstream gaps (`Attach`, `PortForward`,
-post-create `addContainer` hotplug). If LinuxPod is feasible, create bridge
-implementation phases (likely a Swift helper daemon controlled by the Go CRI
-adapter). If LinuxPod fails, only then evaluate route D: a MacVz-owned sandbox VM
-runtime. See issue #87.
+sandbox runtime. C0 is complete in
+[CRI_LINUXPOD_FEASIBILITY.md](CRI_LINUXPOD_FEASIBILITY.md): the decision is
+**go to a minimal LinuxPod PoC**, not production adoption. `LinuxPod` is an
+experimental Swift API that can place multiple Linux containers in one VM, with
+separate rootfs/processes and shared VM CPU/memory/network; upstream integration
+tests already cover multiple/concurrent containers, exec, stats, per-container
+limits, filesystem isolation, optional shared PID namespace, and shared-network
+sysctl evidence. The PoC must prove the Kubernetes-facing contract MacVz needs:
+one Pod IP, localhost reachability across containers, sandbox lifetime
+independent of any single container, kubelet-compatible
+`RunPodSandbox`/`CreateContainer` ordering, logs/exec/stats, and the current
+upstream gaps (`Attach`, `PortForward`, post-create `addContainer` hotplug). If
+the PoC passes, create bridge implementation phases (likely a Swift helper daemon
+controlled by the Go CRI adapter). #88 completed the first pure Swift
+two-container shared-namespace PoC: one LinuxPod boots, two containers are
+registered before `pod.create()`, localhost reaches across containers, exec and
+stats work, and stopping the server first leaves the client observable. The PoC
+does not yet prove vmnet Pod IP attachment, post-create container hotplug,
+`Attach`, `PortForward`, recovery, or k3s in-loop behavior. See
+[CRI_LINUXPOD_POC_REPORT.md](CRI_LINUXPOD_POC_REPORT.md) and issue #87.
 
 **CRI-P9 follow-up (#84):** The host-namespace gate is **cleared via option (b),
 an honest scheduling exclusion**. Honest host-namespace support is physically

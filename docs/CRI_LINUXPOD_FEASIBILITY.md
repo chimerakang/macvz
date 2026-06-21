@@ -1,0 +1,240 @@
+# CRI LinuxPod Feasibility (#87)
+
+Date: 2026-06-21
+
+## Decision
+
+`apple/containerization` `LinuxPod` is the correct next route-C feasibility
+target. It is not production-ready for MacVz yet, but it is the first upstream
+surface found so far that can honestly model the Kubernetes multi-container Pod
+shape: one VM, multiple container root filesystems/processes, shared VM
+CPU/memory/network, and optional shared PID namespace.
+
+The decision for #87 C0 is therefore **Go to a minimal LinuxPod PoC**, not
+"replace the current runtime" and not "start a MacVz-owned VM runtime". The
+current Virtual Kubelet architecture remains the shipped path. The current
+`macvz-cri` path remains experimental.
+
+The PoC must pass the shared Pod sandbox semantics before any bridge or CRI
+backend work starts:
+
+- two containers inside one `LinuxPod`;
+- one VM network namespace, with Pod IP/vmnet attachment tracked as a separate
+  network gate;
+- `localhost` reachability from container B to a listener in container A;
+- per-container rootfs/process/log/status/stats;
+- sandbox VM/network lifetime survives one container stopping before another;
+- kubelet-compatible ordering is understood, especially `RunPodSandbox` before
+  `CreateContainer`.
+
+## What LinuxPod Gives Us
+
+The upstream `LinuxPod` API is explicitly marked experimental, but its shape is
+much closer to Kubernetes Pod semantics than the `apple/container` CLI path.
+
+| Need | LinuxPod surface | Feasibility |
+| --- | --- | --- |
+| One sandbox VM for a Pod | `LinuxPod(id, vmm, configuration)` | Promising. The Pod owns the VM. |
+| Multiple containers in one Pod | `addContainer(id, rootfs, configuration)` | Promising if containers are registered before `create()`. |
+| Start independent containers | `startContainer(containerID)` | Promising. |
+| Stop independent containers | `stopContainer(containerID)` | Promising, but teardown ordering must be tested. |
+| Stop whole sandbox | `stop()` | Promising. |
+| Exec | `execInContainer(containerID, processID, configuration)` | Promising. |
+| Logs | `ContainerConfiguration.process.stdout/stderr` writers | Promising; CRI-format file writer can mirror current adapter work. |
+| Stats | `statistics(containerIDs:categories:)` | Promising for CPU/memory/process/memory-events surfaces. |
+| Shared network namespace | One VM network, tests note containers share network sysctls | Must be proven with `localhost`, not just L3 IP. |
+| Shared PID namespace | `Configuration.shareProcessNamespace` | Optional and promising for `shareProcessNamespace`; default separate PID namespace. |
+| DNS/hosts | Pod-level and per-container DNS/hosts config | Promising for kubelet-provided DNS config mapping. |
+| Shared volumes | `PodVolume` + `.sharedMount(...)` | Promising, but limited shape; Kubernetes volume coverage still needs design. |
+
+## CRI Mapping
+
+| CRI API | LinuxPod-backed mapping | Status |
+| --- | --- | --- |
+| `RunPodSandbox` | Allocate Pod ID/IP/interface, create a `LinuxPod` object, but likely do not call `pod.create()` yet unless a pause/empty VM model is required. | Open design point. Kubelet expects sandbox to exist before containers. |
+| `CreateContainer` | Pull/unpack image to per-container rootfs, then `pod.addContainer(...)`. | Feasible before `pod.create()`. Risky after `pod.create()`. |
+| `StartContainer` | If Pod VM is not created, call `pod.create()` once, then `pod.startContainer(id)`. | Feasible for all containers known before first start. |
+| `StopContainer` | `pod.stopContainer(id)` and update CRI state. | Feasible; must test owner-first / sidecar-first ordering. |
+| `RemoveContainer` | Stop if needed, remove CRI state, release per-container log/rootfs resources. | Partially feasible. LinuxPod public remove semantics need confirmation. |
+| `StopPodSandbox` | `pod.stop()` and release Pod IP/interface. | Feasible. |
+| `RemovePodSandbox` | Delete persistent state/rootfs/logs after stopped. | Feasible in MacVz layer. |
+| `ContainerStatus` | MacVz state + LinuxPod process/wait status. | Feasible with persistent state. |
+| `PodSandboxStatus` | MacVz state + Pod IP/interface + container statuses. | Feasible. |
+| `Exec` / `ExecSync` | `pod.execInContainer(...)`. | Feasible. |
+| `Attach` | Needs re-attach to an already-running primary process. | Blocked upstream; return honest `Unimplemented` initially. |
+| `PortForward` | Needs host-to-pod network namespace dial. | Blocked upstream; `exec socat` workaround is possible but fragile. |
+| `ContainerStats` | `pod.statistics(containerIDs:categories:)`. | Feasible for CPU/memory first. |
+| `PodSandboxStats` | Aggregate per-container stats plus Pod-level accounting where available. | Partially feasible. |
+
+## Main Blockers
+
+| Blocker | Impact | Current answer |
+| --- | --- | --- |
+| Post-create `addContainer` hotplug | Kubelet may create/start one container before later containers are known; sidecars/restarts can need late adds. | Treat as a hard risk. Do not depend on live hotplug until a PoC proves it. |
+| `Attach` missing | `kubectl attach` cannot be implemented honestly. | Return `Unimplemented` with a clear diagnostic for the experimental path. |
+| `PortForward` missing | `kubectl port-forward` requires on-demand dial into Pod netns. | Return `Unimplemented` initially unless a safe helper is built. |
+| Recovery/orphan cleanup | CRI runtime restart must rediscover live Pod VMs/containers. | Needs explicit state model; not solved by LinuxPod alone. |
+| Service/DNS/CNI behavior | LinuxPod provides VM networking, not a full Kubernetes network data plane. | Reuse MacVz network lessons; keep k3s in-loop soak as a later gate. |
+| API stability | LinuxPod is experimental and upstream issues are still active. | Acceptable only behind an experimental backend flag. |
+
+## Lessons From `krust-cri`
+
+`vanchonlee/krust-cri` is the closest public reference found. It exposes the
+Kubernetes `runtime.v1` CRI API on macOS and drives Apple Containerization
+`LinuxPod` underneath. Its smoke path runs k3s/kubelet in a LinuxPod with the
+host CRI socket relayed into the guest, then verifies Pod creation and same-node
+Pod-to-Pod TCP.
+
+The useful lessons for MacVz are:
+
+- A Swift LinuxPod helper/daemon is a credible bridge shape.
+- k3s can be used as a real in-loop smoke client, not just `crictl`.
+- Logs, restart status, and stats can be implemented over LinuxPod.
+- DNS, Service networking, port mappings, multi-node routing, recovery, GC,
+  volumes, security context, and RuntimeClass remain substantial work.
+- The reference avoids relying on live post-create hotplug as the MVP path. If a
+  container is added after the Pod is already created, it stops/recreates the Pod
+  instead of pretending hotplug is solved.
+
+That last point is important: a MacVz PoC must decide whether it can preserve
+kubelet semantics without post-create hotplug. Recreating a Pod may be acceptable
+for a local smoke test, but it is not an honest general CRI implementation unless
+the lifecycle and event semantics are explicit.
+
+## Bridge Options
+
+| Option | Shape | Cost | Recommendation |
+| --- | --- | --- | --- |
+| Swift PoC CLI | Standalone Swift tool creates one LinuxPod and runs scripted checks. | Small | Do first. It proves semantics without Go/CRI complexity. |
+| Swift helper daemon | Local Unix socket JSON-RPC or gRPC: Go `macvz-cri` calls Swift, Swift owns LinuxPod objects. | Medium | Best next bridge if PoC passes. |
+| Direct Swift integration | Rewrite runtime-facing pieces in Swift or deeply embed Swift into Go build. | Medium/high | Avoid for now; packaging and build complexity arrive too early. |
+| containerd Runtime v2 shim | kubelet -> containerd -> MacVz shim -> LinuxPod. | High | Good long-term shape, not first validation. |
+| MacVz-owned VM runtime | Own VMM, guest agent, hotplug, image/rootfs, network, lifecycle. | Very high | Fallback only if LinuxPod cannot satisfy Pod semantics. |
+
+## Phase Plan
+
+### C1: Minimal LinuxPod Two-Container PoC
+
+Build a small Swift PoC outside kubelet/CRI.
+
+Implementation entrypoint:
+
+```sh
+make cri-linuxpod-poc                  # plan-only
+MACVZ_LINUXPOD_POC=1 make cri-linuxpod-poc  # live run
+```
+
+Harness: `test/e2e/cri-linuxpod/`
+
+Report: `docs/CRI_LINUXPOD_POC_REPORT.md`
+
+Acceptance:
+
+- creates a `LinuxPod` with two containers registered before `create()`;
+- starts both containers;
+- container A listens on `127.0.0.1:<port>`;
+- container B connects to A via `localhost` and records success;
+- both containers share the same LinuxPod network namespace through loopback;
+- each container has a distinct rootfs/process identity;
+- logs/stdout capture works per container;
+- `execInContainer` works;
+- `statistics(containerIDs:)` returns CPU/memory for both containers;
+- stopping A first leaves B running and observable;
+- `pod.stop()` tears down the VM cleanly;
+- run duration and log paths are recorded.
+
+### C1 Result
+
+C1 passed on 2026-06-21 UTC using `apple/containerization` commit `6b7b42c`,
+Swift 6.2.1, `bin/vmlinux-arm64`, `vminit:latest`, and
+`docker.io/library/busybox:1.36.1`. The report is
+`docs/CRI_LINUXPOD_POC_REPORT.md`.
+
+The live run intentionally defaults to no vmnet interface. That keeps C1 focused
+on the missing multi-container Pod sandbox primitive: one `LinuxPod`, two
+containers, shared loopback reachability, per-container logs, `exec`, stats, and
+container stop-order isolation. An optional `MACVZ_LINUXPOD_VMNET=1` mode exists
+for later host-network probing, but vmnet/Pod IP attachment is not treated as
+proven by C1.
+
+Failure criteria:
+
+- `localhost` between containers fails;
+- each container needs its own VM/IP;
+- stopping one container tears down the sandbox;
+- the only working path depends on unsupported post-create hotplug;
+- logs/exec/stats cannot be exposed with public APIs.
+
+### C2: Kubelet Ordering Probe
+
+Still outside production MacVz, test the awkward CRI ordering:
+
+1. create `LinuxPod`;
+2. register container A;
+3. call `pod.create()` and start A;
+4. attempt to add/register container B after `pod.create()`;
+5. record whether public APIs can hotplug the second rootfs and start B.
+
+If this fails, document the exact fallback model:
+
+- pre-register all containers before first start, if kubelet ordering allows it
+  for the target workload class;
+- reject late sidecar/container creation honestly;
+- or rebuild the Pod only for explicitly marked experimental smoke flows.
+
+### C3: Swift Helper Daemon Prototype
+
+Only if C1 passes:
+
+- expose a small local socket API for `CreatePod`, `AddContainer`,
+  `StartContainer`, `StopContainer`, `StopPod`, `Exec`, `Stats`, and `Status`;
+- keep the protocol MacVz-owned and narrow;
+- do not implement a full CRI server in Swift;
+- keep Go `macvz-cri` as the kubelet-facing boundary.
+
+### C4: Experimental `macvz-cri --runtime-backend=linuxpod`
+
+Only if C3 is stable enough:
+
+- add a new backend behind an explicit experimental flag;
+- keep the current CLI-backed backend untouched;
+- run hermetic CRI lifecycle tests against a fake helper;
+- run gated live tests against the Swift helper.
+
+### C5: k3s In-Loop Evidence
+
+Only after the backend can run a real two-container Pod shape:
+
+- run a single-node k3s/kubelet smoke;
+- verify scheduling, Pod events, logs, exec, stats, restart behavior, and cleanup;
+- keep `Attach`/`PortForward` honest if still unsupported;
+- run longer soak only after basic semantics pass.
+
+## Recommended Next Issue
+
+Create a follow-up issue for C2:
+
+**CRI-C2: LinuxPod kubelet ordering and post-create container probe**
+
+This should stay outside the production Go CRI backend. It decides whether
+LinuxPod can support kubelet's `RunPodSandbox` before later `CreateContainer`
+ordering honestly, or whether the route-C backend needs an explicit limited
+workload model before a helper daemon is worth building.
+
+## References
+
+- `apple/containerization` `LinuxPod.swift`: experimental LinuxPod API, multiple
+  containers in one VM, shared VM resources/network, pre-create registration and
+  post-create hotplug contract.
+- `apple/containerization` `PodTests.swift`: upstream integration tests for
+  multiple/concurrent containers, exec, stats, DNS/hosts, shared PID namespace,
+  shared volumes, sysctl, and networking.
+- `apple/containerization#735`: missing re-attach primitive for CRI `Attach`.
+- `apple/containerization#736`: missing host-to-Pod network namespace dial for
+  CRI `PortForward`.
+- `apple/containerization#767`: post-create `LinuxPod.addContainer` hotplug is
+  not currently proven for public VZ-backed ext4/block rootfs consumers.
+- `vanchonlee/krust-cri`: public experimental macOS CRI runtime over
+  Apple Containerization `LinuxPod`.
+- Kata Containers and firecracker-containerd: mature references for per-Pod VM,
+  guest-agent, and multi-container Pod runtime design.

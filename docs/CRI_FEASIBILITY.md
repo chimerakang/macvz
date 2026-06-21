@@ -1051,9 +1051,15 @@ Follow-up research for #87 found a more promising route-C target:
 `apple/containerization` has an experimental `LinuxPod` API that can run multiple
 Linux containers inside one VM. That shifts the next step from "wait for
 `container` CLI support" or "start a MacVz-owned runtime first" to validating
-LinuxPod directly as the Pod sandbox backend. This neither flips CRI-P9 to
-**go** (LinuxPod still needs a real PoC, CRI gap analysis, and k3s in-loop soak)
-nor to **stop**. The CRI track stays an isolated `develop` spike.
+LinuxPod directly as the Pod sandbox backend. #87 C0 is now recorded in
+[CRI_LINUXPOD_FEASIBILITY.md](CRI_LINUXPOD_FEASIBILITY.md): the decision is **go
+to a minimal LinuxPod PoC**, with a Swift helper daemon as the likely bridge only
+if that PoC passes. #88 has now passed the first pure LinuxPod shared-namespace
+probe (two containers in one LinuxPod, localhost reachability, logs, exec, stats,
+and stop-order isolation). This still does not flip CRI-P9 to **go**: LinuxPod
+still needs kubelet ordering/post-create container validation, vmnet/Pod IP
+network proof, bridge validation, CRI gap analysis, and k3s in-loop soak. The CRI
+track stays an isolated `develop` spike.
 
 ## CRI-P9 Follow-up (#86): Unblock Honest Multi-Container Pods
 
@@ -1160,8 +1166,10 @@ container rootfs/processes, shared network" model, but it is experimental and ha
 known Kubernetes-facing gaps to verify (`Attach`, `PortForward`, post-create
 container hotplug, kubelet ordering, and real k3s/CNI behavior). This does not by
 itself flip CRI-P9 to **go**; the LinuxPod PoC, CRI gap analysis, and #85's
-real-cluster soak must still pass. The CRI track stays an isolated `develop`
-spike.
+real-cluster soak must still pass. C0 is documented in
+[CRI_LINUXPOD_FEASIBILITY.md](CRI_LINUXPOD_FEASIBILITY.md), which recommends a
+minimal two-container shared-namespace Swift PoC as the next issue. The CRI track
+stays an isolated `develop` spike.
 
 ## CRI-P9 Follow-up (#84): Host-Namespace Workloads — Honest Scheduling Exclusion
 

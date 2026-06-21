@@ -224,6 +224,105 @@ requires shared-netns semantics across micro-VMs that `apple/container` does not
 expose today; it is deferred until the single-container path is proven and the
 CRI-P5 networking story exists. The CRI route is **not** stopped.
 
+## CRI-P3: Single-Container Pod Spike
+
+CRI-P3 takes the single-container step CRI-P2 recommended: one CRI Pod sandbox
+owns exactly one `apple/container` micro-VM, driven through the existing
+`pkg/runtime/container` driver. It stays narrow on purpose — no shared Pod
+network, no shared volumes, no multi-container support — so the container
+lifecycle is proven end-to-end before any data-plane work.
+
+Implemented `RuntimeService` methods (`pkg/criserver/container.go`):
+
+- `CreateContainer` — validates the sandbox exists and is `READY`, enforces the
+  one-container-per-sandbox rule, pulls the image (the `ImageService` is out of
+  scope, so create is self-sufficient and the driver's pull verifies the arm64
+  variant), provisions the workload, and persists the record. The workload is
+  reclaimed if persistence fails, so a create leaves neither an orphan record nor
+  an orphan VM.
+- `StartContainer` — boots the workload; requires the `Created` state.
+- `StopContainer` — stops the workload, captures its exit code/reason, marks the
+  record `Exited`; idempotent for an already-exited container.
+- `RemoveContainer` — destroys the workload and deletes the record; idempotent
+  for an absent container.
+- `ContainerStatus` — returns the record (`NotFound` if absent) and reconciles it
+  against the live workload, so a container that exited on its own — or after an
+  adapter restart — is reported `EXITED` with its real exit code, not a stale
+  `RUNNING`.
+- `ListContainers` — supports the CRI filter (id, sandbox id, state, label
+  selector), replacing the CRI-P1 always-empty stub.
+
+Container state store (`pkg/criserver/store/container.go`):
+
+- One JSON file per container, written atomically, under a `containers/`
+  subdirectory of `--state-dir` (separate from sandbox records so the two stores
+  never read each other's files). An empty `--state-dir` runs in memory only.
+- Records survive an adapter restart; a corrupt record on load is skipped
+  (counted, logged), not fatal.
+
+CRI container ID vs. workload ID: CRI container IDs are generated separately
+(64-hex), and the `apple/container` workload name is derived **deterministically**
+from the container ID (`macvz-cri-<id-prefix>`, see `store.DeriveWorkloadID`). A
+restarted adapter recomputes the same workload name without extra state, and the
+derived name stays within the runtime's name-length limits.
+
+Honesty boundaries:
+
+- A **second** container in a sandbox is rejected with `FailedPrecondition`
+  naming the existing container — multi-container Pods are not silently
+  mismodeled.
+- With **no runtime configured** (the default skeleton), the container methods
+  return `FailedPrecondition` ("no container runtime is configured"), never a
+  fake success or a misleading `Unimplemented`.
+- Env var **ordering** is not preserved (CRI's ordered list is flattened into the
+  driver's `Env` map); acceptable for the single-container spike, noted for
+  CRI-P4.
+- The container has **no Pod network** — it runs on the default `apple/container`
+  network only. This is acceptable for CRI-P3 and explicitly deferred to CRI-P5.
+
+Testing: the default `go test ./...` run is hermetic — the lifecycle is exercised
+against a fake `ContainerRuntime` covering create/start/stop/remove/status/list,
+missing sandbox, duplicate/second-container create, start-from-wrong-state,
+idempotent stop/remove, status reconcile on self-exit, and restart/reload. A
+gated live test (`MACVZ_CRI_INTEGRATION=1`) drives the same path through a real
+`apple/container` service with a public arm64 image and asserts no orphan
+workload remains. With `crictl` installed the manual flow is:
+
+```sh
+make cri
+./bin/macvz-cri --listen unix:///tmp/macvz-cri.sock --state-dir /tmp/macvz-cri-state
+crictl --runtime-endpoint unix:///tmp/macvz-cri.sock runp sandbox.json
+crictl --runtime-endpoint unix:///tmp/macvz-cri.sock create <sandbox-id> container.json sandbox.json
+crictl --runtime-endpoint unix:///tmp/macvz-cri.sock start <container-id>
+crictl --runtime-endpoint unix:///tmp/macvz-cri.sock ps -a
+crictl --runtime-endpoint unix:///tmp/macvz-cri.sock inspect <container-id>
+crictl --runtime-endpoint unix:///tmp/macvz-cri.sock stop <container-id>
+crictl --runtime-endpoint unix:///tmp/macvz-cri.sock rm <container-id>
+crictl --runtime-endpoint unix:///tmp/macvz-cri.sock stopp <sandbox-id>
+crictl --runtime-endpoint unix:///tmp/macvz-cri.sock rmp <sandbox-id>
+```
+
+### CRI-P3 Decision
+
+The single-container path is **proven and honest**. One CRI sandbox mapping to
+one `apple/container` micro-VM satisfies the create/start/stop/remove/status/list
+contract, restart tolerance, and the container-ID-to-workload-ID mapping without
+faking any capability. The container-to-sandbox topology question CRI-P2 raised
+is resolved for the single-container case; multi-container Pods remain explicitly
+rejected.
+
+Carry into **CRI-P4/P5**:
+
+- **CRI-P4** should wire a minimal `ImageService` (`PullImage`/`ImageStatus`/
+  `ListImages`/`RemoveImage`) so image lifecycle is driven by the CRI client
+  rather than implicitly by `CreateContainer`, and preserve env ordering. It is
+  also the right phase to attempt a real kubelet/k3s node join against this
+  adapter.
+- **CRI-P5** owns Pod networking: a Pod IP, CNI ADD/DEL (or the MacVz podNetwork
+  equivalent), and `PodSandboxStatus.Network`. Only once that exists does the
+  **pause-like sandbox VM plus workload VMs** model for honest multi-container
+  Pods become tractable. The CRI route remains **not** stopped.
+
 ## Reproducible Probe
 
 Run:

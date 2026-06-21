@@ -93,13 +93,24 @@ func TestEmptyLists(t *testing.T) {
 
 // TestUnimplementedMethodReturnsCode verifies the embedded Unimplemented servers
 // answer un-overridden methods with codes.Unimplemented rather than panicking.
-// CreateContainer is out of scope for this phase, so it must still report
-// Unimplemented — the spike never fakes success for a capability it lacks.
+// UpdateContainerResources is out of scope for this phase, so it must still
+// report Unimplemented — the spike never fakes success for a capability it lacks.
 func TestUnimplementedMethodReturnsCode(t *testing.T) {
 	s := New(Options{})
-	_, err := s.CreateContainer(context.Background(), &runtimeapi.CreateContainerRequest{})
+	_, err := s.UpdateContainerResources(context.Background(), &runtimeapi.UpdateContainerResourcesRequest{})
 	if status.Code(err) != codes.Unimplemented {
-		t.Errorf("CreateContainer code = %v, want Unimplemented", status.Code(err))
+		t.Errorf("UpdateContainerResources code = %v, want Unimplemented", status.Code(err))
+	}
+}
+
+// TestContainerMethodsRequireRuntime verifies the container surface is honest
+// without a backend: CreateContainer reports FailedPrecondition (the method is
+// implemented but cannot act) rather than Unimplemented or a fake success.
+func TestContainerMethodsRequireRuntime(t *testing.T) {
+	s := New(Options{})
+	_, err := s.CreateContainer(context.Background(), &runtimeapi.CreateContainerRequest{PodSandboxId: "x"})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("CreateContainer without runtime: code = %v, want FailedPrecondition", status.Code(err))
 	}
 }
 

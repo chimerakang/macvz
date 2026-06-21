@@ -1,9 +1,11 @@
 // Command macvz-cri runs an experimental, minimal Kubernetes CRI server for the
-// MacVz CRI feasibility track (docs/CRI_FEASIBILITY.md, CRI-P1).
+// MacVz CRI feasibility track (docs/CRI_FEASIBILITY.md, CRI-P1..P3).
 //
 // It listens on a Unix socket and serves the CRI RuntimeService/ImageService so
-// kubelet or crictl can connect and run `version`/`info`-style checks. It does
-// NOT run Pods, pull images, or drive apple/container — see pkg/criserver.
+// kubelet or crictl can connect, run the sandbox lifecycle, and drive a single
+// container per Pod sandbox as an apple/container micro-VM (CRI-P3). It stays
+// narrow: one container per sandbox, no shared Pod network, no shared volumes —
+// see pkg/criserver.
 //
 // This command is intentionally separate from cmd/macvz-kubelet (the shipped
 // Virtual Kubelet provider) and is not the default MacVz runtime mode.
@@ -25,6 +27,7 @@ import (
 	"github.com/chimerakang/macvz/internal/version"
 	"github.com/chimerakang/macvz/pkg/criserver"
 	"github.com/chimerakang/macvz/pkg/criserver/store"
+	"github.com/chimerakang/macvz/pkg/runtime/container"
 	"google.golang.org/grpc"
 	"k8s.io/klog/v2"
 )
@@ -34,14 +37,20 @@ const defaultListen = "unix:///tmp/macvz-cri.sock"
 
 func main() {
 	var (
-		listen      string
-		stateDir    string
-		showVersion bool
+		listen        string
+		stateDir      string
+		runtimeBinary string
+		rosetta       bool
+		showVersion   bool
 	)
 	flag.StringVar(&listen, "listen", defaultListen,
 		"CRI gRPC endpoint to serve (unix:///path/to.sock or an absolute socket path)")
 	flag.StringVar(&stateDir, "state-dir", defaultStateDir(),
-		"directory for restart-tolerant Pod sandbox state (empty = in-memory only)")
+		"directory for restart-tolerant Pod sandbox and container state (empty = in-memory only)")
+	flag.StringVar(&runtimeBinary, "runtime-binary", "",
+		"apple/container CLI to drive container workloads (empty resolves \"container\" via PATH)")
+	flag.BoolVar(&rosetta, "rosetta", false,
+		"allow booting linux/amd64 images via Rosetta-for-Linux translation")
 	flag.BoolVar(&showVersion, "version", false, "print version and exit")
 
 	klog.InitFlags(nil)
@@ -55,7 +64,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	if err := run(ctx, listen, stateDir); err != nil {
+	if err := run(ctx, listen, stateDir, runtimeBinary, rosetta); err != nil {
 		klog.ErrorS(err, "macvz-cri exited with error")
 		klog.Flush()
 		os.Exit(1)
@@ -63,7 +72,7 @@ func main() {
 	klog.Flush()
 }
 
-func run(ctx context.Context, listen, stateDir string) error {
+func run(ctx context.Context, listen, stateDir, runtimeBinary string, rosetta bool) error {
 	socketPath, err := socketPath(listen)
 	if err != nil {
 		return err
@@ -75,6 +84,20 @@ func run(ctx context.Context, listen, stateDir string) error {
 	}
 	if skipped > 0 {
 		klog.InfoS("skipped unparseable sandbox records on load", "count", skipped, "stateDir", stateDir)
+	}
+
+	// Container records live in a sibling directory so the two stores never read
+	// each other's files. An empty stateDir keeps both in-memory.
+	containerDir := stateDir
+	if containerDir != "" {
+		containerDir = filepath.Join(stateDir, "containers")
+	}
+	containers, cSkipped, err := store.NewContainerStore(containerDir)
+	if err != nil {
+		return fmt.Errorf("open container store: %w", err)
+	}
+	if cSkipped > 0 {
+		klog.InfoS("skipped unparseable container records on load", "count", cSkipped, "stateDir", containerDir)
 	}
 
 	// Remove only a confirmed stale Unix socket. If another CRI server is alive
@@ -91,10 +114,14 @@ func run(ctx context.Context, listen, stateDir string) error {
 	// Best-effort cleanup so we do not leave a dangling socket behind.
 	defer func() { _ = os.Remove(socketPath) }()
 
+	driver := container.New(container.Config{Binary: runtimeBinary, Rosetta: rosetta})
+
 	grpcServer := grpc.NewServer()
 	srv := criserver.New(criserver.Options{
 		RuntimeVersion: version.Version,
 		Sandboxes:      sandboxes,
+		Containers:     containers,
+		Runtime:        driver,
 	})
 	srv.Register(grpcServer)
 
@@ -102,7 +129,8 @@ func run(ctx context.Context, listen, stateDir string) error {
 		"version", version.Version,
 		"socket", socketPath,
 		"stateDir", stateDir,
-		"note", "CRI feasibility spike (docs/CRI_FEASIBILITY.md); state-only Pod sandboxes, not the default MacVz runtime",
+		"rosetta", rosetta,
+		"note", "CRI feasibility spike (docs/CRI_FEASIBILITY.md); single-container Pods over apple/container, not the default MacVz runtime",
 	)
 
 	// Stop the gRPC server when the context is cancelled (SIGINT/SIGTERM).

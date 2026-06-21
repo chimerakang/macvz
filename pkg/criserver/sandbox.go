@@ -67,13 +67,19 @@ func (s *Server) RunPodSandbox(_ context.Context, req *runtimeapi.RunPodSandboxR
 	return &runtimeapi.RunPodSandboxResponse{PodSandboxId: id}, nil
 }
 
-// StopPodSandbox transitions a sandbox to NotReady. It is idempotent: stopping
-// an already-stopped or absent sandbox succeeds, since the state-only model has
-// no resources left to reclaim either way. kubelet relies on this idempotency —
-// it may call StopPodSandbox many times before RemovePodSandbox.
-func (s *Server) StopPodSandbox(_ context.Context, req *runtimeapi.StopPodSandboxRequest) (*runtimeapi.StopPodSandboxResponse, error) {
+// StopPodSandbox stops any containers owned by the sandbox, then transitions the
+// sandbox to NotReady. It is idempotent: stopping an already-stopped or absent
+// sandbox succeeds. kubelet relies on this idempotency — it may call
+// StopPodSandbox many times before RemovePodSandbox.
+func (s *Server) StopPodSandbox(ctx context.Context, req *runtimeapi.StopPodSandboxRequest) (*runtimeapi.StopPodSandboxResponse, error) {
 	if req.GetPodSandboxId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "StopPodSandbox: pod sandbox id is required")
+	}
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+
+	if err := s.stopSandboxContainers(ctx, req.GetPodSandboxId(), "StopPodSandbox"); err != nil {
+		return nil, err
 	}
 	if _, err := s.sandboxes.SetState(req.GetPodSandboxId(), store.StateNotReady); err != nil {
 		return nil, status.Errorf(codes.Internal, "StopPodSandbox: %v", err)
@@ -81,11 +87,18 @@ func (s *Server) StopPodSandbox(_ context.Context, req *runtimeapi.StopPodSandbo
 	return &runtimeapi.StopPodSandboxResponse{}, nil
 }
 
-// RemovePodSandbox deletes a sandbox record. It is idempotent: removing an absent
-// sandbox succeeds, matching the CRI contract.
-func (s *Server) RemovePodSandbox(_ context.Context, req *runtimeapi.RemovePodSandboxRequest) (*runtimeapi.RemovePodSandboxResponse, error) {
+// RemovePodSandbox destroys and removes containers owned by the sandbox, then
+// deletes the sandbox record. It is idempotent: removing an absent sandbox
+// succeeds, matching the CRI contract.
+func (s *Server) RemovePodSandbox(ctx context.Context, req *runtimeapi.RemovePodSandboxRequest) (*runtimeapi.RemovePodSandboxResponse, error) {
 	if req.GetPodSandboxId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "RemovePodSandbox: pod sandbox id is required")
+	}
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+
+	if err := s.removeSandboxContainers(ctx, req.GetPodSandboxId(), "RemovePodSandbox"); err != nil {
+		return nil, err
 	}
 	if err := s.sandboxes.Delete(req.GetPodSandboxId()); err != nil {
 		return nil, status.Errorf(codes.Internal, "RemovePodSandbox: %v", err)

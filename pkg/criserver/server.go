@@ -3,13 +3,18 @@
 //
 // CRI-P1 proved the CRI server process, gRPC wiring, and basic
 // RuntimeService/ImageService handshake (Version/Status/empty lists). CRI-P2
-// (this iteration) adds a state-only Pod sandbox lifecycle — RunPodSandbox,
-// StopPodSandbox, RemovePodSandbox, PodSandboxStatus, ListPodSandbox — backed by
-// the restart-tolerant store in pkg/criserver/store (see sandbox.go).
+// added a state-only Pod sandbox lifecycle — RunPodSandbox, StopPodSandbox,
+// RemovePodSandbox, PodSandboxStatus, ListPodSandbox (see sandbox.go). CRI-P3
+// adds a single-container Pod lifecycle — CreateContainer, StartContainer,
+// StopContainer, RemoveContainer, ContainerStatus, ListContainers — that drives
+// one apple/container micro-VM per sandbox (see container.go). Both lifecycles
+// are backed by the restart-tolerant stores in pkg/criserver/store.
 //
-// It still does NOT run containers, pull images, or drive apple/container: a
-// sandbox here is a metadata record with a lifecycle, not a micro-VM, and every
-// unmodelled CRI method returns codes.Unimplemented rather than a fake success.
+// The scope stays narrow: one container per sandbox, no shared Pod network, no
+// shared volumes, and no multi-container support (a second container is rejected
+// with an explicit error). Every CRI method this phase does not model returns
+// codes.Unimplemented, and the container surface returns FailedPrecondition when
+// no runtime is wired — never a fake success.
 //
 // This path is intentionally separate from the shipped Virtual Kubelet provider
 // (cmd/macvz-kubelet) and is not the default MacVz runtime mode.
@@ -17,6 +22,7 @@ package criserver
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"github.com/chimerakang/macvz/pkg/criserver/store"
@@ -45,7 +51,15 @@ type Options struct {
 	// and tests, but the long-running adapter passes a disk-backed store so the
 	// kubelet's sandbox view survives an adapter restart.
 	Sandboxes *store.Store
-	// Now overrides the clock for sandbox CreatedAt timestamps in tests. Nil uses
+	// Containers is the state store backing the container lifecycle (#75). Nil
+	// installs an in-memory, non-persistent store, matching Sandboxes.
+	Containers *store.ContainerStore
+	// Runtime drives the apple/container workload lifecycle behind the CRI
+	// container methods (#75). Nil leaves the container surface implemented but
+	// inert: each method returns FailedPrecondition rather than faking success, so
+	// the default skeleton still serves sandbox-only flows honestly.
+	Runtime ContainerRuntime
+	// Now overrides the clock for CreatedAt timestamps in tests. Nil uses
 	// time.Now.
 	Now func() time.Time
 }
@@ -59,10 +73,13 @@ type Server struct {
 	runtimeapi.UnimplementedRuntimeServiceServer
 	runtimeapi.UnimplementedImageServiceServer
 
-	runtimeName    string
-	runtimeVersion string
-	sandboxes      *store.Store
-	now            func() time.Time
+	runtimeName      string
+	runtimeVersion   string
+	sandboxes        *store.Store
+	containers       *store.ContainerStore
+	containerRuntime ContainerRuntime
+	lifecycleMu      sync.Mutex
+	now              func() time.Time
 }
 
 // New builds a CRI skeleton server with the given options.
@@ -81,15 +98,21 @@ func New(opts Options) *Server {
 		// signature is preserved.
 		sandboxes, _, _ = store.New("")
 	}
+	containers := opts.Containers
+	if containers == nil {
+		containers, _, _ = store.NewContainerStore("")
+	}
 	now := opts.Now
 	if now == nil {
 		now = time.Now
 	}
 	return &Server{
-		runtimeName:    name,
-		runtimeVersion: version,
-		sandboxes:      sandboxes,
-		now:            now,
+		runtimeName:      name,
+		runtimeVersion:   version,
+		sandboxes:        sandboxes,
+		containers:       containers,
+		containerRuntime: opts.Runtime,
+		now:              now,
 	}
 }
 
@@ -143,11 +166,6 @@ func (s *Server) Status(_ context.Context, req *runtimeapi.StatusRequest) (*runt
 		}
 	}
 	return resp, nil
-}
-
-// ListContainers returns an empty list. The skeleton owns no containers.
-func (s *Server) ListContainers(_ context.Context, _ *runtimeapi.ListContainersRequest) (*runtimeapi.ListContainersResponse, error) {
-	return &runtimeapi.ListContainersResponse{Containers: nil}, nil
 }
 
 // ListImages returns an empty list. The skeleton manages no images.

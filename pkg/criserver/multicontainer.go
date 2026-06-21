@@ -58,11 +58,16 @@ const missingSharedNetnsPrimitive = "apple/container exposes no shared network n
 // second live container.
 type SharedPodNetworkRuntime interface {
 	// SupportsSharedPodNetwork reports whether the runtime can join a new
-	// container to an existing sandbox VM's network namespace. When false, the
-	// returned string names the missing primitive for diagnostics.
+	// container to an existing sandbox VM's network namespace. Support also means
+	// the sandbox namespace lifetime is not tied to one ordinary workload
+	// container: stopping/removing the first container must not implicitly destroy
+	// the shared namespace while another joined container is still live. When
+	// false, the returned string names the missing primitive for diagnostics.
 	SupportsSharedPodNetwork() (bool, string)
 	// CreateInPodSandbox creates spec as an additional container inside the sandbox
 	// VM identified by sandboxWorkloadID, sharing that VM's Pod network namespace.
+	// The returned workload id must be addressable by the normal Start/Stop/Destroy,
+	// Logs, Exec, Status, and Stats methods.
 	CreateInPodSandbox(ctx context.Context, sandboxWorkloadID string, spec types.ContainerSpec) (id string, err error)
 }
 

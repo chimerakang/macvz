@@ -165,8 +165,10 @@ After these fixes the compatibility suite and the soak both pass live.
 - A multi-day run and a real Linux kubelet/k3s control plane in the loop remain
   outstanding (tracked in `docs/CRI_FEASIBILITY.md` CRI-P9). The harness supports
   the longer run unchanged via `MACVZ_SOAK_ITERATIONS`.
-- The two architectural route-two blockers are unaffected by this run:
-  multi-container Pods (#82) and host-namespace workloads (#84).
+- The remaining architectural route-two blockers are tracked outside this run:
+  multi-container Pods (#82) remain blocked on shared-netns support, while
+  host-namespace workloads are handled separately by #84's honest
+  scheduling-exclusion design.
 
 ## Cleanup
 
@@ -175,4 +177,6 @@ After these fixes the compatibility suite and the soak both pass live.
 - The compatibility suite asserts no stale socket, container, or sandbox after
   teardown (PASS).
 - `MACVZ_CRI_KEEP=1` preserved per-run diagnostics under the output dirs for this
-  report; no `apple/container` workloads were left behind.
+  report. A post-review host audit found two stale `macvz-cri-*` debug workloads
+  from earlier kept runs; both were stopped/removed before accepting #83, and the
+  final `container list --all` audit showed no `macvz-cri-*` workloads.

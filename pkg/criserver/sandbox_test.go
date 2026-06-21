@@ -2,6 +2,7 @@ package criserver
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/chimerakang/macvz/pkg/criserver/store"
@@ -142,6 +143,36 @@ func TestRunPodSandboxRejectsDuplicatePodKey(t *testing.T) {
 	}
 	if len(list.GetItems()) != 1 || list.GetItems()[0].GetId() != first {
 		t.Fatalf("duplicate RunPodSandbox changed sandbox list: %+v", list.GetItems())
+	}
+}
+
+func TestRunPodSandboxRejectsHostNamespaceWithSchedulingHint(t *testing.T) {
+	s := New(Options{})
+	ctx := context.Background()
+	req := runReq("kube-system", "cni-agent", "uid-cni")
+	req.Config.Linux = &runtimeapi.LinuxPodSandboxConfig{
+		SecurityContext: &runtimeapi.LinuxSandboxSecurityContext{
+			NamespaceOptions: &runtimeapi.NamespaceOption{
+				Network: runtimeapi.NamespaceMode_NODE,
+			},
+		},
+	}
+	_, err := s.RunPodSandbox(ctx, req)
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("host-namespace RunPodSandbox code = %v, want InvalidArgument", status.Code(err))
+	}
+	// The rejection must name the offending field AND point at the honest
+	// scheduling-exclusion scheme (#84) so the failure is actionable, not opaque.
+	msg := status.Convert(err).Message()
+	for _, want := range []string{"hostNetwork", NodeTaint(), NodeHostNamespaceLabel} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("rejection %q does not mention %q", msg, want)
+		}
+	}
+	// Nothing should be left reserved after a rejected sandbox.
+	list, _ := s.ListPodSandbox(ctx, &runtimeapi.ListPodSandboxRequest{})
+	if len(list.GetItems()) != 0 {
+		t.Errorf("rejected host-namespace sandbox left %d items", len(list.GetItems()))
 	}
 }
 

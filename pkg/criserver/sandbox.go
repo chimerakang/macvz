@@ -26,8 +26,11 @@ import (
 // to map the sandbox ID back to its Kubernetes Pod namespace/name/UID.
 func (s *Server) RunPodSandbox(_ context.Context, req *runtimeapi.RunPodSandboxRequest) (*runtimeapi.RunPodSandboxResponse, error) {
 	cfg := req.GetConfig()
+	if cfg == nil {
+		return nil, status.Error(codes.InvalidArgument, "RunPodSandbox: config and metadata are required")
+	}
 	md := cfg.GetMetadata()
-	if cfg == nil || md == nil {
+	if md == nil {
 		return nil, status.Error(codes.InvalidArgument, "RunPodSandbox: config and metadata are required")
 	}
 	if md.GetName() == "" || md.GetNamespace() == "" || md.GetUid() == "" {
@@ -38,8 +41,8 @@ func (s *Server) RunPodSandbox(_ context.Context, req *runtimeapi.RunPodSandboxR
 	// than a Pod that boots while silently ignoring its host-sharing request.
 	if reason, bad := unsupportedSandboxShape(cfg); bad {
 		return nil, status.Errorf(codes.InvalidArgument,
-			"RunPodSandbox: Pod %s/%s uses a shape the experimental CRI adapter cannot honor: %s",
-			md.GetNamespace(), md.GetName(), reason)
+			"RunPodSandbox: Pod %s/%s uses a shape the experimental CRI adapter cannot honor: %s; %s",
+			md.GetNamespace(), md.GetName(), reason, hostNamespaceSchedulingHint())
 	}
 
 	id, err := store.NewID()

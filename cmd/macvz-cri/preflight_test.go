@@ -6,6 +6,8 @@ import (
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/chimerakang/macvz/pkg/criserver"
 )
 
 // okProbes returns a probe set where every host interaction succeeds, so a test
@@ -40,6 +42,25 @@ func TestPreflightChecksAllOK(t *testing.T) {
 	}
 	if r := statusFor(results, "apple/container CLI"); r.Status != checkOK {
 		t.Errorf("runtime binary check = %s (%s)", r.Status, r.Detail)
+	}
+}
+
+func TestPreflightNodeRegistrationAdvisory(t *testing.T) {
+	results := preflightChecks(preflightConfig{stateDir: "/tmp/s"}, okProbes())
+	r := statusFor(results, "host-namespace scheduling")
+	if r.Status != checkOK {
+		t.Fatalf("node registration advisory status = %s, want OK", r.Status)
+	}
+	for _, want := range []string{
+		criserver.NodeTaint(),
+		strings.Join(criserver.NodeLabels(), ","),
+		"--register-with-taints",
+		"--node-labels",
+		"tolerate",
+	} {
+		if !strings.Contains(r.Detail, want) {
+			t.Errorf("advisory %q does not mention %q", r.Detail, want)
+		}
 	}
 }
 
@@ -114,7 +135,9 @@ func TestPreflightPodNetwork(t *testing.T) {
 		{
 			name: "helper missing fails",
 			pn:   podNetConfig{podCIDR: "10.0.0.0/24", iface: "bridge100", helperSocket: "/var/run/macvz-netd.sock"},
-			mut:  func(p *preflightProbes) { p.stat = func(string) (os.FileInfo, error) { return nil, fmt.Errorf("no such file") } },
+			mut: func(p *preflightProbes) {
+				p.stat = func(string) (os.FileInfo, error) { return nil, fmt.Errorf("no such file") }
+			},
 			want: checkFail,
 		},
 	}

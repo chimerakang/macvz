@@ -75,8 +75,11 @@ func (s *Server) CreateContainer(ctx context.Context, req *runtimeapi.CreateCont
 		return nil, status.Error(codes.InvalidArgument, "CreateContainer: pod sandbox id is required")
 	}
 	cfg := req.GetConfig()
+	if cfg == nil {
+		return nil, status.Error(codes.InvalidArgument, "CreateContainer: config and metadata name are required")
+	}
 	md := cfg.GetMetadata()
-	if cfg == nil || md == nil || md.GetName() == "" {
+	if md == nil || md.GetName() == "" {
 		return nil, status.Error(codes.InvalidArgument, "CreateContainer: config and metadata name are required")
 	}
 	image := cfg.GetImage().GetImage()
@@ -101,20 +104,30 @@ func (s *Server) CreateContainer(ctx context.Context, req *runtimeapi.CreateCont
 	// the dead container first, yet tolerating a lingering Exited record here makes
 	// the restart path robust: only a still-live (Created/Running) container blocks a
 	// new one, so restartPolicy behavior is honest rather than wedged.
+	//
+	// When the experimental multi-container probe (#86) admits an additional
+	// container, it must join the sandbox-owning VM — the live container that owns
+	// the Pod network (SharesPodNetwork == false) — so all containers share one Pod
+	// IP and localhost namespace. We therefore target the owner's workload, not an
+	// arbitrary sidecar.
 	for _, existing := range s.containers.ListBySandbox(sandboxID) {
-		if existing.State != store.ContainerExited {
-			// A live container already owns this sandbox. By default this is the
-			// honest one-container-per-Pod rejection; the experimental #82 probe
-			// turns it into a capability statement naming the missing
-			// apple/container primitive. See admitAdditionalContainer.
-			rt, sandboxWorkloadID, err := s.admitAdditionalContainer(sandboxID, existing)
-			if err != nil {
-				return nil, err
-			}
-			if joinRuntime == nil {
-				joinRuntime = rt
-				joinSandboxWorkloadID = sandboxWorkloadID
-			}
+		if existing.State == store.ContainerExited {
+			continue
+		}
+		// A live container already owns this sandbox. By default this is the
+		// honest one-container-per-Pod rejection; the experimental #82/#86 probe
+		// turns it into either a capability statement naming the missing
+		// apple/container primitive or, against a runtime that implements the
+		// join capability, an admitted pause-VM join. See admitAdditionalContainer.
+		rt, sandboxWorkloadID, err := s.admitAdditionalContainer(sandboxID, existing)
+		if err != nil {
+			return nil, err
+		}
+		joinRuntime = rt
+		// Prefer the sandbox owner's workload as the join target; fall back to any
+		// live container's workload if the owner is not found (defensive).
+		if joinSandboxWorkloadID == "" || !existing.SharesPodNetwork {
+			joinSandboxWorkloadID = sandboxWorkloadID
 		}
 	}
 
@@ -141,8 +154,11 @@ func (s *Server) CreateContainer(ctx context.Context, req *runtimeapi.CreateCont
 		Annotations: cfg.GetAnnotations(),
 		LogPath:     cfg.GetLogPath(),
 		Mounts:      recMounts,
-		State:       store.ContainerCreated,
-		CreatedAt:   s.now().UnixNano(),
+		// A joined container (#86) shares the sandbox owner's Pod IP; the owner and
+		// every single-container Pod own their own network path.
+		SharesPodNetwork: joinRuntime != nil,
+		State:            store.ContainerCreated,
+		CreatedAt:        s.now().UnixNano(),
 	}
 	c.Metadata.Name = md.GetName()
 	c.Metadata.Attempt = md.GetAttempt()
@@ -240,7 +256,15 @@ func (s *Server) StartContainer(ctx context.Context, req *runtimeapi.StartContai
 	// left Running behind an unreachable Pod IP.
 	sb, sbOK := s.sandboxes.Get(c.SandboxID)
 	if s.networkEnabled() {
-		if sbOK && sb.Network.PodIP != "" {
+		switch {
+		case c.SharesPodNetwork:
+			// A joined container (#86) shares the sandbox owner's single Pod IP; the
+			// owner already attached the path on its own start. Attaching again — or
+			// allocating a second IP — would violate the one-Pod-IP contract, so the
+			// joined container's start does no networking.
+			klog.V(4).InfoS("CRI StartContainer: joined container shares the sandbox Pod network",
+				"containerID", id, "sandboxID", c.SandboxID)
+		case sbOK && sb.Network.PodIP != "":
 			if err := s.attachSandboxNetwork(ctx, &sb, c.WorkloadID); err != nil {
 				s.unwindContainerStart(ctx, &c)
 				return nil, err
@@ -331,7 +355,7 @@ func (s *Server) ContainerStatus(ctx context.Context, req *runtimeapi.ContainerS
 		if err := s.containers.Put(&reconciled); err == nil {
 			c = reconciled
 			if c.State == store.ContainerExited {
-				if err := s.detachContainerNetwork(ctx, c.SandboxID, "ContainerStatus"); err != nil {
+				if err := s.detachContainerNetwork(ctx, c.SandboxID, c.ID, "ContainerStatus"); err != nil {
 					return nil, err
 				}
 			}
@@ -444,7 +468,7 @@ func (s *Server) stopContainerRecord(ctx context.Context, c store.Container, tim
 	// and deterministically. It is a no-op when no pump is running.
 	s.stopLogPump(c.ID)
 	if c.State == store.ContainerExited {
-		return s.detachContainerNetwork(ctx, c.SandboxID, method)
+		return s.detachContainerNetwork(ctx, c.SandboxID, c.ID, method)
 	}
 	if s.containerRuntime == nil {
 		return errRuntimeNotConfigured(method)
@@ -471,7 +495,7 @@ func (s *Server) stopContainerRecord(ctx context.Context, c store.Container, tim
 	if err := s.containers.Put(&c); err != nil {
 		return status.Errorf(codes.Internal, "%s: persist container %q: %v", method, c.ID, err)
 	}
-	if err := s.detachContainerNetwork(ctx, c.SandboxID, method); err != nil {
+	if err := s.detachContainerNetwork(ctx, c.SandboxID, c.ID, method); err != nil {
 		return err
 	}
 	return nil
@@ -484,7 +508,7 @@ func (s *Server) removeContainerRecord(ctx context.Context, c store.Container, m
 	if err := s.containerRuntime.Destroy(ctx, c.WorkloadID); err != nil && !errors.Is(err, runtime.ErrNotFound) {
 		return runtimeError(method, "destroy workload", err)
 	}
-	if err := s.detachContainerNetwork(ctx, c.SandboxID, method); err != nil {
+	if err := s.detachContainerNetwork(ctx, c.SandboxID, c.ID, method); err != nil {
 		return err
 	}
 	if err := s.containers.Delete(c.ID); err != nil {
@@ -493,9 +517,22 @@ func (s *Server) removeContainerRecord(ctx context.Context, c store.Container, m
 	return nil
 }
 
-func (s *Server) detachContainerNetwork(ctx context.Context, sandboxID string, method string) error {
+func (s *Server) detachContainerNetwork(ctx context.Context, sandboxID, selfID, method string) error {
 	if !s.networkEnabled() {
 		return nil
+	}
+	// Multi-container Pods (#86) share one Pod IP attached to the sandbox VM. Keep
+	// the Pod network up while any other container in the sandbox is still live;
+	// only the last container draining tears it down. StopPodSandbox/RemovePodSandbox
+	// detach wholesale (idempotently) after stopping every container, so the Pod IP
+	// is always released on sandbox teardown regardless of per-container order.
+	for _, other := range s.containers.ListBySandbox(sandboxID) {
+		if other.ID == selfID {
+			continue
+		}
+		if other.State != store.ContainerExited {
+			return nil
+		}
 	}
 	if err := s.detachSandboxNetwork(ctx, sandboxID); err != nil {
 		st, ok := status.FromError(err)

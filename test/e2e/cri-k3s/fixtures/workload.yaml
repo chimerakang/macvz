@@ -1,0 +1,136 @@
+# CRI-P9 follow-up (#85) in-loop fixture.
+#
+# A single-container, non-host-namespace workload that exercises only the CRI
+# surfaces the experimental macvz-cri adapter supports, scheduled by a real
+# Linux k3s/kubelet control plane onto the macOS MacVz CRI node.
+#
+# It is deliberately the *supported* workload class:
+#   - exactly one container (multi-container is blocked by #82)
+#   - no host namespaces (rejected by #84; this Pod uses the default Pod netns)
+#   - projected ConfigMap + Secret data (read-only mounts)
+#   - an HTTP readiness probe the kubelet drives
+#   - a ClusterIP Service for in-cluster reachability
+#
+# The node selection/toleration is the #84 honest scheduling-exclusion scheme:
+# the MacVz node is registered with taint
+# `node.macvz.io/host-namespace-unsupported=true:NoSchedule` (which repels
+# ordinary Pods) and labels `node.macvz.io/runtime=apple-container` /
+# `node.macvz.io/host-namespace=unsupported`. A workload that is intentionally
+# MacVz-compatible must therefore both *select* the runtime label and *tolerate*
+# the taint. Keys mirror pkg/criserver/nodescheme.go — keep them in lockstep.
+#
+# Image: an arm64 busybox providing sh + httpd + wget. Override the default by
+# editing the two `image:` fields below, or let k3s-inloop.sh substitute
+# MACVZ_CRI_IMAGE at apply time.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: macvz-cri-e2e
+  labels:
+    app.kubernetes.io/part-of: macvz-cri-inloop
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+  namespace: macvz-cri-e2e
+data:
+  # Served as the HTTP index so `kubectl port-forward` + curl and the Service
+  # probe both observe this marker, proving the projected ConfigMap was bound.
+  index.html: |
+    macvz-cri-p9-inloop-ok
+  app.conf: |
+    role=inloop-fixture
+    marker=macvz-cri-p9-inloop-ok
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: app-secret
+  namespace: macvz-cri-e2e
+type: Opaque
+stringData:
+  # Proves a projected Secret is mounted read-only alongside the ConfigMap. The
+  # exec check reads this back to confirm the mount.
+  token: macvz-cri-p9-secret-ok
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inloop
+  namespace: macvz-cri-e2e
+  labels:
+    app: inloop
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: inloop
+  template:
+    metadata:
+      labels:
+        app: inloop
+    spec:
+      # #84 scheduling-exclusion opt-in: select the MacVz runtime and tolerate
+      # the host-namespace-unsupported taint so the scheduler places this Pod on
+      # the MacVz CRI node instead of being repelled with ordinary workloads.
+      nodeSelector:
+        node.macvz.io/runtime: apple-container
+      tolerations:
+        - key: node.macvz.io/host-namespace-unsupported
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      containers:
+        - name: app
+          image: busybox:1.36.1
+          # Serve the projected ConfigMap index over HTTP so readiness, the
+          # Service, and port-forward all exercise a real listener in the
+          # micro-VM. The boot echo gives `kubectl logs` a deterministic marker;
+          # httpd -f then keeps the container in the foreground.
+          command: ["sh", "-c", "echo macvz-cri-p9-inloop-boot; httpd -f -p 8080 -h /www"]
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /index.html
+              port: 8080
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            failureThreshold: 12
+          livenessProbe:
+            httpGet:
+              path: /index.html
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          volumeMounts:
+            - name: web
+              mountPath: /www
+              readOnly: true
+            - name: secret
+              mountPath: /etc/app-secret
+              readOnly: true
+      volumes:
+        - name: web
+          configMap:
+            name: app-config
+        - name: secret
+          secret:
+            secretName: app-secret
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: inloop
+  namespace: macvz-cri-e2e
+spec:
+  type: ClusterIP
+  selector:
+    app: inloop
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080

@@ -50,7 +50,7 @@ func (s *Server) RecoverContainers(ctx context.Context) {
 				exited++
 				// A container that exited while the adapter was down must release its
 				// Pod network path so a later sandbox teardown does not leak host rules.
-				if err := s.detachContainerNetwork(ctx, c.SandboxID, "RecoverContainers"); err != nil {
+				if err := s.detachContainerNetwork(ctx, c.SandboxID, c.ID, "RecoverContainers"); err != nil {
 					klog.ErrorS(err, "CRI restart recovery: failed to detach network for exited container", "containerID", c.ID)
 				}
 			}

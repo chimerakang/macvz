@@ -14,6 +14,12 @@ import (
 // operator into believing host sharing worked — exactly the kind of fake success
 // the CRI track forbids. Instead the adapter rejects the shape with a clear,
 // operator-facing reason naming the offending field.
+//
+// The CRI-P9 follow-up (#84) pairs this rejection with a kubelet-visible
+// taint/label scheme (nodescheme.go) so host-namespace system workloads are
+// scheduled onto a Linux node instead of failing here; the rejection message
+// points back at that scheme so an operator who still sees one fail knows the
+// honest fix. See docs/CRI_FEASIBILITY.md, "CRI-P9 Follow-up (#84)".
 
 // unsupportedSandboxShape inspects a Pod sandbox config for shapes the
 // single-container micro-VM model cannot honor honestly. It returns a clear

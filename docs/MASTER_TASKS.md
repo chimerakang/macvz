@@ -55,6 +55,11 @@ architecture from Virtual Kubelet provider to kubelet CRI runtime integration.
 | CRI-P8 | Harden k3s compatibility, install, cleanup, and soak behavior | ✅ Complete |
 | CRI-P9 | Make the route-two go/no-go decision and migration plan | ✅ Complete (no-go for replacement; experimental side path) |
 | CRI-P9 follow-up (#82) | Multi-container Pod feasibility: pause-VM shared-netns spike | ✅ Complete (blocked on missing `apple/container` primitive; flag-gated adapter path ready) |
+| CRI-P9 follow-up (#83) | Real-hardware CRI-socket soak run and published report | ✅ Complete for crictl/socket soak; real kubelet/k3s in-loop soak still open |
+| CRI-P9 follow-up (#84) | Host-namespace workload feasibility / honest scheduling exclusion | ✅ Complete (taint/label opt-in scheme + loud RunPodSandbox backstop) |
+| CRI-P9 follow-up (#85) | Real kubelet/k3s fixture deployment and multi-day in-loop soak | 🟡 Harness/fixture/runbook built (`test/e2e/cri-k3s/k3s-inloop.sh`, `docs/CRI_K3S_INLOOP_REPORT.md`); gated live run operator-pending |
+| CRI-P9 follow-up (#86) | Unblock honest multi-container Pods when `apple/container` exposes shared sandbox namespaces | 🟡 Capability re-verified absent (1.0.0); adapter-side honest path prepared behind `--experimental-multi-container` (join-in-sandbox-VM, one Pod IP, leak-free, owner-first drain guarded); blocked on runtime primitive with stable sandbox namespace lifetime |
+| CRI runtime feasibility (#87) | Validate `apple/containerization` `LinuxPod` as the route-C Pod sandbox backend | 🟡 Open — prioritize `LinuxPod` proof over MacVz-owned runtime; self-owned sandbox runtime is fallback only |
 
 **CRI-P5 evidence (#77):** Pod networking is wired through the same primitives as
 the shipped provider — `network.PodIPAM` for Pod IPs and `podnet.Router` for the
@@ -143,17 +148,21 @@ no-go for replacement, not a stop**: keep CRI as a documented experimental
 supported production runtime. The CRI adapter is honest and useful for the
 single-container, non-host-namespace Pod class (P1–P8 have hermetic coverage plus
 gated component/live harnesses; `go test ./...`, `go vet ./...`, `make build`,
-`make cri` green), but two blockers fundamental to `apple/container` — not the adapter —
-prevent a general node runtime: **multi-container Pods** (no shared-netns pause
-model across micro-VMs) and **host-namespace Pods** (`hostNetwork`/`hostPID`/
-`hostIPC`). The third gate, a **sustained real-hardware k3s soak**, has a harness
-(`test/e2e/cri-k3s/`) but no run yet. Decision flips to **go** only when all three
-clear; README positioning is unchanged because the user-facing architecture does
-not change. Follow-up issues track the three blockers (#82 multi-container,
-#83 real-hardware soak, #84 host-namespace). Full decision package
-(supported/unsupported workload shapes, gaps vs. Virtual Kubelet and vs. ordinary
-CRI runtimes, k3s failure modes, operational + security model, migration and
-fallback plans) is in [CRI_FEASIBILITY.md](CRI_FEASIBILITY.md) CRI-P9.
+`make cri` green), but it is still not a general node runtime. Follow-ups have
+now narrowed the decision: #82/#86 prove the **current `apple/container` CLI path**
+cannot model multi-container Pods by launching one independent micro-VM per
+container, while #87 identifies `apple/containerization`'s experimental
+`LinuxPod` API as the next route-C feasibility target; #84 clears
+**host-namespace Pods** only by an honest scheduling-exclusion scheme, not by
+pretending support; and #83/#85 separate CRI-socket soak evidence from real
+kubelet/k3s in-loop evidence. Decision flips to **go** only after a LinuxPod-backed
+Pod sandbox or equivalent runtime path proves Kubernetes Pod semantics and a
+multi-day real k3s/kubelet in-loop soak passes; README positioning is unchanged
+because the user-facing architecture does not change. Full decision package
+(supported/unsupported workload shapes, gaps vs. Virtual Kubelet and vs.
+ordinary CRI runtimes, k3s failure modes, operational + security model,
+migration and fallback plans) is in [CRI_FEASIBILITY.md](CRI_FEASIBILITY.md)
+CRI-P9.
 
 **CRI-P9 follow-up (#82):** The multi-container blocker is confirmed
 **architectural, not a missing flag**: `apple/container` runs one Linux kernel
@@ -171,6 +180,74 @@ container through that join operation with the first workload ID as the sandbox 
 target. An L3-shared-network approximation was rejected as dishonest (distinct
 IPs break the single-Pod-IP/localhost contract). See
 [CRI_FEASIBILITY.md](CRI_FEASIBILITY.md) "CRI-P9 Follow-up (#82)".
+
+**CRI-P9 follow-up (#86):** Re-verified `apple/container` 1.0.0 CLI/runtime still
+exposes no shared sandbox namespace (`--network "container:<id>"` → `network ...
+not found`; no `pod`/`sandbox`/`pause` verb; no
+`--net=container:`/`--pid`/`--ipc` flag), so the current CLI-backed CRI path
+**stays blocked with evidence** and returns a clear `Unimplemented` diagnostic.
+What #86 adds beyond #82 is the **adapter-side honest path** behind
+`--experimental-multi-container`: container #2+ joins the **sandbox owner's** VM
+via `CreateInPodSandbox` (never a second micro-VM), a joined container shares the
+owner's **single Pod IP** with no second IP allocation or `binat` attach
+(`store.Container.SharesPodNetwork`), per-container stop/remove keeps the Pod
+network up **until the last container drains** (including owner-first stop order),
+and a failed join leaks no record/IP/workload. Follow-up research found
+`apple/containerization`'s experimental `LinuxPod` API, so the next step is no
+longer "wait for `container` CLI support" or "self-build a runtime first"; it is
+#87: validate `LinuxPod` as the route-C Pod sandbox backend and keep a MacVz-owned
+sandbox runtime as fallback only. See [CRI_FEASIBILITY.md](CRI_FEASIBILITY.md)
+"CRI-P9 Follow-up (#86)" and #87.
+
+**CRI runtime feasibility (#87):** Route C is now the active research path:
+validate `apple/containerization` `LinuxPod` before considering a MacVz-owned
+sandbox runtime. `LinuxPod` is an experimental Swift API that can place multiple
+Linux containers in one VM, with separate rootfs/processes and shared VM
+CPU/memory/network; upstream integration tests already cover multiple/concurrent
+containers, exec, stats, per-container limits, filesystem isolation, optional
+shared PID namespace, and shared-network sysctl evidence. The work now is to
+prove the Kubernetes-facing contract MacVz needs: one Pod IP, localhost
+reachability across containers, sandbox lifetime independent of any single
+container, kubelet-compatible `RunPodSandbox`/`CreateContainer` ordering,
+logs/exec/stats, and the current upstream gaps (`Attach`, `PortForward`,
+post-create `addContainer` hotplug). If LinuxPod is feasible, create bridge
+implementation phases (likely a Swift helper daemon controlled by the Go CRI
+adapter). If LinuxPod fails, only then evaluate route D: a MacVz-owned sandbox VM
+runtime. See issue #87.
+
+**CRI-P9 follow-up (#84):** The host-namespace gate is **cleared via option (b),
+an honest scheduling exclusion**. Honest host-namespace support is physically
+impossible — a host namespace is per-kernel and each Pod is a separate micro-VM
+kernel — so the answer is a kubelet-visible taint/label scheme (canonical keys in
+`pkg/criserver/nodescheme.go`): labels `node.macvz.io/runtime=apple-container`
+and `node.macvz.io/host-namespace=unsupported`, plus taint
+`node.macvz.io/host-namespace-unsupported=true:NoSchedule`. Because system
+DaemonSets often tolerate every taint, the scheme is layered: label-based
+`nodeAffinity` exclusion for cluster-owned charts, and the existing loud
+`RunPodSandbox` rejection (now naming the scheme) as the visible backstop for
+charts you cannot edit — failing as a `FailedCreatePodSandBox` event, not
+opaquely. The taint also makes MacVz an opt-in node for ordinary workloads:
+compatible Pods must tolerate it and should select the runtime label.
+`macvz-cri --preflight` prints the exact registration flags. See
+[CRI_FEASIBILITY.md](CRI_FEASIBILITY.md) "CRI-P9 Follow-up (#84)".
+
+**CRI-P9 follow-up (#85):** #83 intentionally stopped at a real-hardware
+CRI-socket soak driven by `crictl`; it did not put a Linux kubelet/k3s control
+plane in the loop. #85 **builds that missing layer**: a gated, operator-run
+harness (`test/e2e/cri-k3s/k3s-inloop.sh`, `make cri-k3s-inloop`) plus a
+single-container fixture (`test/e2e/cri-k3s/fixtures/workload.yaml`) that selects
+the #84 runtime label and tolerates the host-namespace taint, and a runbook +
+evidence template (`docs/CRI_K3S_INLOOP_REPORT.md`). The harness schedules the
+fixture through a real k3s control plane and proves `kubectl rollout
+status`/`logs`/`exec`/`port-forward`, ClusterIP/Service reachability from a
+Linux-node probe, macvz-cri and k3s restart recovery, a soak (adapter RSS / Pod
+restartCount / host workload counts), and a final orphan audit. It is gated
+(`MACVZ_INTEGRATION=1` + reachable `KUBECONFIG`) and plan-only otherwise; restart
+and audit phases use operator hooks and skip loudly when unset. The dev host
+cannot stand up the Linux-control-plane + macOS-CRI-node topology unattended, so
+the **live evidence is operator-pending**. Until that live run passes *and* #82
+(multi-container) clears, CRI remains an experimental side path / no-go for
+replacement even though #84 itself is resolved.
 
 ## Current Validation Snapshot
 

@@ -4,9 +4,11 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/chimerakang/macvz/internal/types"
 	"github.com/chimerakang/macvz/pkg/criserver/store"
+	"github.com/chimerakang/macvz/pkg/network"
 	"github.com/chimerakang/macvz/pkg/runtime"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -183,6 +185,174 @@ func TestMultiContainerProbeDoesNotBlockRestartAfterExit(t *testing.T) {
 	// admitted without hitting the multi-container probe.
 	if _, err := s.CreateContainer(ctx, createReq(sandboxID, "app")); err != nil {
 		t.Fatalf("restart CreateContainer after exit should be admitted: %v", err)
+	}
+}
+
+// newNetworkedMultiContainerServer builds a multi-container-enabled server with a
+// real PodIPAM and a fake Pod network, so the honest networking contract (one Pod
+// IP shared across containers) can be asserted.
+func newNetworkedMultiContainerServer(t *testing.T, rt ContainerRuntime) (*Server, *network.PodIPAM, *fakePodNet) {
+	t.Helper()
+	ipam, err := network.NewPodIPAM(testPodCIDR)
+	if err != nil {
+		t.Fatalf("NewPodIPAM: %v", err)
+	}
+	pnet := newFakePodNet()
+	s := New(Options{Runtime: rt, IPAM: ipam, PodNetwork: pnet, MultiContainer: true})
+	s.vmIPPollAttempts = 3
+	s.vmIPPollInterval = time.Millisecond
+	return s, ipam, pnet
+}
+
+func createStartNamed(t *testing.T, s *Server, sandboxID, name string) string {
+	t.Helper()
+	ctx := context.Background()
+	cResp, err := s.CreateContainer(ctx, createReq(sandboxID, name))
+	if err != nil {
+		t.Fatalf("CreateContainer(%s): %v", name, err)
+	}
+	id := cResp.GetContainerId()
+	if _, err := s.StartContainer(ctx, &runtimeapi.StartContainerRequest{ContainerId: id}); err != nil {
+		t.Fatalf("StartContainer(%s): %v", name, err)
+	}
+	return id
+}
+
+// A joined container shares the sandbox owner's single Pod IP: the Pod network is
+// attached exactly once (by the owner's start), the joined container's start
+// allocates no second IP and triggers no second attach, and PodSandboxStatus
+// reports one Pod IP for the whole Pod. This is the core Kubernetes Pod contract.
+func TestMultiContainerSharesOnePodIP(t *testing.T) {
+	rt := &sharedNetnsFakeRuntime{fakeRuntime: newFakeRuntime(), supported: true}
+	rt.startIP = "192.168.64.9"
+	s, ipam, pnet := newNetworkedMultiContainerServer(t, rt)
+
+	sandboxID := runSandbox(t, s, "web", "default", "uid-web")
+	key := "default/web"
+	wantIP := ipam.IP(key)
+	if wantIP == "" {
+		t.Fatalf("RunPodSandbox did not reserve a Pod IP")
+	}
+
+	createStartNamed(t, s, sandboxID, "app")     // sandbox owner
+	createStartNamed(t, s, sandboxID, "sidecar") // joined container
+
+	if pnet.attachCalls != 1 {
+		t.Errorf("Pod network attached %d times, want exactly 1 (joined container must not re-attach)", pnet.attachCalls)
+	}
+	if len(rt.joined) != 1 {
+		t.Fatalf("expected exactly one CreateInPodSandbox join, got %d", len(rt.joined))
+	}
+	if got := sandboxNetworkIP(t, s, sandboxID); got != wantIP {
+		t.Errorf("PodSandboxStatus Pod IP = %q, want the single reserved IP %q", got, wantIP)
+	}
+	// Both containers carry the same Pod identity / IP key.
+	if got := ipam.IP(key); got != wantIP {
+		t.Errorf("a joined container changed the Pod IP: %q != %q", got, wantIP)
+	}
+}
+
+// Stopping one container in a multi-container Pod keeps the shared Pod network up
+// while another container is still live; only the last container draining tears it
+// down. This preserves sandbox-vs-workload lifecycle semantics.
+func TestMultiContainerStopKeepsNetworkUntilLastDrains(t *testing.T) {
+	rt := &sharedNetnsFakeRuntime{fakeRuntime: newFakeRuntime(), supported: true}
+	rt.startIP = "192.168.64.10"
+	s, _, pnet := newNetworkedMultiContainerServer(t, rt)
+	ctx := context.Background()
+
+	sandboxID := runSandbox(t, s, "web", "default", "uid-web")
+	key := "default/web"
+	ownerID := createStartNamed(t, s, sandboxID, "app")
+	sidecarID := createStartNamed(t, s, sandboxID, "sidecar")
+
+	// Stop the sidecar: the owner is still live, so the Pod network must stay up.
+	if _, err := s.StopContainer(ctx, &runtimeapi.StopContainerRequest{ContainerId: sidecarID, Timeout: 1}); err != nil {
+		t.Fatalf("StopContainer(sidecar): %v", err)
+	}
+	if _, ok := pnet.isAttached(key); !ok {
+		t.Errorf("Pod network detached after stopping only the sidecar; the owner is still live")
+	}
+
+	// Stop the owner: now the Pod has drained, so the network is released.
+	if _, err := s.StopContainer(ctx, &runtimeapi.StopContainerRequest{ContainerId: ownerID, Timeout: 1}); err != nil {
+		t.Fatalf("StopContainer(owner): %v", err)
+	}
+	if _, ok := pnet.isAttached(key); ok {
+		t.Errorf("Pod network still attached after the last container drained")
+	}
+}
+
+// The shared namespace lifetime must not be tied to the first workload
+// container. If the sandbox owner is stopped while a joined sidecar is still
+// running, the Pod network must stay attached until the sidecar drains too.
+func TestMultiContainerStopOwnerFirstKeepsNetworkUntilSidecarDrains(t *testing.T) {
+	rt := &sharedNetnsFakeRuntime{fakeRuntime: newFakeRuntime(), supported: true}
+	rt.startIP = "192.168.64.12"
+	s, _, pnet := newNetworkedMultiContainerServer(t, rt)
+	ctx := context.Background()
+
+	sandboxID := runSandbox(t, s, "web", "default", "uid-web")
+	key := "default/web"
+	ownerID := createStartNamed(t, s, sandboxID, "app")
+	sidecarID := createStartNamed(t, s, sandboxID, "sidecar")
+
+	if _, err := s.StopContainer(ctx, &runtimeapi.StopContainerRequest{ContainerId: ownerID, Timeout: 1}); err != nil {
+		t.Fatalf("StopContainer(owner): %v", err)
+	}
+	if _, ok := pnet.isAttached(key); !ok {
+		t.Errorf("Pod network detached after stopping the owner while sidecar is still live")
+	}
+
+	if _, err := s.StopContainer(ctx, &runtimeapi.StopContainerRequest{ContainerId: sidecarID, Timeout: 1}); err != nil {
+		t.Fatalf("StopContainer(sidecar): %v", err)
+	}
+	if _, ok := pnet.isAttached(key); ok {
+		t.Errorf("Pod network still attached after owner and sidecar both drained")
+	}
+}
+
+// A failed join leaves no leaked CRI state, Pod IP, or workload: the existing
+// owner and its single attachment are untouched, and no partial second container
+// record or join is recorded.
+func TestMultiContainerFailedJoinNoLeak(t *testing.T) {
+	rt := &sharedNetnsFakeRuntime{fakeRuntime: newFakeRuntime(), supported: true}
+	rt.startIP = "192.168.64.11"
+	s, ipam, pnet := newNetworkedMultiContainerServer(t, rt)
+	ctx := context.Background()
+
+	sandboxID := runSandbox(t, s, "web", "default", "uid-web")
+	key := "default/web"
+	createStartNamed(t, s, sandboxID, "app")
+	wantIP := ipam.IP(key)
+
+	// The runtime now fails the join.
+	rt.createErr = context.DeadlineExceeded
+	_, err := s.CreateContainer(ctx, createReq(sandboxID, "sidecar"))
+	if err == nil {
+		t.Fatalf("CreateContainer(sidecar) should fail when the join errors")
+	}
+
+	listed, err := s.ListContainers(ctx, &runtimeapi.ListContainersRequest{
+		Filter: &runtimeapi.ContainerFilter{PodSandboxId: sandboxID},
+	})
+	if err != nil {
+		t.Fatalf("ListContainers: %v", err)
+	}
+	if n := len(listed.GetContainers()); n != 1 {
+		t.Errorf("failed join leaked a container record: have %d, want 1", n)
+	}
+	if len(rt.joined) != 0 {
+		t.Errorf("failed join recorded %d joins, want 0", len(rt.joined))
+	}
+	if got := ipam.IP(key); got != wantIP {
+		t.Errorf("failed join disturbed the Pod IP: %q != %q", got, wantIP)
+	}
+	if _, ok := pnet.isAttached(key); !ok {
+		t.Errorf("failed join detached the still-live owner's Pod network")
+	}
+	if pnet.attachCalls != 1 {
+		t.Errorf("attachCalls = %d after a failed join, want 1 (owner only)", pnet.attachCalls)
 	}
 }
 

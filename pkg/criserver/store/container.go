@@ -66,13 +66,21 @@ type Container struct {
 	// them faithfully and so a restarted adapter recovers the same view without
 	// re-deriving it from the runtime.
 	Mounts []Mount `json:"mounts,omitempty"`
-	State       ContainerState    `json:"state"`
-	CreatedAt   int64             `json:"createdAt"`            // unix nanoseconds
-	StartedAt   int64             `json:"startedAt,omitempty"`  // unix nanoseconds
-	FinishedAt  int64             `json:"finishedAt,omitempty"` // unix nanoseconds
-	ExitCode    int32             `json:"exitCode,omitempty"`
-	Reason      string            `json:"reason,omitempty"`
-	Message     string            `json:"message,omitempty"`
+	// SharesPodNetwork marks a container that joined an existing Pod sandbox VM's
+	// network namespace (the multi-container pause-VM model, #86) rather than
+	// owning its own micro-VM and Pod IP. A joined container shares the sandbox
+	// owner's single Pod IP, so StartContainer does not attach a second Pod network
+	// path for it, and a per-container stop/remove keeps the shared path up while
+	// any other container in the Pod is still live. False for the sandbox owner and
+	// for every single-container Pod.
+	SharesPodNetwork bool           `json:"sharesPodNetwork,omitempty"`
+	State            ContainerState `json:"state"`
+	CreatedAt        int64          `json:"createdAt"`            // unix nanoseconds
+	StartedAt        int64          `json:"startedAt,omitempty"`  // unix nanoseconds
+	FinishedAt       int64          `json:"finishedAt,omitempty"` // unix nanoseconds
+	ExitCode         int32          `json:"exitCode,omitempty"`
+	Reason           string         `json:"reason,omitempty"`
+	Message          string         `json:"message,omitempty"`
 }
 
 // Mount is a persisted filesystem mount realized for a container (CRI-P7, #79).

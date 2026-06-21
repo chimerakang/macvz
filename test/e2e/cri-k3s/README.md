@@ -10,12 +10,21 @@ release.
 
 - `run.sh` — gated compatibility suite: adapter handshake, single-container Pod
   lifecycle, logs, exec, projected config mount, unsupported-shape diagnostic,
-  adapter restart recovery, and cleanup verification.
+  adapter restart recovery, and cleanup verification. Driven by `crictl`.
 - `soak.sh` — gated bounded soak: repeated create/delete cycles sampling adapter
-  RSS and orphan counts, with leak/orphan guards.
+  RSS and orphan counts, with leak/orphan guards. Driven by `crictl`.
+- `k3s-inloop.sh` — gated **real kubelet/k3s in-loop** suite (CRI-P9 follow-up
+  #85): schedules `fixtures/workload.yaml` through a real k3s control plane and
+  proves `kubectl rollout status`/`logs`/`exec`/`port-forward`, ClusterIP Service
+  reachability, macvz-cri and k3s restart recovery, and a sustained soak. This is
+  the layer `run.sh`/`soak.sh` cannot reach — `crictl` is not a control-plane loop.
+- `fixtures/workload.yaml` — the #85 single-container fixture: selects the #84
+  runtime label and tolerates the host-namespace taint, with projected
+  ConfigMap/Secret, an HTTP probe, and a ClusterIP Service.
 
-Both are gated by `MACVZ_INTEGRATION=1`; without it they print their plan and
-exit 0, so they are safe in `go test`-style CI.
+`run.sh`/`soak.sh` are gated by `MACVZ_INTEGRATION=1`; `k3s-inloop.sh`
+additionally needs a reachable `KUBECONFIG`. Without their gates each prints its
+plan and exits 0, so they are safe in `go test`-style CI.
 
 ## Quick start
 
@@ -56,7 +65,35 @@ bundled containerd.
    ```sh
    k3s agent \
      --container-runtime-endpoint "unix://$HOME/.macvz/cri/macvz-cri.sock" \
+     --node-label node.macvz.io/runtime=apple-container \
+     --node-label node.macvz.io/host-namespace=unsupported \
+     --node-taint node.macvz.io/host-namespace-unsupported=true:NoSchedule \
      --server https://<k3s-server>:6443 --token <node-token>
+   ```
+
+   The `--node-label`/`--node-taint` flags are the CRI-P9 follow-up (#84)
+   host-namespace scheduling-exclusion scheme: host-namespace Pods cannot be
+   honored on the per-Pod-VM model, so the node is registered with scheduling
+   metadata and the adapter rejects any incompatible Pod that still lands (see
+   `docs/CRI_FEASIBILITY.md`, "CRI-P9 Follow-up
+   (#84)"). `macvz-cri --preflight` prints the exact flags. For a raw kubelet the
+   equivalents are `--node-labels` and `--register-with-taints`.
+
+   The taint is intentionally opt-in: it also repels ordinary Pods unless they
+   tolerate it. Workloads that are known to fit the MacVz constraints should both
+   select the runtime label and tolerate the taint:
+
+   ```yaml
+   spec:
+     template:
+       spec:
+         nodeSelector:
+           node.macvz.io/runtime: apple-container
+         tolerations:
+           - key: node.macvz.io/host-namespace-unsupported
+             operator: Equal
+             value: "true"
+             effect: NoSchedule
    ```
 
    Equivalent `config.yaml`:
@@ -74,11 +111,24 @@ bundled containerd.
    ```sh
    MACVZ_INTEGRATION=1 MACVZ_CRI_MANAGE=0 \
      MACVZ_CRI_SOCKET="$HOME/.macvz/cri/macvz-cri.sock" \
-	    ./test/e2e/cri-k3s/run.sh
-	   ```
+     ./test/e2e/cri-k3s/run.sh
+   ```
 
-   A full `kubectl` fixture deployment and Service reachability smoke against a
-   live k3s cluster are intentionally left for CRI-P9 go/no-go evidence.
+4. Run the **real kubelet/k3s in-loop** suite (CRI-P9 follow-up #85) against the
+   live cluster — this is the full `kubectl` fixture deployment, Service
+   reachability, restart-recovery, and soak that `crictl` cannot cover:
+
+   ```sh
+   export KUBECONFIG=/path/to/k3s.yaml
+   MACVZ_INTEGRATION=1 make cri-k3s-inloop
+   ```
+
+   It auto-detects the MacVz node by its runtime label, applies
+   `fixtures/workload.yaml`, and runs the in-loop phases. Restart/audit phases
+   take operator hooks (`MACVZ_RESTART_CRI_CMD`, `MACVZ_RESTART_K3S_CMD`,
+   `MACVZ_ADAPTER_RSS_CMD`, `MACVZ_HOST_AUDIT_CMD`); an unset hook skips its phase
+   loudly. See `docs/CRI_K3S_INLOOP_REPORT.md` for the runbook and evidence
+   template.
 
 ## Cleanup
 

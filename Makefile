@@ -40,6 +40,10 @@ cri-k3s: cri ## Run the CRI-P8 k3s compatibility suite (set MACVZ_INTEGRATION=1 
 cri-soak: cri ## Run the CRI-P8 bounded soak (set MACVZ_INTEGRATION=1 to run live)
 	./test/e2e/cri-k3s/soak.sh
 
+.PHONY: cri-k3s-inloop
+cri-k3s-inloop: ## Run the CRI-P9 real kubelet/k3s in-loop suite (set MACVZ_INTEGRATION=1 + KUBECONFIG to run live)
+	./test/e2e/cri-k3s/k3s-inloop.sh
+
 .PHONY: bench
 bench: ## Build the density/RAM benchmark harness into bin/mvz-bench
 	@mkdir -p $(BIN_DIR)

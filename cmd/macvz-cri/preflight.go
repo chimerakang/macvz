@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/chimerakang/macvz/pkg/criserver"
 	"github.com/chimerakang/macvz/pkg/network"
 )
 
@@ -93,8 +94,27 @@ func preflightChecks(cfg preflightConfig, p preflightProbes) []checkResult {
 	out = append(out, checkStateDir(cfg.stateDir, p))
 	out = append(out, checkPodNetwork(cfg.pn, p))
 	out = append(out, checkMounts(cfg.mc, p)...)
+	out = append(out, checkNodeRegistration())
 
 	return out
+}
+
+// checkNodeRegistration is the CRI-P9 follow-up (#84) host-namespace scheduling
+// advisory. host-namespace Pods (hostNetwork/hostPID/hostIPC) cannot be honored
+// on the per-Pod-VM model, so the adapter rejects them at RunPodSandbox. To keep
+// that from manifesting as opaque scheduling failures for system DaemonSets, the
+// node should advertise the canonical taint/label scheme so the scheduler routes
+// host-namespace workloads elsewhere. The adapter cannot set node metadata itself
+// (the kubelet owns the Node object in CRI mode), so this is an OK-status
+// advisory printing the exact registration flags the operator must pass.
+func checkNodeRegistration() checkResult {
+	return checkResult{
+		Name:   "host-namespace scheduling",
+		Status: checkOK,
+		Detail: fmt.Sprintf(
+			"host-namespace Pods are rejected (per-Pod-VM model); register the node with --node-labels=%s and --register-with-taints=%s (k3s: --node-label/--node-taint) so the scheduler routes them elsewhere; only workloads intentionally targeting this node should tolerate that taint",
+			strings.Join(criserver.NodeLabels(), ","), criserver.NodeTaint()),
+	}
 }
 
 // checkRuntimeBinary verifies the apple/container CLI the adapter drives is

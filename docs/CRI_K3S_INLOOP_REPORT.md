@@ -20,12 +20,11 @@ shipped Virtual Kubelet path.
 **Short live in-loop run passed for the supported workload class.** On
 2026-06-23, the fixture passed scheduling, rollout, logs, exec, port-forward,
 ClusterIP Service reachability from a Linux-node probe, `macvz-cri` restart
-recovery, a bounded short soak, cleanup, and host orphan audit on the local
-two-Mac lab. Handoff was skipped because the default adapter path was under test
-(`MACVZ_HANDOFF=0`), and k3s/kubelet restart recovery was skipped because no
-operator hook was provided. A multi-day soak is still pending. The CRI route-two
-decision **remains no-go for replacement** until #82 multi-container support is
-resolved and the longer operator run is complete.
+recovery, kubelet restart recovery, a bounded short soak, cleanup, and host
+orphan audit on the local two-Mac lab. Handoff was skipped because the default
+adapter path was under test (`MACVZ_HANDOFF=0`). A multi-day soak is still
+pending. The CRI route-two decision **remains no-go for replacement** until #82
+multi-container support is resolved and the longer operator run is complete.
 
 ## Topology
 
@@ -100,20 +99,21 @@ Short live run:
 KUBECONFIG=$HOME/.kube/config \
 MACVZ_INTEGRATION=1 \
 MACVZ_NODE=macvz-b-cri \
-MACVZ_CRI_OUT_DIR=/tmp/cri-inloop-20260623032551 \
-MACVZ_INLOOP_SOAK_ITERATIONS=30 \
-MACVZ_INLOOP_SOAK_INTERVAL=10 \
+MACVZ_CRI_OUT_DIR=/tmp/cri-inloop-restartk3s-20260623040202 \
+MACVZ_INLOOP_SOAK_ITERATIONS=10 \
+MACVZ_INLOOP_SOAK_INTERVAL=5 \
 MACVZ_HOST_AUDIT_CMD="ssh test@192.168.1.122 '/opt/homebrew/bin/container list --all'" \
 MACVZ_ADAPTER_RSS_CMD="ssh test@192.168.1.122 \"ps -axo rss,command | awk '/[m]acvz-cri --listen unix:\\/\\/\\/Users\\/test\\/macvz-cri-i5-test\\/service-default\\/macvz-cri.sock/ {print \\$1; exit}'\"" \
 MACVZ_RESTART_CRI_CMD="ssh test@192.168.1.122 'launchctl kickstart -k gui/501/io.macvz.cri.default'" \
+MACVZ_RESTART_K3S_CMD="docker exec macvz61-control-plane sh -lc '<restart macvz-b-cri kubelet from /tmp/macvz-cri-inloop/kubelet.pid>'" \
 bash test/e2e/cri-k3s/k3s-inloop.sh
 ```
 
 Result:
 
 ```text
-PASS CRI-P9 in-loop suite: checks passed with 2 skipped hook-dependent phase(s)
-diagnostics: /tmp/cri-inloop-20260623032551
+PASS CRI-P9 in-loop suite: checks passed with 1 skipped hook-dependent phase(s)
+diagnostics: /tmp/cri-inloop-restartk3s-20260623040202
 ```
 
 ### Build under test
@@ -145,7 +145,7 @@ diagnostics: /tmp/cri-inloop-20260623032551
 | 6 | `kubectl port-forward` + curl returns the served marker | `PASS` | `pf.log` |
 | 7 | ClusterIP Service reachable from a Linux-node probe | `PASS` | `probe.log` |
 | 8 | Restarting `macvz-cri` keeps the Pod (no dup/loss) | `PASS` | `restart-cri.log`, host audit |
-| 9 | Restarting k3s/kubelet keeps the Pod (no orphan) | `SKIP` | no `MACVZ_RESTART_K3S_CMD` hook |
+| 9 | Restarting k3s/kubelet keeps the Pod (no orphan) | `PASS` | `restart-k3s.log` |
 | 10 | Soak: bounded adapter RSS, no crash loop | `PASS` | `soak-samples.csv` |
 | 11 | Final host audit: no stale `macvz-cri-*` workloads | `PASS` | `cleanup.log`, host audit |
 
@@ -153,9 +153,9 @@ diagnostics: /tmp/cri-inloop-20260623032551
 
 | Metric | Value |
 | --- | --- |
-| Duration / samples | 30 samples at 10s interval |
-| First / last adapter RSS | `22720 KB` / `26752 KB` |
-| RSS growth (bound 64 MiB) | `4032 KB` |
+| Duration / samples | 10 samples at 5s interval |
+| First / last adapter RSS | `27840 KB` / `27968 KB` |
+| RSS growth (bound 64 MiB) | `128 KB` |
 | Pod restartCount over soak | `0` |
 | Residual host workloads at end | `0` |
 

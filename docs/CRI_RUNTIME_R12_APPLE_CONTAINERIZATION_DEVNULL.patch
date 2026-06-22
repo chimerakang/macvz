@@ -1,0 +1,45 @@
+diff --git a/vminitd/Sources/vmexec/RunCommand.swift b/vminitd/Sources/vmexec/RunCommand.swift
+--- a/vminitd/Sources/vmexec/RunCommand.swift
++++ b/vminitd/Sources/vmexec/RunCommand.swift
+@@ -145,9 +145,10 @@ struct RunCommand: ParsableCommand {
+     private func childRootSetup(rootfs: ContainerizationOCI.Root, mounts: [ContainerizationOCI.Mount]) throws {
+         // setup rootfs
+         try prepareRoot(rootfs: rootfs.path)
+         try mountRootfs(rootfs: rootfs.path, mounts: mounts)
++        try ensureDevNull(rootfs: rootfs.path)
+         try setDevSymlinks(rootfs: rootfs.path)
+ 
+         try pivotRoot(rootfs: rootfs.path)
+@@ -418,6 +419,28 @@ struct RunCommand: ParsableCommand {
+     private func setDevSymlinks(rootfs: String) throws {
+         let links: [(src: String, dst: String)] = [
+             ("/proc/self/fd", "/dev/fd"),
+@@
+             }
+         }
+     }
++
++    private func ensureDevNull(rootfs: String) throws {
++        let path = URL(fileURLWithPath: rootfs).appendingPathComponent("/dev/null").path
++        var existing = stat()
++        if lstat(path, &existing) == 0 {
++            if (existing.st_mode & S_IFMT) == S_IFCHR {
++                return
++            }
++            guard unlink(path) == 0 else {
++                throw App.Errno(stage: "unlink(\(path))")
++            }
++        } else if errno != ENOENT {
++            throw App.Errno(stage: "lstat(\(path))")
++        }
++
++        guard mknod(path, mode_t(S_IFCHR | 0o666), dev_t(259)) == 0 else {
++            throw App.Errno(stage: "mknod(\(path))")
++        }
++        guard chmod(path, mode_t(0o666)) == 0 else {
++            throw App.Errno(stage: "chmod(\(path))")
++        }
++    }
+ 
+     private func reOpenDevNull() throws {
+         let file = open("/dev/null", O_RDWR)

@@ -426,6 +426,27 @@ This confirms the ptmx invariant was real and removable, but process identity is
 still not reached. The next blocker is `/dev/null` device setup in the late
 prepared rootfs path.
 
+## R12 Result
+
+R12 completed on 2026-06-22 UTC. The live probe report is published at
+[CRI_RUNTIME_R12_DEVNULL_PROBE_REPORT.md](CRI_RUNTIME_R12_DEVNULL_PROBE_REPORT.md).
+
+Outcome: `vmexecDevNullFixAdvancedToExec`.
+
+The local apple/containerization patch created `/dev/null` as character device
+`1:3` after OCI `/dev` tmpfs setup and before `pivotRoot`. The same
+late-rootfs harness no longer failed at `stage=open(/dev/null)`. The process
+started and then exited from userspace with code 127:
+
+```text
+processStartSucceeded=true
+processExitCode=127
+```
+
+That advances the research from vmexec device setup into rootfs completeness:
+the minimal R9 rootfs has `/bin/sh` and `/bin/busybox`, but no applet symlinks
+for commands used by the identity script.
+
 ## MacVz Integration Boundary
 
 Until the primitive exists, MacVz should keep production runtime code unchanged.

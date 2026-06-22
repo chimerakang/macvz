@@ -514,6 +514,25 @@ Decision: the next probe should ensure a usable `/dev/null` exists after OCI
 `/dev` tmpfs setup for late prepared rootfs starts. Production CRI wiring
 remains blocked until the late container reports rootfs identity.
 
+### R12: vmexec `/dev/null` Probe (#104)
+
+R12 completed on 2026-06-22 UTC. The report is
+[CRI_RUNTIME_R12_DEVNULL_PROBE_REPORT.md](CRI_RUNTIME_R12_DEVNULL_PROBE_REPORT.md).
+
+Result: **the `/dev/null` blocker was removed, and the harness reached
+userspace process execution**. A local apple/containerization patch creates
+`/dev/null` as character device `1:3` after OCI `/dev` tmpfs setup and before
+`pivotRoot`. The rebuilt `vminit:macvz-r12` initfs no longer failed at
+`stage=open(/dev/null)`.
+
+The new result is `processStartSucceeded=true` followed by `processExitCode=127`.
+The observed outcome is `vmexecDevNullFixAdvancedToExec`.
+
+Decision: the next probe should make the minimal R9 rootfs runnable by adding
+BusyBox applet symlinks or invoking `/bin/busybox <applet>` explicitly.
+Production CRI wiring remains blocked until the late container reports rootfs
+identity.
+
 ### C5: Swift Helper Daemon Prototype
 
 Only if R0 later selects a LinuxPod-based bridge as a valid runtime building

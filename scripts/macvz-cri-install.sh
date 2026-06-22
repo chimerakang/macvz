@@ -151,9 +151,11 @@ EOF
 			plist_string "--state-dir"
 			plist_string "$STATE_DIR"
 			# Append any extra adapter flags (e.g. Pod networking), one <string> each.
-			for a in "${EXTRA_ARGS[@]}"; do
-				plist_string "$a"
-			done
+			if [ "${#EXTRA_ARGS[@]}" -gt 0 ]; then
+				for a in "${EXTRA_ARGS[@]}"; do
+					plist_string "$a"
+				done
+			fi
 			cat <<EOF
   </array>
   <key>RunAtLoad</key><true/>
@@ -194,8 +196,13 @@ cmd_install() {
 	# clearly, instead of as a launchd crash-loop in the logs.
 	if [ "$DRY_RUN" != 1 ]; then
 		log "Preflight"
-		"$BIN_DST" --preflight --listen "unix://$SOCKET" --state-dir "$STATE_DIR" "${EXTRA_ARGS[@]}" || \
-			warn "preflight reported FAIL items above; the LaunchAgent will be installed but may not serve until they are resolved"
+		if [ "${#EXTRA_ARGS[@]}" -gt 0 ]; then
+			"$BIN_DST" --preflight --listen "unix://$SOCKET" --state-dir "$STATE_DIR" "${EXTRA_ARGS[@]}" || \
+				warn "preflight reported FAIL items above; the LaunchAgent will be installed but may not serve until they are resolved"
+		else
+			"$BIN_DST" --preflight --listen "unix://$SOCKET" --state-dir "$STATE_DIR" || \
+				warn "preflight reported FAIL items above; the LaunchAgent will be installed but may not serve until they are resolved"
+		fi
 	fi
 
 	write_plist
@@ -250,7 +257,10 @@ cmd_preflight() {
 	local bin="$BIN_DST"
 	[ -x "$bin" ] || bin="$FROM_DIR/macvz-cri"
 	[ -x "$bin" ] || die "macvz-cri binary not found (install first or run 'make cri')"
-	exec "$bin" --preflight --listen "unix://$SOCKET" --state-dir "$STATE_DIR" "${EXTRA_ARGS[@]}"
+	if [ "${#EXTRA_ARGS[@]}" -gt 0 ]; then
+		exec "$bin" --preflight --listen "unix://$SOCKET" --state-dir "$STATE_DIR" "${EXTRA_ARGS[@]}"
+	fi
+	exec "$bin" --preflight --listen "unix://$SOCKET" --state-dir "$STATE_DIR"
 }
 
 main() {

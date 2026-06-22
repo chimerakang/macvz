@@ -133,7 +133,13 @@ trap cleanup EXIT
 # --- phases ------------------------------------------------------------------
 phase_preflight() {
 	log "Phase: preflight"
-	if "$CRI_BIN" --preflight --listen "unix://$SOCKET" --state-dir "$STATE_DIR" ${MACVZ_CRI_EXTRA:-} >"$OUT_DIR/preflight.log" 2>&1; then
+	local preflight_socket="$SOCKET"
+	# With MACVZ_CRI_MANAGE=0 the target socket is supposed to be serving
+	# already, so run dependency preflight against an unused socket. The adapter
+	# handshake phase proves the external endpoint itself is reachable.
+	[ "$MANAGE" = 1 ] || preflight_socket="$TMP_ROOT/preflight.sock"
+	if "$CRI_BIN" --preflight --listen "unix://$preflight_socket" --state-dir "$STATE_DIR" \
+		--volume-host-path-allowed "$OUT_DIR" ${MACVZ_CRI_EXTRA:-} >"$OUT_DIR/preflight.log" 2>&1; then
 		pass "preflight reported no hard-dependency failures"
 	else
 		# A FAIL here is usually a missing apple/container; surface it but continue so
@@ -276,10 +282,16 @@ phase_cleanup() {
 
 	# After stopping the adapter, the socket must not linger.
 	stop_adapter
-	if [ -S "$SOCKET" ]; then
-		fail "stale CRI socket left at $SOCKET after adapter stop"
+	if [ "$MANAGE" = 1 ]; then
+		if [ -S "$SOCKET" ]; then
+			fail "stale CRI socket left at $SOCKET after adapter stop"
+		else
+			pass "no stale CRI socket after adapter stop"
+		fi
+	elif crt version >/dev/null 2>&1; then
+		pass "external CRI socket still serving (MACVZ_CRI_MANAGE=0)"
 	else
-		pass "no stale CRI socket after adapter stop"
+		fail "external CRI socket stopped serving unexpectedly"
 	fi
 }
 

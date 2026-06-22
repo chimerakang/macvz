@@ -378,7 +378,13 @@ phase_remove() {
 	if [ "$(crt pods -q 2>/dev/null | wc -l | tr -d ' ')" = "0" ]; then pass "no sandboxes remain"; else fail "sandboxes remain after cleanup"; fi
 
 	stop_adapter
-	if [ -S "$SOCKET" ]; then fail "stale CRI socket left at $SOCKET"; else pass "no stale CRI socket after adapter stop"; fi
+	if [ "$MANAGE" = 1 ]; then
+		if [ -S "$SOCKET" ]; then fail "stale CRI socket left at $SOCKET"; else pass "no stale CRI socket after adapter stop"; fi
+	elif crt version >/dev/null 2>&1; then
+		pass "external CRI socket still serving (MACVZ_CRI_MANAGE=0)"
+	else
+		fail "external CRI socket stopped serving unexpectedly"
+	fi
 }
 
 # --- main --------------------------------------------------------------------

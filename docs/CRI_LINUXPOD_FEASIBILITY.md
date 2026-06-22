@@ -550,6 +550,23 @@ to vminitd at `/run/container/r9-late-alpha/rootfs/macvz-r9-result` after the
 process exits. Production CRI wiring remains blocked until rootfs identity
 evidence is verified.
 
+### R14: Late Rootfs Result Visibility (#106)
+
+R14 completed on 2026-06-22 UTC. The report is
+[CRI_RUNTIME_R14_RESULT_VISIBILITY_REPORT.md](CRI_RUNTIME_R14_RESULT_VISIBILITY_REPORT.md).
+
+Result: **result visibility is the current blocker**. The process starts and
+exits 0, proving the userspace path runs. The harness records that
+the script completed after writing `/macvz-r9-result` inside the vmexec
+namespace, but vminitd cannot stat it at
+`/run/container/r9-late-alpha/rootfs/macvz-r9-result`.
+
+The observed outcome is `lateRootfsResultVisibilityExplained`.
+
+Decision: the next probe should add a vminitd-verifiable evidence channel,
+such as stdout capture or an explicit shared result mount. Production CRI wiring
+remains blocked until rootfs identity evidence is verified.
+
 ### C5: Swift Helper Daemon Prototype
 
 Only if R0 later selects a LinuxPod-based bridge as a valid runtime building

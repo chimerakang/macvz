@@ -468,6 +468,21 @@ The remaining failure is result visibility: vminitd cannot stat
 The next probe should explain where the result file is written across the
 vmexec mount namespace boundary.
 
+## R14 Result
+
+R14 completed on 2026-06-22 UTC. The live probe report is published at
+[CRI_RUNTIME_R14_RESULT_VISIBILITY_REPORT.md](CRI_RUNTIME_R14_RESULT_VISIBILITY_REPORT.md).
+
+Outcome: `lateRootfsResultVisibilityExplained`.
+
+The late process still starts and exits 0. The harness now records that this
+proves the script completed after writing `/macvz-r9-result` inside the vmexec
+mount namespace, while vminitd still cannot stat
+`/run/container/r9-late-alpha/rootfs/macvz-r9-result`.
+
+The next blocker is not userspace execution; it is creating a vminitd-verifiable
+identity evidence channel across the vmexec mount namespace boundary.
+
 ## MacVz Integration Boundary
 
 Until the primitive exists, MacVz should keep production runtime code unchanged.

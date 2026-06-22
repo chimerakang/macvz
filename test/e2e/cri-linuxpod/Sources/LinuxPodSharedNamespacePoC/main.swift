@@ -3197,6 +3197,9 @@ struct LinuxPodSharedNamespacePoC: AsyncParsableCommand {
                 }
             } catch {
                 errors["verify"] = describe(error)
+                if processExitCode == 0 {
+                    errors["resultVisibility"] = "process exit 0 proves the script completed after writing /macvz-r9-result inside the vmexec namespace, but vminitd could not stat \(resultPath)"
+                }
             }
         } else if prepareSucceeded {
             errors["verify"] = "skipped because process did not start and exit successfully"
@@ -3267,7 +3270,7 @@ struct LinuxPodSharedNamespacePoC: AsyncParsableCommand {
             return "vminitdContainerStartFailed"
         }
         if processExitCode == 0 && (!resultVerified || !namespaceVerified) {
-            return "lateRootfsUserspaceAdvanced"
+            return "lateRootfsResultVisibilityExplained"
         }
         if processExitCode != 0 || !resultVerified || !namespaceVerified {
             return "vminitdRootfsIdentityMismatch"

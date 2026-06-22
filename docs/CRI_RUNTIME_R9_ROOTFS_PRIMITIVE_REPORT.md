@@ -1,6 +1,6 @@
 # CRI-R9 vminitd Rootfs Primitive Launch Report (#101)
 
-Date: 2026-06-22T08:43:01Z
+Date: 2026-06-22T08:59:09Z
 
 ## Environment
 
@@ -23,15 +23,14 @@ Date: 2026-06-22T08:43:01Z
     "cleanupSucceeded" : true,
     "errors" : {
       "experimentalApiShape" : "existing vminitd Copy(COPY_OUT\/COPY_IN archive) used as PrepareContainerRootfs",
-      "processExit" : "exit 127",
       "rootfsPath" : "\/run\/container\/r9-late-alpha\/rootfs",
-      "verify" : "skipped because process did not start and exit successfully"
+      "verify" : "ContainerizationError: notFound: \"stat: path not found '\/run\/container\/r9-late-alpha\/rootfs\/macvz-r9-result'\" (cause: \"notFound: \"stat: path not found '\/run\/container\/r9-late-alpha\/rootfs\/macvz-r9-result'\"\")"
     },
     "namespaceVerified" : false,
-    "outcome" : "vminitdRootfsIdentityMismatch",
+    "outcome" : "lateRootfsUserspaceAdvanced",
     "processContainerID" : "r9-late-alpha",
     "processCreateSucceeded" : true,
-    "processExitCode" : 127,
+    "processExitCode" : 0,
     "processID" : "r9-late-alpha",
     "processStartSucceeded" : true,
     "requestID" : "late-alpha",
@@ -42,7 +41,7 @@ Date: 2026-06-22T08:43:01Z
     "stageSucceeded" : true,
     "verifyOutput" : ""
   },
-  "durationSeconds" : 2.4181909561157227,
+  "durationSeconds" : 2.203916072845459,
   "errors" : {
 
   },
@@ -54,9 +53,9 @@ Date: 2026-06-22T08:43:01Z
     "utility" : "\/tmp\/macvz-runtime-r9\/logs\/utility.log"
   },
   "note" : "R9 uses existing vminitd Copy archive transport as a local experimental PrepareContainerRootfs shape, then launches through the existing new-container process path",
-  "outcome" : "vminitdRootfsIdentityMismatch",
+  "outcome" : "lateRootfsUserspaceAdvanced",
   "podCreated" : true,
-  "podID" : "macvz-r9-1782117779",
+  "podID" : "macvz-r9-1782118747",
   "transportAvailable" : true,
   "utilityStarted" : true,
   "workDir" : "\/tmp\/macvz-runtime-r9"
@@ -79,26 +78,24 @@ experimental shape used by the harness was:
    as a temporary `PrepareContainerRootfs` transport.
 2. Copy `/run/container/utility/rootfs/bin/busybox` and
    `/run/container/utility/rootfs/lib` out of the running Pod VM.
-3. Build a minimal host-side rootfs with `/bin/sh`, `/bin/busybox`, `/lib`,
-   `/etc/macvz-r9-identity`, `/proc`, `/sys`, `/dev`, `/run`, and `/tmp`.
+3. Build a minimal host-side rootfs with `/bin/sh`, `/bin/busybox`, BusyBox
+   applet symlinks, `/lib`, `/etc/macvz-r9-identity`, `/proc`, `/sys`, `/dev`,
+   `/run`, and `/tmp`.
 4. Copy that rootfs back into the VM at
    `/run/container/r9-late-alpha/rootfs`.
 5. Call the existing vminitd new-container path:
    `createProcess(id: "r9-late-alpha", containerID: "r9-late-alpha", spec.root.path: "/run/container/r9-late-alpha/rootfs")`.
-6. Call `startProcess`, then `deleteProcess`, and verify the prepared rootfs is
-   removed.
+6. Call `startProcess`, then `deleteProcess`, and verify cleanup.
 
-## R10/R11/R12 Instrumentation Notes
+## R13 Instrumentation Note
 
-This report has been regenerated across the R10-R12 probes using local
-apple/containerization initfs images:
+This report was regenerated during CRI-R13. The late container process now
+starts and exits 0, so the prior userspace exit 127 is fixed. The remaining
+failure is that vminitd cannot stat:
 
-- R10 (`vminit:macvz-r10`) explained the original start failure as
-  `stage=remove(ptmx) errno=2`.
-- R11 (`vminit:macvz-r11`) patched ptmx ENOENT handling and advanced to
-  `stage=open(/dev/null) errno=2`.
-- R12 (`vminit:macvz-r12`) created `/dev/null` after OCI `/dev` tmpfs setup.
-  The process now starts and exits from userspace with code 127.
+```text
+/run/container/r9-late-alpha/rootfs/macvz-r9-result
+```
 
-The R12 conclusion is published at
-[CRI_RUNTIME_R12_DEVNULL_PROBE_REPORT.md](CRI_RUNTIME_R12_DEVNULL_PROBE_REPORT.md).
+The R13 conclusion is published at
+[CRI_RUNTIME_R13_USERSPACE_PROBE_REPORT.md](CRI_RUNTIME_R13_USERSPACE_PROBE_REPORT.md).

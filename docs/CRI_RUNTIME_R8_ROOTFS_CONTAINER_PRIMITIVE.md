@@ -447,6 +447,27 @@ That advances the research from vmexec device setup into rootfs completeness:
 the minimal R9 rootfs has `/bin/sh` and `/bin/busybox`, but no applet symlinks
 for commands used by the identity script.
 
+## R13 Result
+
+R13 completed on 2026-06-22 UTC. The live probe report is published at
+[CRI_RUNTIME_R13_USERSPACE_PROBE_REPORT.md](CRI_RUNTIME_R13_USERSPACE_PROBE_REPORT.md).
+
+Outcome: `lateRootfsUserspaceAdvanced`.
+
+The MacVz harness now adds relative BusyBox applet symlinks for the commands
+used by the identity script. The same late-rootfs harness advanced from
+userspace exit 127 to successful process exit:
+
+```text
+processStartSucceeded=true
+processExitCode=0
+```
+
+The remaining failure is result visibility: vminitd cannot stat
+`/run/container/r9-late-alpha/rootfs/macvz-r9-result` after the process exits.
+The next probe should explain where the result file is written across the
+vmexec mount namespace boundary.
+
 ## MacVz Integration Boundary
 
 Until the primitive exists, MacVz should keep production runtime code unchanged.

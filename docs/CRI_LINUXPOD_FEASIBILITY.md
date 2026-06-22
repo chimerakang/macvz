@@ -533,6 +533,23 @@ BusyBox applet symlinks or invoking `/bin/busybox <applet>` explicitly.
 Production CRI wiring remains blocked until the late container reports rootfs
 identity.
 
+### R13: Late Rootfs Userspace Probe (#105)
+
+R13 completed on 2026-06-22 UTC. The report is
+[CRI_RUNTIME_R13_USERSPACE_PROBE_REPORT.md](CRI_RUNTIME_R13_USERSPACE_PROBE_REPORT.md).
+
+Result: **the late-rootfs userspace command-not-found blocker was removed**.
+The R9 harness now creates relative BusyBox applet symlinks in the minimal
+rootfs. The rebuilt run no longer exits 127; it starts the process and receives
+`processExitCode=0`.
+
+The observed outcome is `lateRootfsUserspaceAdvanced`.
+
+Decision: the next probe should explain why `/macvz-r9-result` is not visible
+to vminitd at `/run/container/r9-late-alpha/rootfs/macvz-r9-result` after the
+process exits. Production CRI wiring remains blocked until rootfs identity
+evidence is verified.
+
 ### C5: Swift Helper Daemon Prototype
 
 Only if R0 later selects a LinuxPod-based bridge as a valid runtime building

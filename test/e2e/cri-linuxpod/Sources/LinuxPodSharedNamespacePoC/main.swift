@@ -3088,6 +3088,14 @@ struct LinuxPodSharedNamespacePoC: AsyncParsableCommand {
                 [.posixPermissions: 0o755],
                 ofItemAtPath: binDir.appendingPathComponent("sh").path
             )
+            for applet in ["cat", "grep", "ls", "readlink", "tr"] {
+                let appletPath = binDir.appendingPathComponent(applet)
+                try? FileManager.default.removeItem(at: appletPath)
+                try FileManager.default.createSymbolicLink(
+                    atPath: appletPath.path,
+                    withDestinationPath: "busybox"
+                )
+            }
             try "macvz-r9-id=\(requestID)\n".write(
                 to: identityDir.appendingPathComponent("macvz-r9-identity"),
                 atomically: true,
@@ -3257,6 +3265,9 @@ struct LinuxPodSharedNamespacePoC: AsyncParsableCommand {
         }
         if !processStartSucceeded {
             return "vminitdContainerStartFailed"
+        }
+        if processExitCode == 0 && (!resultVerified || !namespaceVerified) {
+            return "lateRootfsUserspaceAdvanced"
         }
         if processExitCode != 0 || !resultVerified || !namespaceVerified {
             return "vminitdRootfsIdentityMismatch"

@@ -77,7 +77,8 @@ architecture from Virtual Kubelet provider to kubelet CRI runtime integration.
 | CRI-R10 (#102) | Instrument vminitd/vmexec start failure for late prepared rootfs | ✅ Complete (instrumented `vminit:macvz-r10` showed bundle/rootfs/init/dynamic linker all present; `vmexec` failed in console `/dev/ptmx` setup at `remove(ptmx)` with ENOENT, outcome `vmexecStartFailureExplained`) |
 | CRI-R11 (#103) | Probe vmexec `/dev/ptmx` handling for late prepared rootfs start | ✅ Complete (local ptmx patch treated ENOENT as idempotent; `vminit:macvz-r11` advanced from `remove(ptmx)` to `open(/dev/null)` ENOENT, outcome `vmexecPtmxFixAdvancedToExec`) |
 | CRI-R12 (#104) | Probe vmexec `/dev/null` setup for late prepared rootfs start | ✅ Complete (local devnull patch created char device `1:3` after OCI `/dev` tmpfs; `vminit:macvz-r12` advanced to userspace exit 127, outcome `vmexecDevNullFixAdvancedToExec`) |
-| CRI-R13 (#105) | Make late-rootfs identity probe userspace runnable | 🟡 Planned (fix minimal rootfs BusyBox applet availability or command invocation so the identity script can run after R12 reached userspace) |
+| CRI-R13 (#105) | Make late-rootfs identity probe userspace runnable | ✅ Complete (R9 minimal rootfs now includes relative BusyBox applet symlinks; `vminit:macvz-r12` advanced to userspace exit 0, outcome `lateRootfsUserspaceAdvanced`) |
+| CRI-R14 (#106) | Probe late-rootfs result visibility across vmexec mount namespace | 🟡 Planned (explain why `/macvz-r9-result` is not visible at `/run/container/<id>/rootfs/macvz-r9-result` after successful userspace exit) |
 
 **CRI-P5 evidence (#77):** Pod networking is wired through the same primitives as
 the shipped provider — `network.PodIPAM` for Pod IPs and `podnet.Router` for the

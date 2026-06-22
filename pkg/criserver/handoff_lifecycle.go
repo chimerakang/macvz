@@ -2,11 +2,31 @@ package criserver
 
 import (
 	"errors"
+	"os"
 	"strconv"
 
 	"github.com/chimerakang/macvz/pkg/criserver/store"
 	"github.com/chimerakang/macvz/pkg/runtime"
 )
+
+// handoffWritePolicy describes a handoff directory's permission posture in terms
+// of the CRI-I5-1 (#121) policy, derived from its mode bits: owner-only and
+// owner+group are the hardened forms applied after a successful chown to the
+// container's runAsUser/runAsGroup; world-writable is the safe fallback used when
+// the owner is unknown or the adapter cannot chown to it. Any other mode is
+// reported verbatim so an unexpected posture is visible rather than mislabeled.
+func handoffWritePolicy(perm os.FileMode) string {
+	switch perm & 0o777 {
+	case 0o700:
+		return "owner-only"
+	case 0o770:
+		return "owner-group"
+	case 0o777:
+		return "world-writable-fallback"
+	default:
+		return "0" + strconv.FormatUint(uint64(perm&0o777), 8)
+	}
+}
 
 // handoff_lifecycle.go completes the CRI lifecycle mapping for handoff-aware
 // containers (CRI-I3-3, #117), building on the create-time preparation in
@@ -56,6 +76,18 @@ func (s *Server) handoffStatusInfo(c store.Container) map[string]string {
 		"handoffPath":       layout.HandoffDir,
 		"handoffMountPoint": layout.MountPoint,
 		"identitySource":    "handoff",
+	}
+
+	// Surface the runtime-private handoff directory's permission posture
+	// (CRI-I5-1, #121) so an operator can confirm whether it was narrowed to the
+	// container's runAsUser/runAsGroup or fell back to world-writable. Best-effort:
+	// a stat failure is reported as a diagnostic, never an error.
+	if fi, statErr := os.Stat(layout.HandoffDir); statErr == nil {
+		perm := fi.Mode().Perm()
+		info["handoffDirMode"] = "0" + strconv.FormatUint(uint64(perm), 8)
+		info["handoffWritePolicy"] = handoffWritePolicy(perm)
+	} else {
+		info["handoffDirMode"] = "stat-error: " + statErr.Error()
 	}
 
 	expected, expErr := runtime.ReadStagedIdentity(layout.RootfsDir)

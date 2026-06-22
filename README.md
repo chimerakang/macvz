@@ -90,6 +90,18 @@ macvz/
 
 ---
 
+### Experimental tracks (not the shipped runtime)
+
+A separate **experimental CRI feasibility adapter** (`cmd/macvz-cri`) explores running
+the Mac directly as a kubelet/CRI node. It is **not** the MacVz product surface above —
+the shipped path is the Virtual Kubelet provider (`macvz-kubelet`). The adapter's
+LinuxPod **runtime-handoff** path is **off by default**, opt-in via
+`macvz-cri --experimental-handoff`, experimental, and not production-ready. See
+[docs/CRI_EXPERIMENTAL_HANDOFF_OPERATOR.md](docs/CRI_EXPERIMENTAL_HANDOFF_OPERATOR.md)
+for the feature gate, supported/unsupported behavior, and operator install/run/cleanup.
+
+---
+
 ## 5. Phased Development Plan
 
 > **Guiding idea:** prove the runtime layer on a single Mac first, then make it a Kubernetes node, then connect nodes across machines.

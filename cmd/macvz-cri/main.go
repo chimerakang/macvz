@@ -139,7 +139,7 @@ func main() {
 	flag.BoolVar(&multiContainer, "experimental-multi-container", false,
 		"opt into the experimental multi-container Pod probe (#82): admits a second container only if the runtime implements pause-VM shared-netns create/join support; apple/container does not, so this turns the one-container rejection into a diagnostic naming the missing primitive")
 	flag.BoolVar(&handoff, "experimental-handoff", false,
-		"opt into the experimental LinuxPod runtime handoff path (CRI-I, #109..#117): CreateContainer prepares a runtime-private per-container rootfs/handoff subtree and StartContainer gates Running on handoff identity verification; off by default and unrelated to the shipped Virtual Kubelet runtime")
+		"opt into the experimental LinuxPod runtime handoff path (CRI-I, #109..#120): CreateContainer prepares a runtime-private per-container rootfs/handoff subtree and StartContainer gates Running on handoff identity verification; off by default, experimental (not production-ready), and unrelated to the shipped Virtual Kubelet runtime (docs/CRI_EXPERIMENTAL_HANDOFF_OPERATOR.md)")
 	flag.StringVar(&handoffRoot, "handoff-root", "",
 		"root directory for the experimental handoff subtree when --experimental-handoff is set (empty uses the production /run/macvz/containers, which is not writable on macOS; point this at a writable per-user dir to exercise the path locally)")
 	flag.BoolVar(&showVersion, "version", false, "print version and exit")
@@ -153,6 +153,7 @@ func main() {
 	}
 
 	mc := mountConfig{kubeletPodsDir: kubeletPodsDir, hostPathAllowed: hostPathAllowed}
+	hc := handoffConfig{enabled: handoff, root: handoffRoot}
 
 	if doPreflight {
 		if err := runPreflight(preflightConfig{
@@ -161,6 +162,7 @@ func main() {
 			runtimeBinary: runtimeBinary,
 			pn:            pn,
 			mc:            mc,
+			hc:            hc,
 		}); err != nil {
 			klog.Flush()
 			os.Exit(1)
@@ -171,8 +173,6 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-
-	hc := handoffConfig{enabled: handoff, root: handoffRoot}
 
 	if err := run(ctx, listen, stateDir, runtimeBinary, rosetta, streamingAddr, pn, mc, multiContainer, hc); err != nil {
 		klog.ErrorS(err, "macvz-cri exited with error")
@@ -239,10 +239,18 @@ func run(ctx context.Context, listen, stateDir, runtimeBinary string, rosetta bo
 	// apple/container path with no handoff preparation or identity gate.
 	var handoffMgr *runtime.HandoffManager
 	if hc.enabled {
-		handoffMgr = runtime.NewHandoffManager(hc.root)
-		klog.InfoS("experimental LinuxPod handoff path enabled",
-			"root", hc.root,
-			"note", "CreateContainer stages a runtime-private rootfs/handoff subtree and StartContainer gates Running on identity verification (docs/CRI_RUNTIME_R16_HANDOFF_DESIGN.md)")
+		// Fail loudly at startup if the operator opted into the experimental path but
+		// the environment cannot support it (e.g. the default /run/macvz/containers is
+		// not writable on macOS). Without this the failure would surface only at the
+		// first CreateContainer as an opaque Internal error.
+		effRoot, err := prepareHandoffRoot(hc.root)
+		if err != nil {
+			return fmt.Errorf("--experimental-handoff: %w", err)
+		}
+		handoffMgr = runtime.NewHandoffManager(effRoot)
+		klog.InfoS("experimental LinuxPod handoff path enabled (off by default; not the shipped Virtual Kubelet runtime)",
+			"root", effRoot,
+			"note", "CreateContainer stages a runtime-private rootfs/handoff subtree and StartContainer gates Running on identity verification (docs/CRI_EXPERIMENTAL_HANDOFF_OPERATOR.md)")
 	}
 
 	grpcServer := grpc.NewServer()
@@ -500,4 +508,25 @@ func defaultStateDir() string {
 		return filepath.Join(os.TempDir(), "macvz-cri", "sandboxes")
 	}
 	return filepath.Join(home, ".macvz", "cri", "sandboxes")
+}
+
+// prepareHandoffRoot resolves and provisions the experimental handoff subtree root
+// before the server starts, so an unsupported environment fails loudly here rather
+// than as an opaque Internal error at the first CreateContainer. An empty root
+// resolves to the production runtime.HandoffContainersRoot (the same fallback the
+// HandoffManager applies), which is not writable on macOS — hence the explicit
+// --handoff-root guidance. It returns the effective root on success.
+func prepareHandoffRoot(root string) (string, error) {
+	effective := root
+	if effective == "" {
+		effective = runtime.HandoffContainersRoot
+	}
+	if err := os.MkdirAll(effective, 0o755); err != nil {
+		return "", fmt.Errorf("handoff root %q could not be created: %w; pass --handoff-root to a writable directory (the production %s is not writable on macOS)",
+			effective, err, runtime.HandoffContainersRoot)
+	}
+	if err := dirWritable(effective); err != nil {
+		return "", fmt.Errorf("handoff root %q is not writable: %w; pass --handoff-root to a writable directory", effective, err)
+	}
+	return effective, nil
 }

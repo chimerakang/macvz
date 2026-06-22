@@ -90,6 +90,17 @@ macvz/
 
 ---
 
+### 實驗性路線（非正式出貨的 runtime）
+
+另有一個獨立的**實驗性 CRI 可行性轉接器**（`cmd/macvz-cri`），用來探索讓 Mac 直接以
+kubelet/CRI 節點的形式運作。它**不是**上述的 MacVz 產品介面——正式出貨路線仍是 Virtual
+Kubelet provider（`macvz-kubelet`）。該轉接器的 LinuxPod **runtime-handoff** 路徑
+**預設關閉**，需以 `macvz-cri --experimental-handoff` 明確開啟，屬實驗性質、尚未達生產可用。
+功能開關、支援／不支援的行為，以及操作者的安裝／執行／清理流程，詳見
+[docs/CRI_EXPERIMENTAL_HANDOFF_OPERATOR.md](docs/CRI_EXPERIMENTAL_HANDOFF_OPERATOR.md)。
+
+---
+
 ## 5. 漸進式開發階段規劃
 
 > **設計心法：** 先在單台 Mac 上把 runtime 層玩通，再讓它成為 Kubernetes 節點，最後串起跨機網路。

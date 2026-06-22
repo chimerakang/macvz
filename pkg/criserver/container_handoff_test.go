@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	goruntime "runtime"
 	"testing"
 
 	"github.com/chimerakang/macvz/internal/types"
@@ -182,6 +183,144 @@ func TestRemoveContainerCleansUpHandoff(t *testing.T) {
 	if _, err := os.Stat(layout.ContainerDir); !os.IsNotExist(err) {
 		t.Errorf("handoff subtree not removed by RemoveContainer: stat err=%v", err)
 	}
+}
+
+// --- CRI-I5-1 (#121) handoff permission hardening --------------------------
+
+// TestHandoffOwnerFromConfig covers resolving the container process owner from
+// the CRI security context: both ids, uid only, none, and an absent context.
+func TestHandoffOwnerFromConfig(t *testing.T) {
+	cases := []struct {
+		name string
+		sc   *runtimeapi.LinuxContainerSecurityContext
+		want runtime.HandoffOwner
+	}{
+		{"nil linux", nil, runtime.HandoffOwner{}},
+		{"uid and gid", &runtimeapi.LinuxContainerSecurityContext{
+			RunAsUser:  &runtimeapi.Int64Value{Value: 1000},
+			RunAsGroup: &runtimeapi.Int64Value{Value: 2000},
+		}, runtime.HandoffOwner{UID: 1000, GID: 2000, HasUID: true, HasGID: true}},
+		{"uid only", &runtimeapi.LinuxContainerSecurityContext{
+			RunAsUser: &runtimeapi.Int64Value{Value: 0},
+		}, runtime.HandoffOwner{UID: 0, HasUID: true}},
+		{"username only is ignored (unreliable)", &runtimeapi.LinuxContainerSecurityContext{
+			RunAsUsername: "nobody",
+		}, runtime.HandoffOwner{}},
+		{"group only is ignored without uid", &runtimeapi.LinuxContainerSecurityContext{
+			RunAsGroup: &runtimeapi.Int64Value{Value: 2000},
+		}, runtime.HandoffOwner{}},
+		{"negative uid ignored", &runtimeapi.LinuxContainerSecurityContext{
+			RunAsUser:  &runtimeapi.Int64Value{Value: -1},
+			RunAsGroup: &runtimeapi.Int64Value{Value: 2000},
+		}, runtime.HandoffOwner{}},
+		{"negative gid ignored", &runtimeapi.LinuxContainerSecurityContext{
+			RunAsUser:  &runtimeapi.Int64Value{Value: 1000},
+			RunAsGroup: &runtimeapi.Int64Value{Value: -1},
+		}, runtime.HandoffOwner{UID: 1000, HasUID: true}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &runtimeapi.ContainerConfig{}
+			if tc.sc != nil {
+				cfg.Linux = &runtimeapi.LinuxContainerConfig{SecurityContext: tc.sc}
+			}
+			if got := handoffOwnerFromConfig(cfg); got != tc.want {
+				t.Errorf("handoffOwnerFromConfig = %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestCreateContainerNarrowsHandoffToRunAsUser proves the end-to-end hardening:
+// a CreateContainer carrying a runAsUser/runAsGroup the adapter can chown to
+// (the test's own uid/gid) narrows the on-disk handoff dir below the
+// world-writable fallback, and verbose ContainerStatus reports the policy.
+func TestCreateContainerNarrowsHandoffToRunAsUser(t *testing.T) {
+	if goruntime.GOOS == "windows" {
+		t.Skip("unix file modes")
+	}
+	rt := newFakeRuntime()
+	s, sandboxID, root := newHandoffServer(t, rt, nil)
+
+	uid, gid := os.Getuid(), os.Getgid()
+	req := createReq(sandboxID, "app")
+	req.Config.Linux = &runtimeapi.LinuxContainerConfig{
+		SecurityContext: &runtimeapi.LinuxContainerSecurityContext{
+			RunAsUser:  &runtimeapi.Int64Value{Value: int64(uid)},
+			RunAsGroup: &runtimeapi.Int64Value{Value: int64(gid)},
+		},
+	}
+	resp, err := s.CreateContainer(context.Background(), req)
+	if err != nil {
+		t.Fatalf("CreateContainer: %v", err)
+	}
+	id := resp.GetContainerId()
+	workloadID := store.DeriveWorkloadID(id)
+	layout := layoutUnder(t, root, workloadID)
+
+	fi, err := os.Stat(layout.HandoffDir)
+	if err != nil {
+		t.Fatalf("stat handoff dir: %v", err)
+	}
+	if got := fi.Mode().Perm(); got != 0o770 {
+		t.Errorf("handoff dir mode = %o, want 0770 (narrowed to owner+group)", got)
+	}
+
+	rec, ok := s.containers.Get(id)
+	if !ok {
+		t.Fatalf("container record %q not persisted", id)
+	}
+	info := s.handoffStatusInfo(rec)
+	if info["handoffWritePolicy"] != "owner-group" {
+		t.Errorf("handoffWritePolicy = %q, want owner-group; info=%+v", info["handoffWritePolicy"], info)
+	}
+	if info["handoffDirMode"] != "0770" {
+		t.Errorf("handoffDirMode = %q, want 0770", info["handoffDirMode"])
+	}
+}
+
+// TestCreateContainerHandoffReadOnlyRootFSStillWritable proves a read-only root
+// filesystem does not block evidence: the handoff bind mount is independently
+// writable (ReadOnly=false), and the on-disk handoff dir is writable, so a
+// readOnlyRootFilesystem container can still report its identity.
+func TestCreateContainerHandoffReadOnlyRootFSStillWritable(t *testing.T) {
+	if goruntime.GOOS == "windows" {
+		t.Skip("unix file modes")
+	}
+	rt := newFakeRuntime()
+	s, sandboxID, root := newHandoffServer(t, rt, nil)
+
+	req := createReq(sandboxID, "app")
+	req.Config.Linux = &runtimeapi.LinuxContainerConfig{
+		SecurityContext: &runtimeapi.LinuxContainerSecurityContext{
+			ReadonlyRootfs: true,
+		},
+	}
+	resp, err := s.CreateContainer(context.Background(), req)
+	if err != nil {
+		t.Fatalf("CreateContainer: %v", err)
+	}
+	workloadID := store.DeriveWorkloadID(resp.GetContainerId())
+	layout := layoutUnder(t, root, workloadID)
+
+	// The handoff mount must remain writable regardless of read-only rootfs.
+	if len(rt.created) != 1 {
+		t.Fatalf("expected one workload create, got %d", len(rt.created))
+	}
+	wantMount := runtime.HandoffMount(layout)
+	if wantMount.ReadOnly {
+		t.Fatalf("test invariant: handoff mount should be writable")
+	}
+	if !hasMount(rt.created[0].Mounts, wantMount) {
+		t.Errorf("read-only-rootfs container missing writable handoff mount; mounts=%+v", rt.created[0].Mounts)
+	}
+	// And the on-disk handoff dir is writable (no runAsUser -> world-writable
+	// fallback, which a non-root container can write).
+	probe := filepath.Join(layout.HandoffDir, "identity")
+	if err := os.WriteFile(probe, []byte("identity=test\n"), 0o600); err != nil {
+		t.Errorf("handoff dir not writable under read-only rootfs: %v", err)
+	}
+	_ = os.Remove(probe)
 }
 
 func hasMount(mounts []types.Mount, want types.Mount) bool {

@@ -203,7 +203,7 @@ func (s *Server) CreateContainer(ctx context.Context, req *runtimeapi.CreateCont
 	// handoffCleanup undoes the staged subtree so the create leaves nothing behind.
 	var handoffCleanup func()
 	if joinRuntime == nil && s.handoffEnabled() {
-		cleanup, herr := s.prepareHandoff(&spec, workloadID)
+		cleanup, herr := s.prepareHandoff(&spec, workloadID, handoffOwnerFromConfig(cfg))
 		if herr != nil {
 			return nil, herr
 		}

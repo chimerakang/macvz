@@ -172,6 +172,56 @@ func TestPreflightKubeletPodsDirMissingWarns(t *testing.T) {
 	}
 }
 
+func TestPreflightHandoffDisabledIsOK(t *testing.T) {
+	r := checkHandoff(handoffConfig{enabled: false}, okProbes())
+	if r.Status != checkOK {
+		t.Fatalf("disabled handoff should be OK, got %s (%s)", r.Status, r.Detail)
+	}
+	for _, want := range []string{"disabled", "--experimental-handoff", "experimental"} {
+		if !strings.Contains(r.Detail, want) {
+			t.Errorf("disabled detail %q missing %q", r.Detail, want)
+		}
+	}
+}
+
+func TestPreflightHandoffEnabledWritableRootIsOK(t *testing.T) {
+	r := checkHandoff(handoffConfig{enabled: true, root: "/tmp/handoff"}, okProbes())
+	if r.Status != checkOK {
+		t.Fatalf("enabled handoff with writable root should be OK, got %s (%s)", r.Status, r.Detail)
+	}
+	if !strings.Contains(r.Detail, "/tmp/handoff") {
+		t.Errorf("detail %q missing root path", r.Detail)
+	}
+}
+
+func TestPreflightHandoffEnabledMissingRootWritableParentWarns(t *testing.T) {
+	p := okProbes()
+	// Root itself is not writable (missing), but its parent is.
+	p.dirWritable = func(dir string) error {
+		if dir == "/tmp/handoff" {
+			return fmt.Errorf("no such file or directory")
+		}
+		return nil
+	}
+	r := checkHandoff(handoffConfig{enabled: true, root: "/tmp/handoff"}, p)
+	if r.Status != checkWarn {
+		t.Fatalf("missing root with writable parent should WARN, got %s (%s)", r.Status, r.Detail)
+	}
+}
+
+func TestPreflightHandoffEnabledUnwritableFails(t *testing.T) {
+	p := okProbes()
+	// Neither the default root nor its parent is writable — the macOS /run case.
+	p.dirWritable = func(string) error { return fmt.Errorf("read-only file system") }
+	r := checkHandoff(handoffConfig{enabled: true}, p)
+	if r.Status != checkFail {
+		t.Fatalf("unwritable handoff root should FAIL, got %s (%s)", r.Status, r.Detail)
+	}
+	if !strings.Contains(r.Detail, "--handoff-root") {
+		t.Errorf("FAIL detail %q should suggest --handoff-root", r.Detail)
+	}
+}
+
 func TestRenderPreflightReturnsFalseOnFail(t *testing.T) {
 	var buf bytes.Buffer
 	results := []checkResult{

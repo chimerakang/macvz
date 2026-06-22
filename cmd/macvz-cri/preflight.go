@@ -13,6 +13,7 @@ import (
 
 	"github.com/chimerakang/macvz/pkg/criserver"
 	"github.com/chimerakang/macvz/pkg/network"
+	"github.com/chimerakang/macvz/pkg/runtime"
 )
 
 // preflight is the CRI-P8 operator diagnostics mode (#80). `macvz-cri --preflight`
@@ -36,6 +37,7 @@ type preflightConfig struct {
 	runtimeBinary string
 	pn            podNetConfig
 	mc            mountConfig
+	hc            handoffConfig
 }
 
 // checkStatus is the outcome of a single preflight check.
@@ -94,9 +96,53 @@ func preflightChecks(cfg preflightConfig, p preflightProbes) []checkResult {
 	out = append(out, checkStateDir(cfg.stateDir, p))
 	out = append(out, checkPodNetwork(cfg.pn, p))
 	out = append(out, checkMounts(cfg.mc, p)...)
+	out = append(out, checkHandoff(cfg.hc, p))
 	out = append(out, checkNodeRegistration())
 
 	return out
+}
+
+// checkHandoff validates the experimental LinuxPod handoff gate (CRI-I, #109..#120;
+// gate decision CRI-I5-3, #123). The path is off by default and is not the shipped
+// Virtual Kubelet runtime, so "disabled" is the expected OK state. When enabled it
+// must have a usable runtime-private subtree root: a writable root is OK; a missing
+// root whose parent is writable is a WARN (the adapter creates it at start); an
+// unusable root with an unwritable parent — the macOS /run/macvz/containers default —
+// is a FAIL with the --handoff-root remedy, matching the loud startup failure.
+func checkHandoff(hc handoffConfig, p preflightProbes) checkResult {
+	const name = "experimental handoff"
+	if !hc.enabled {
+		return checkResult{
+			Name:   name,
+			Status: checkOK,
+			Detail: "disabled (default): single-container Pods run on the apple/container path with no handoff preparation or identity gate; enable with --experimental-handoff (experimental, not production-ready)",
+		}
+	}
+	effective := hc.root
+	if effective == "" {
+		effective = runtime.HandoffContainersRoot
+	}
+	if err := p.dirWritable(effective); err == nil {
+		return checkResult{
+			Name:   name,
+			Status: checkOK,
+			Detail: fmt.Sprintf("enabled; runtime-private subtree root %s is writable (experimental, not production-ready)", effective),
+		}
+	}
+	parent := filepath.Dir(effective)
+	if perr := p.dirWritable(parent); perr == nil {
+		return checkResult{
+			Name:   name,
+			Status: checkWarn,
+			Detail: fmt.Sprintf("enabled; root %s not present yet but parent %s is writable, so it will be created at start", effective, parent),
+		}
+	}
+	return checkResult{
+		Name:   name,
+		Status: checkFail,
+		Detail: fmt.Sprintf("enabled but root %s is not usable and parent %s is not writable; pass --handoff-root to a writable directory (the production %s is not writable on macOS)",
+			effective, parent, runtime.HandoffContainersRoot),
+	}
 }
 
 // checkNodeRegistration is the CRI-P9 follow-up (#84) host-namespace scheduling

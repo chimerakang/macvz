@@ -148,6 +148,114 @@ func TestHandoffCreateMakesDirsWithModes(t *testing.T) {
 	}
 }
 
+// TestHandoffCreateForUserNarrowsToOwner proves the CRI-I5-1 (#121) hardening:
+// when the container's runAsUser/runAsGroup are known and the adapter can chown
+// the handoff directory to them, the directory is chowned to that owner and
+// narrowed below the world-writable fallback — owner+group when the gid is known,
+// owner-only when only the uid is. Chowning to the test's own uid/gid always
+// succeeds (no privilege needed), so this exercises the reliable-narrow path on
+// any machine.
+func TestHandoffCreateForUserNarrowsToOwner(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix file modes")
+	}
+	uid, gid := os.Getuid(), os.Getgid()
+
+	t.Run("uid and gid known -> owner+group 0770", func(t *testing.T) {
+		m := NewHandoffManager(t.TempDir())
+		layout, err := m.CreateForUser("macvz-cri-withgid", HandoffOwner{UID: uid, GID: gid, HasUID: true, HasGID: true})
+		if err != nil {
+			t.Fatalf("CreateForUser: %v", err)
+		}
+		assertHandoffMode(t, layout.HandoffDir, handoffDirModeOwnerGroup)
+		if ou, og, ok := statFileOwner(t, layout.HandoffDir); ok && (ou != uid || og != gid) {
+			t.Errorf("handoff dir owner = %d:%d, want %d:%d", ou, og, uid, gid)
+		}
+		assertWritable(t, layout.HandoffDir)
+	})
+
+	t.Run("uid only -> owner-only 0700", func(t *testing.T) {
+		m := NewHandoffManager(t.TempDir())
+		layout, err := m.CreateForUser("macvz-cri-uidonly", HandoffOwner{UID: uid, HasUID: true})
+		if err != nil {
+			t.Fatalf("CreateForUser: %v", err)
+		}
+		assertHandoffMode(t, layout.HandoffDir, handoffDirModeOwner)
+		if ou, _, ok := statFileOwner(t, layout.HandoffDir); ok && ou != uid {
+			t.Errorf("handoff dir uid = %d, want %d", ou, uid)
+		}
+		assertWritable(t, layout.HandoffDir)
+	})
+}
+
+// TestHandoffCreateForUserFallsBackWhenChownNotPermitted proves the safe
+// fallback: when the runAsUser is known but the adapter cannot chown the
+// directory to it (here, uid 0 from a non-root test process — EPERM), the
+// directory keeps the world-writable mode so the non-root container can still
+// write its identity evidence. Skipped when running as root, where chowning to 0
+// succeeds and there is no fallback to observe.
+func TestHandoffCreateForUserFallsBackWhenChownNotPermitted(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix file modes")
+	}
+	if os.Getuid() == 0 {
+		t.Skip("running as root: chown to any uid succeeds, so the fallback is unobservable")
+	}
+	m := NewHandoffManager(t.TempDir())
+	// Owner uid 0 (root): a non-root process cannot chown to it, so narrowing must
+	// not happen and the world-writable fallback must be kept.
+	layout, err := m.CreateForUser("macvz-cri-foreign", HandoffOwner{UID: 0, GID: 0, HasUID: true, HasGID: true})
+	if err != nil {
+		t.Fatalf("CreateForUser: %v", err)
+	}
+	assertHandoffMode(t, layout.HandoffDir, handoffDirMode)
+	// Ownership must be unchanged (still the adapter/test uid), and writable.
+	if ou, _, ok := statFileOwner(t, layout.HandoffDir); ok && ou != os.Getuid() {
+		t.Errorf("handoff dir uid = %d, want unchanged %d (chown should have failed)", ou, os.Getuid())
+	}
+	assertWritable(t, layout.HandoffDir)
+}
+
+// TestHandoffCreateUnknownOwnerIsWorldWritable proves an unknown owner (no
+// runAsUser, the image's user) keeps the world-writable fallback so any
+// configured non-root user can write evidence.
+func TestHandoffCreateUnknownOwnerIsWorldWritable(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix file modes")
+	}
+	m := NewHandoffManager(t.TempDir())
+	layout, err := m.CreateForUser("macvz-cri-unknown", HandoffOwner{})
+	if err != nil {
+		t.Fatalf("CreateForUser: %v", err)
+	}
+	assertHandoffMode(t, layout.HandoffDir, handoffDirMode)
+	assertWritable(t, layout.HandoffDir)
+}
+
+// assertHandoffMode fails unless path has exactly the expected permission bits.
+func assertHandoffMode(t *testing.T, path string, want os.FileMode) {
+	t.Helper()
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+	if got := fi.Mode().Perm(); got != want {
+		t.Errorf("handoff dir mode = %o, want %o", got, want)
+	}
+}
+
+// assertWritable proves a non-root container could write its evidence file: the
+// directory must allow creating a file under it.
+func assertWritable(t *testing.T, dir string) {
+	t.Helper()
+	f := filepath.Join(dir, "identity")
+	if err := os.WriteFile(f, []byte("identity=test\n"), 0o600); err != nil {
+		t.Errorf("handoff dir not writable (%s): %v", dir, err)
+		return
+	}
+	_ = os.Remove(f)
+}
+
 func TestHandoffCreateIsRepeatable(t *testing.T) {
 	m := NewHandoffManager(t.TempDir())
 	id := "macvz-cri-repeat"

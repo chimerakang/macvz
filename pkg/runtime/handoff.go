@@ -37,14 +37,26 @@ const (
 	containerDirMode = 0o755
 	rootfsDirMode    = 0o755
 
-	// handoffDirMode is intentionally world-writable so the container's
-	// configured process user can write evidence even when it is not root.
+	// handoffDirMode is the safe fallback when the container's process user is
+	// unknown or the adapter cannot chown the directory to it: world-writable so
+	// the configured process user can write evidence even when it is not root.
 	// R15 showed that a root-owned 0755 handoff directory causes "Permission
-	// denied" for non-root late processes. This is safe because the directory
-	// is private to one container and deleted with that container; it is not a
-	// shared Pod volume or a host filesystem escape. Future hardening can narrow
-	// this to runAsUser/runAsGroup once user mapping lands in the LinuxPod path.
+	// denied" for non-root late processes. This is safe because the directory is
+	// private to one container and deleted with that container; it is not a shared
+	// Pod volume or a host filesystem escape. CRI-I5-1 (#121) narrows it below this
+	// fallback whenever runAsUser/runAsGroup are known and chownable.
 	handoffDirMode = 0o777
+
+	// handoffDirModeOwner and handoffDirModeOwnerGroup are the hardened modes used
+	// after the handoff directory has been chowned to the container's known
+	// runAsUser (and, when set, runAsGroup): owner-only when only the uid is known,
+	// owner+group when the gid is also known (covering an fsGroup/runAsGroup that
+	// shares the directory). Both keep the owning container writable while removing
+	// the world-write bit, so an unrelated host-local process can no longer write
+	// the evidence channel. They are applied only on a successful chown, so a
+	// non-root container always retains write access (CRI-I5-1, #121).
+	handoffDirModeOwner      = 0o700
+	handoffDirModeOwnerGroup = 0o770
 )
 
 // ErrInvalidHandoffID means a container/workload ID could not be used to derive
@@ -78,6 +90,25 @@ type HandoffLayout struct {
 	// (HandoffDir/identity).
 	IdentityFile string
 }
+
+// HandoffOwner is the resolved container process owner the handoff directory
+// should be writable by, derived from the Pod's securityContext
+// runAsUser/runAsGroup (CRI-I5-1, #121). The zero value means the owner is
+// unknown — the image's configured user is used and the runtime cannot predict
+// the uid — so Create keeps the world-writable fallback. A known UID lets Create
+// narrow the handoff directory to that owner when it can chown it.
+//
+// It carries explicit Has* flags rather than a sentinel uid because 0 (root) is a
+// legitimate, distinct value from "unset".
+type HandoffOwner struct {
+	UID    int
+	GID    int
+	HasUID bool
+	HasGID bool
+}
+
+// known reports whether a uid was resolved from the security context.
+func (o HandoffOwner) known() bool { return o.HasUID }
 
 // HandoffManager derives and manages runtime-private handoff paths under a root.
 // The zero value is not usable; construct one with NewHandoffManager. It holds
@@ -118,16 +149,33 @@ func (m *HandoffManager) Layout(containerID string) (HandoffLayout, error) {
 }
 
 // Create derives the layout and creates the container, rootfs, and handoff
+// directories with their intended modes, keeping the world-writable handoff
+// fallback (the owner is unknown). It is equivalent to CreateForUser with a zero
+// HandoffOwner and is retained for callers that have no security context.
+func (m *HandoffManager) Create(containerID string) (HandoffLayout, error) {
+	return m.CreateForUser(containerID, HandoffOwner{})
+}
+
+// CreateForUser derives the layout and creates the container, rootfs, and handoff
 // directories with their intended modes. It is safe to call more than once for
 // the same container: existing directories are reused and their modes are
 // re-applied. The handoff directory mode is forced with Chmod so a restrictive
 // umask cannot leave it non-writable for a non-root container process.
 //
-// On any failure after this call creates a new container subtree, Create removes
-// that subtree so a first-time failed Create leaves nothing staged. If the
+// Permission policy (CRI-I5-1, #121): when owner carries a known runAsUser,
+// CreateForUser chowns the handoff directory to that uid (and gid when known) and
+// narrows it to owner-only (0700) or owner+group (0770), removing the world-write
+// bit. The chown is best-effort: when the adapter is not privileged enough to
+// chown to that uid (the common macOS case, where apple/container refuses to run
+// as root), it falls back to the world-writable mode so a non-root container can
+// still write its identity evidence. Correctness (writable) always wins over
+// hardening. The rootfs and container dirs are runtime-owned and never chowned.
+//
+// On any failure after this call creates a new container subtree, CreateForUser
+// removes that subtree so a first-time failed call leaves nothing staged. If the
 // subtree already existed, failures leave it intact so retry cannot destroy
 // handoff evidence or debug state from an earlier attempt.
-func (m *HandoffManager) Create(containerID string) (HandoffLayout, error) {
+func (m *HandoffManager) CreateForUser(containerID string, owner HandoffOwner) (HandoffLayout, error) {
 	layout, err := m.Layout(containerID)
 	if err != nil {
 		return HandoffLayout{}, err
@@ -167,11 +215,45 @@ func (m *HandoffManager) Create(containerID string) (HandoffLayout, error) {
 	if err := os.MkdirAll(layout.HandoffDir, handoffDirMode); err != nil {
 		return cleanup(fmt.Errorf("runtime: create handoff dir: %w", err))
 	}
-	// MkdirAll applies the umask, so force the world-writable mode explicitly.
-	if err := os.Chmod(layout.HandoffDir, handoffDirMode); err != nil {
+	// Resolve the handoff-dir mode from the owner, narrowing below the
+	// world-writable fallback only when the directory could be chowned to a known
+	// runAsUser. MkdirAll applies the umask, so the chosen mode is forced with an
+	// explicit Chmod that a restrictive umask cannot strip.
+	mode := m.applyHandoffOwnership(layout.HandoffDir, owner)
+	if err := os.Chmod(layout.HandoffDir, mode); err != nil {
 		return cleanup(fmt.Errorf("runtime: chmod handoff dir: %w", err))
 	}
 	return layout, nil
+}
+
+// applyHandoffOwnership best-effort chowns the handoff directory to a known
+// container owner and returns the directory mode to enforce. With an unknown
+// owner, or when the chown is not permitted (the adapter is not privileged enough
+// to give the directory to that uid — the common non-root macOS case), it returns
+// the world-writable fallback so a non-root container can still write evidence.
+// A successful chown narrows the mode to owner-only (uid known) or owner+group
+// (uid and gid known). The chown is ordered before the caller's Chmod so that,
+// when it succeeds (the adapter is privileged), the subsequent Chmod still
+// applies; when it fails, the directory remains owned by the adapter and the
+// fallback Chmod succeeds. It never returns an error: hardening is best-effort and
+// must not break a create.
+func (m *HandoffManager) applyHandoffOwnership(handoffDir string, owner HandoffOwner) os.FileMode {
+	if !owner.known() {
+		return handoffDirMode
+	}
+	gid := -1
+	if owner.HasGID {
+		gid = owner.GID
+	}
+	if err := os.Chown(handoffDir, owner.UID, gid); err != nil {
+		// Not reliable (e.g. EPERM: the adapter cannot chown to that uid). Keep the
+		// world-writable fallback so the non-root container can still write.
+		return handoffDirMode
+	}
+	if owner.HasGID {
+		return handoffDirModeOwnerGroup
+	}
+	return handoffDirModeOwner
 }
 
 // Cleanup removes the entire per-container subtree (rootfs, handoff, and any

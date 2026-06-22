@@ -94,6 +94,37 @@ func TestPrepareSocket(t *testing.T) {
 	})
 }
 
+func TestPrepareHandoffRoot(t *testing.T) {
+	t.Run("creates writable root", func(t *testing.T) {
+		root := filepath.Join(t.TempDir(), "handoff", "containers")
+		got, err := prepareHandoffRoot(root)
+		if err != nil {
+			t.Fatalf("prepareHandoffRoot: %v", err)
+		}
+		if got != root {
+			t.Errorf("effective root = %q, want %q", got, root)
+		}
+		if fi, err := os.Stat(root); err != nil || !fi.IsDir() {
+			t.Errorf("root not created: stat err=%v", err)
+		}
+	})
+
+	t.Run("unusable root fails loudly", func(t *testing.T) {
+		// Root under a regular file: MkdirAll fails ENOTDIR deterministically.
+		blocker := filepath.Join(t.TempDir(), "not-a-dir")
+		if err := os.WriteFile(blocker, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		_, err := prepareHandoffRoot(filepath.Join(blocker, "containers"))
+		if err == nil {
+			t.Fatal("prepareHandoffRoot should fail under a non-directory parent")
+		}
+		if !strings.Contains(err.Error(), "--handoff-root") {
+			t.Errorf("error %q should suggest --handoff-root", err.Error())
+		}
+	})
+}
+
 func TestSetupStreamingPublishesConcretePort(t *testing.T) {
 	containers, _, err := store.NewContainerStore("")
 	if err != nil {

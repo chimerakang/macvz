@@ -2,12 +2,14 @@ package criserver
 
 import (
 	"errors"
+	"strconv"
 
 	"github.com/chimerakang/macvz/internal/types"
 	"github.com/chimerakang/macvz/pkg/criserver/store"
 	"github.com/chimerakang/macvz/pkg/runtime"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
 	"k8s.io/klog/v2"
 )
 
@@ -29,6 +31,46 @@ import (
 // handoffEnabled reports whether the experimental LinuxPod handoff path is wired.
 func (s *Server) handoffEnabled() bool { return s.handoff != nil }
 
+// handoffOwnerFromConfig resolves the container's process owner from the CRI
+// container config's Linux security context (CRI-I5-1, #121) so the handoff
+// directory can be narrowed to the configured runAsUser/runAsGroup. Only the
+// numeric runAsUser/runAsGroup are used: they map deterministically to the host
+// file owner over the VirtioFS share. runAsUsername is intentionally ignored —
+// resolving a name requires reading the image's /etc/passwd and is not reliable
+// at prepare time, so it degrades to the safe world-writable fallback. A missing
+// security context or runAsUser yields a zero (unknown) owner, which keeps the
+// fallback.
+func handoffOwnerFromConfig(cfg *runtimeapi.ContainerConfig) runtime.HandoffOwner {
+	sc := cfg.GetLinux().GetSecurityContext()
+	if sc == nil {
+		return runtime.HandoffOwner{}
+	}
+	var owner runtime.HandoffOwner
+	if u := sc.GetRunAsUser(); u != nil {
+		if uid, ok := handoffIDValue(u.GetValue()); ok {
+			owner.UID = uid
+			owner.HasUID = true
+		}
+	}
+	if g := sc.GetRunAsGroup(); owner.HasUID && g != nil {
+		if gid, ok := handoffIDValue(g.GetValue()); ok {
+			owner.GID = gid
+			owner.HasGID = true
+		}
+	}
+	return owner
+}
+
+func handoffIDValue(v int64) (int, bool) {
+	if v < 0 {
+		return 0, false
+	}
+	if strconv.IntSize == 32 && v > int64(^uint(0)>>1) {
+		return 0, false
+	}
+	return int(v), true
+}
+
 // prepareHandoff prepares the runtime-private rootfs/handoff subtree for a
 // workload and injects the handoff bind mount into spec. On success it returns a
 // cleanup func the caller must invoke if a later step (workload create or
@@ -37,9 +79,12 @@ func (s *Server) handoffEnabled() bool { return s.handoff != nil }
 // collision maps to FailedPrecondition, a filesystem/preparation fault to
 // Internal.
 //
-// It must be called only when handoffEnabled() is true.
-func (s *Server) prepareHandoff(spec *types.ContainerSpec, workloadID string) (cleanup func(), err error) {
-	layout, err := s.handoff.Create(workloadID)
+// It must be called only when handoffEnabled() is true. owner carries the
+// container's resolved runAsUser/runAsGroup (CRI-I5-1, #121) so the handoff
+// directory can be narrowed to that user when the adapter can chown it; a zero
+// owner keeps the world-writable fallback.
+func (s *Server) prepareHandoff(spec *types.ContainerSpec, workloadID string, owner runtime.HandoffOwner) (cleanup func(), err error) {
+	layout, err := s.handoff.CreateForUser(workloadID, owner)
 	if err != nil {
 		// An invalid workload ID is a precondition fault; any other create error is
 		// a filesystem fault. Either way nothing partial is left: Create undoes a

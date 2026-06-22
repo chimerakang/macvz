@@ -1,6 +1,6 @@
 # CRI-R9 vminitd Rootfs Primitive Launch Report (#101)
 
-Date: 2026-06-22T09:13:14Z
+Date: 2026-06-22T09:31:12Z
 
 ## Environment
 
@@ -23,12 +23,11 @@ Date: 2026-06-22T09:13:14Z
     "cleanupSucceeded" : true,
     "errors" : {
       "experimentalApiShape" : "existing vminitd Copy(COPY_OUT\/COPY_IN archive) used as PrepareContainerRootfs",
-      "resultVisibility" : "process exit 0 proves the script completed after writing \/macvz-r9-result inside the vmexec namespace, but vminitd could not stat \/run\/container\/r9-late-alpha\/rootfs\/macvz-r9-result",
-      "rootfsPath" : "\/run\/container\/r9-late-alpha\/rootfs",
-      "verify" : "ContainerizationError: notFound: \"stat: path not found '\/run\/container\/r9-late-alpha\/rootfs\/macvz-r9-result'\" (cause: \"notFound: \"stat: path not found '\/run\/container\/r9-late-alpha\/rootfs\/macvz-r9-result'\"\")"
+      "namespaceEvidence" : "bind-mounted handoff verified rootfs identity; proc_root did not expose the host-visible prepared-rootfs path",
+      "rootfsPath" : "\/run\/container\/r9-late-alpha\/rootfs"
     },
     "namespaceVerified" : false,
-    "outcome" : "lateRootfsResultVisibilityExplained",
+    "outcome" : "vminitdRootfsPrimitiveLaunchSucceeded",
     "processContainerID" : "r9-late-alpha",
     "processCreateSucceeded" : true,
     "processExitCode" : 0,
@@ -36,13 +35,13 @@ Date: 2026-06-22T09:13:14Z
     "processStartSucceeded" : true,
     "requestID" : "late-alpha",
     "resultPath" : "\/run\/container\/r9-late-alpha\/rootfs\/macvz-r9-result",
-    "resultVerified" : false,
-    "stageOutput" : "prepare_ok source=\/run\/container\/utility\/rootfs\/bin\/busybox rootfs=\/run\/container\/r9-late-alpha\/rootfs",
+    "resultVerified" : true,
+    "stageOutput" : "prepare_ok source=\/run\/container\/utility\/rootfs\/bin\/busybox rootfs=\/run\/container\/r9-late-alpha\/rootfs evidence=\/run\/macvz-r9-evidence\/r9-late-alpha",
     "stagePath" : "\/run\/container\/r9-late-alpha\/rootfs",
     "stageSucceeded" : true,
-    "verifyOutput" : ""
+    "verifyOutput" : "identity=macvz-r9-id=late-alpha\nexpected=macvz-r9-id=late-alpha\npwd=\/\nproc_root=\/\nroot_mount=tmpfs \/ tmpfs rw,relatime 0 0\nroot_listing=bin,dev,etc,lib,macvz-r9-evidence,macvz-r9-result,proc,run,sys,tmp,\n"
   },
-  "durationSeconds" : 2.5749579668045044,
+  "durationSeconds" : 3.176005005836487,
   "errors" : {
 
   },
@@ -54,9 +53,9 @@ Date: 2026-06-22T09:13:14Z
     "utility" : "\/tmp\/macvz-runtime-r9\/logs\/utility.log"
   },
   "note" : "R9 uses existing vminitd Copy archive transport as a local experimental PrepareContainerRootfs shape, then launches through the existing new-container process path",
-  "outcome" : "lateRootfsResultVisibilityExplained",
+  "outcome" : "vminitdRootfsPrimitiveLaunchSucceeded",
   "podCreated" : true,
-  "podID" : "macvz-r9-1782119592",
+  "podID" : "macvz-r9-1782120669",
   "transportAvailable" : true,
   "utilityStarted" : true,
   "workDir" : "\/tmp\/macvz-runtime-r9"
@@ -70,14 +69,15 @@ Date: 2026-06-22T09:13:14Z
 - [x] vminitd createProcess/startProcess was called with id == containerID to target the new-container path.
 - [x] Identity, namespace/rootfs evidence, deleteProcess cleanup, and the final R9 outcome were recorded.
 
-## R14 Instrumentation Note
+## R15 Instrumentation Note
 
-This report was regenerated during CRI-R14. The late process starts and exits 0,
-and the harness records:
+This report was regenerated during CRI-R15. The harness now verifies late-rootfs
+identity through a vminitd-visible bind-mounted handoff path:
 
 ```text
-process exit 0 proves the script completed after writing /macvz-r9-result inside the vmexec namespace, but vminitd could not stat /run/container/r9-late-alpha/rootfs/macvz-r9-result
+/run/macvz-r9-evidence/r9-late-alpha/macvz-r9-result
 ```
 
-The R14 conclusion is published at
-[CRI_RUNTIME_R14_RESULT_VISIBILITY_REPORT.md](CRI_RUNTIME_R14_RESULT_VISIBILITY_REPORT.md).
+The late process exits 0, `resultVerified=true`, and the outcome is
+`vminitdRootfsPrimitiveLaunchSucceeded`. The R15 conclusion is published at
+[CRI_RUNTIME_R15_EVIDENCE_CHANNEL_REPORT.md](CRI_RUNTIME_R15_EVIDENCE_CHANNEL_REPORT.md).

@@ -483,6 +483,24 @@ mount namespace, while vminitd still cannot stat
 The next blocker is not userspace execution; it is creating a vminitd-verifiable
 identity evidence channel across the vmexec mount namespace boundary.
 
+## R15 Result
+
+R15 completed on 2026-06-22 UTC. The live probe report is published at
+[CRI_RUNTIME_R15_EVIDENCE_CHANNEL_REPORT.md](CRI_RUNTIME_R15_EVIDENCE_CHANNEL_REPORT.md).
+
+Outcome: `vminitdRootfsPrimitiveLaunchSucceeded`.
+
+The R9 harness now prepares a vminitd-visible handoff directory at
+`/run/macvz-r9-evidence/<processID>`, bind-mounts it into the late rootfs at
+`/macvz-r9-evidence`, and verifies
+`/run/macvz-r9-evidence/r9-late-alpha/macvz-r9-result` with vminitd stat/copyOut.
+The late process exits 0 and the copied payload contains
+`identity=macvz-r9-id=late-alpha`.
+
+This proves the late prepared-rootfs process can report expected rootfs identity
+through an explicit evidence channel. The remaining work is productionizing that
+handoff shape in the CRI runtime design, not proving the launch path again.
+
 ## MacVz Integration Boundary
 
 Until the primitive exists, MacVz should keep production runtime code unchanged.

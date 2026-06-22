@@ -567,6 +567,27 @@ Decision: the next probe should add a vminitd-verifiable evidence channel,
 such as stdout capture or an explicit shared result mount. Production CRI wiring
 remains blocked until rootfs identity evidence is verified.
 
+### R15: Late Rootfs Evidence Channel (#107)
+
+R15 completed on 2026-06-22 UTC. The report is
+[CRI_RUNTIME_R15_EVIDENCE_CHANNEL_REPORT.md](CRI_RUNTIME_R15_EVIDENCE_CHANNEL_REPORT.md).
+
+Result: **late rootfs identity evidence is verified**. The harness prepares a
+vminitd-visible handoff directory, bind-mounts it into the late rootfs, and
+verifies the copied result at
+`/run/macvz-r9-evidence/r9-late-alpha/macvz-r9-result`.
+
+The observed outcome is `vminitdRootfsPrimitiveLaunchSucceeded`:
+
+```text
+processStartSucceeded=true
+processExitCode=0
+resultVerified=true
+```
+
+Decision: the research direction can move from harness proof to CRI runtime
+design for a per-container evidence/result handoff path and cleanup lifecycle.
+
 ### C5: Swift Helper Daemon Prototype
 
 Only if R0 later selects a LinuxPod-based bridge as a valid runtime building

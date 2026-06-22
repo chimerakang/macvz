@@ -2047,9 +2047,29 @@ struct LinuxPodSharedNamespacePoC: AsyncParsableCommand {
         markerPrefix: String,
         identityFileName: String,
         resultFileName: String,
+        evidenceSourcePath: String? = nil,
+        evidenceDestinationPath: String? = nil,
         hostnamePrefix: String
     ) -> ContainerizationOCI.Spec {
-        ContainerizationOCI.Spec(
+        var mounts = [
+            ContainerizationOCI.Mount(type: "proc", source: "proc", destination: "/proc"),
+            ContainerizationOCI.Mount(type: "tmpfs", source: "tmpfs", destination: "/dev", options: ["nosuid", "mode=755", "size=65536k"]),
+            ContainerizationOCI.Mount(type: "devpts", source: "devpts", destination: "/dev/pts", options: ["nosuid", "noexec", "newinstance", "gid=5", "mode=0620", "ptmxmode=0666"]),
+            ContainerizationOCI.Mount(type: "sysfs", source: "sysfs", destination: "/sys", options: ["nosuid", "noexec", "nodev"]),
+            ContainerizationOCI.Mount(type: "tmpfs", source: "tmpfs", destination: "/dev/shm", options: ["nosuid", "noexec", "nodev", "mode=1777", "size=65536k"]),
+        ]
+        if let evidenceSourcePath, let evidenceDestinationPath {
+            mounts.append(
+                ContainerizationOCI.Mount(
+                    type: "bind",
+                    source: evidenceSourcePath,
+                    destination: evidenceDestinationPath,
+                    options: ["rbind", "rw"]
+                )
+            )
+        }
+
+        return ContainerizationOCI.Spec(
             version: "1.0.2",
             process: ContainerizationOCI.Process(
                 args: [
@@ -2067,19 +2087,17 @@ struct LinuxPodSharedNamespacePoC: AsyncParsableCommand {
                       echo "root_listing=$(ls -1 / 2>/dev/null | tr '\\n' ',' || true)"
                     } > /\(resultFileName)
                     test "${identity}" = "\(markerPrefix)=\(requestID)"
+                    if [ -d "\(evidenceDestinationPath ?? "/__macvz_no_handoff")" ]; then
+                      cat /\(resultFileName) > "\(evidenceDestinationPath ?? "/__macvz_no_handoff")/\(resultFileName)"
+                      sync
+                    fi
                     """,
                 ],
                 cwd: "/",
                 env: ["PATH=\(LinuxProcessConfiguration.defaultPath)"]
             ),
             hostname: "\(hostnamePrefix)-\(requestID)",
-            mounts: [
-                ContainerizationOCI.Mount(type: "proc", source: "proc", destination: "/proc"),
-                ContainerizationOCI.Mount(type: "tmpfs", source: "tmpfs", destination: "/dev", options: ["nosuid", "mode=755", "size=65536k"]),
-                ContainerizationOCI.Mount(type: "devpts", source: "devpts", destination: "/dev/pts", options: ["nosuid", "noexec", "newinstance", "gid=5", "mode=0620", "ptmxmode=0666"]),
-                ContainerizationOCI.Mount(type: "sysfs", source: "sysfs", destination: "/sys", options: ["nosuid", "noexec", "nodev"]),
-                ContainerizationOCI.Mount(type: "tmpfs", source: "tmpfs", destination: "/dev/shm", options: ["nosuid", "noexec", "nodev", "mode=1777", "size=65536k"]),
-            ],
+            mounts: mounts,
             root: ContainerizationOCI.Root(path: rootfsPath, readonly: false),
             linux: ContainerizationOCI.Linux(
                 resources: ContainerizationOCI.LinuxResources(),
@@ -3034,8 +3052,15 @@ struct LinuxPodSharedNamespacePoC: AsyncParsableCommand {
         let processID = "r9-\(escapedID)"
         let rootfsPath = "/run/container/\(processID)/rootfs"
         let resultPath = "\(rootfsPath)/macvz-r9-result"
+        let evidencePath = "/run/macvz-r9-evidence/\(processID)"
+        let evidenceResultPath = "\(evidencePath)/macvz-r9-result"
         let hostPreparedRootfs = rootfsURL.appendingPathComponent("r9-prepared-\(escapedID)")
         let hostResultPath = rootfsURL.appendingPathComponent("r9-result-\(escapedID).txt")
+        let hostEvidenceDir = rootfsURL.appendingPathComponent("r9-evidence-\(escapedID)")
+        let hostEvidenceResultPath = rootfsURL.appendingPathComponent("r9-evidence-result-\(escapedID).txt")
+        let stderrPort = randomVsockPort()
+        let stderrListener = try vm.listen(stderrPort)
+        var stderrOutput = ""
         var prepareSucceeded = false
         var processCreateSucceeded = false
         var processStartSucceeded = false
@@ -3054,14 +3079,24 @@ struct LinuxPodSharedNamespacePoC: AsyncParsableCommand {
         do {
             try? FileManager.default.removeItem(at: hostPreparedRootfs)
             try? FileManager.default.removeItem(at: hostResultPath)
+            try? FileManager.default.removeItem(at: hostEvidenceDir)
+            try? FileManager.default.removeItem(at: hostEvidenceResultPath)
             let binDir = hostPreparedRootfs.appendingPathComponent("bin")
             let identityDir = hostPreparedRootfs.appendingPathComponent("etc")
-            for dir in ["dev", "proc", "run", "sys", "tmp"] {
+            for dir in ["dev", "macvz-r9-evidence", "proc", "run", "sys", "tmp"] {
                 try FileManager.default.createDirectory(
                     at: hostPreparedRootfs.appendingPathComponent(dir),
                     withIntermediateDirectories: true
                 )
             }
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o777],
+                ofItemAtPath: hostPreparedRootfs.path
+            )
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o777],
+                ofItemAtPath: hostPreparedRootfs.appendingPathComponent("macvz-r9-evidence").path
+            )
             try FileManager.default.createDirectory(at: binDir, withIntermediateDirectories: true)
             try FileManager.default.createDirectory(at: identityDir, withIntermediateDirectories: true)
             try await copyGuestPathToHost(
@@ -3088,7 +3123,7 @@ struct LinuxPodSharedNamespacePoC: AsyncParsableCommand {
                 [.posixPermissions: 0o755],
                 ofItemAtPath: binDir.appendingPathComponent("sh").path
             )
-            for applet in ["cat", "grep", "ls", "readlink", "tr"] {
+            for applet in ["cat", "grep", "ls", "readlink", "sync", "tr"] {
                 let appletPath = binDir.appendingPathComponent(applet)
                 try? FileManager.default.removeItem(at: appletPath)
                 try FileManager.default.createSymbolicLink(
@@ -3102,6 +3137,16 @@ struct LinuxPodSharedNamespacePoC: AsyncParsableCommand {
                 encoding: .utf8
             )
             try? FileManager.default.removeItem(at: hostPreparedRootfs.appendingPathComponent("macvz-r9-result"))
+            try FileManager.default.createDirectory(at: hostEvidenceDir, withIntermediateDirectories: true)
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o777],
+                ofItemAtPath: hostEvidenceDir.path
+            )
+            try "macvz-r9-evidence\n".write(
+                to: hostEvidenceDir.appendingPathComponent(".keep"),
+                atomically: true,
+                encoding: .utf8
+            )
 
             try await copyHostPathToGuest(
                 vm: vm,
@@ -3109,11 +3154,18 @@ struct LinuxPodSharedNamespacePoC: AsyncParsableCommand {
                 source: hostPreparedRootfs,
                 guestPath: rootfsPath
             )
+            try await copyHostPathToGuest(
+                vm: vm,
+                vminitd: vminitd,
+                source: hostEvidenceDir,
+                guestPath: evidencePath
+            )
             _ = try await vminitd.stat(path: URL(fileURLWithPath: "\(rootfsPath)/bin/sh"))
             _ = try await vminitd.stat(path: URL(fileURLWithPath: "\(rootfsPath)/etc/macvz-r9-identity"))
+            _ = try await vminitd.stat(path: URL(fileURLWithPath: "\(evidencePath)/.keep"))
             try await vminitd.sync()
             prepareSucceeded = true
-            prepareOutput = "prepare_ok source=/run/container/utility/rootfs/bin/busybox rootfs=\(rootfsPath)"
+            prepareOutput = "prepare_ok source=/run/container/utility/rootfs/bin/busybox rootfs=\(rootfsPath) evidence=\(evidencePath)"
         } catch {
             errors["prepare"] = describe(error)
         }
@@ -3126,6 +3178,8 @@ struct LinuxPodSharedNamespacePoC: AsyncParsableCommand {
                 markerPrefix: "macvz-r9-id",
                 identityFileName: "macvz-r9-identity",
                 resultFileName: "macvz-r9-result",
+                evidenceSourcePath: evidencePath,
+                evidenceDestinationPath: "/macvz-r9-evidence",
                 hostnamePrefix: "macvz-r9"
             )
             do {
@@ -3134,7 +3188,7 @@ struct LinuxPodSharedNamespacePoC: AsyncParsableCommand {
                     containerID: processID,
                     stdinPort: nil,
                     stdoutPort: nil,
-                    stderrPort: nil,
+                    stderrPort: stderrPort,
                     ociRuntimePath: nil,
                     configuration: spec,
                     options: nil
@@ -3147,12 +3201,32 @@ struct LinuxPodSharedNamespacePoC: AsyncParsableCommand {
 
         if processCreateSucceeded {
             do {
-                _ = try await vminitd.startProcess(id: processID, containerID: processID)
-                processStartSucceeded = true
-                let status = try await vminitd.waitProcess(id: processID, containerID: processID, timeoutInSeconds: 10)
-                processExitCode = status.exitCode
-                if status.exitCode != 0 {
-                    errors["processExit"] = "exit \(status.exitCode)"
+                try await withThrowingTaskGroup(of: StdioCaptureEvent.self) { group in
+                    group.addTask {
+                        let output = try await captureVsockStream(stderrListener)
+                        return .stderr(output)
+                    }
+                    group.addTask {
+                        _ = try await vminitd.startProcess(id: processID, containerID: processID)
+                        let status = try await vminitd.waitProcess(id: processID, containerID: processID, timeoutInSeconds: 10)
+                        return .exitCode(status.exitCode)
+                    }
+
+                    for try await event in group {
+                        switch event {
+                        case .stderr(let output):
+                            stderrOutput = output
+                        case .exitCode(let exitCode):
+                            processStartSucceeded = true
+                            processExitCode = exitCode
+                        }
+                    }
+                }
+                if processExitCode != 0, let exitCode = processExitCode {
+                    errors["processExit"] = "exit \(exitCode)"
+                    if !stderrOutput.isEmpty {
+                        errors["processStderr"] = stderrOutput
+                    }
                 }
             } catch {
                 errors["startOrWaitProcess"] = describe(error)
@@ -3177,14 +3251,14 @@ struct LinuxPodSharedNamespacePoC: AsyncParsableCommand {
 
         if prepareSucceeded && processStartSucceeded && processExitCode == 0 {
             do {
-                _ = try await vminitd.stat(path: URL(fileURLWithPath: resultPath))
+                _ = try await vminitd.stat(path: URL(fileURLWithPath: evidenceResultPath))
                 try await copyGuestPathToHost(
                     vm: vm,
                     vminitd: vminitd,
-                    guestPath: resultPath,
-                    destination: hostResultPath
+                    guestPath: evidenceResultPath,
+                    destination: hostEvidenceResultPath
                 )
-                verifyOutput = try readTextFile(hostResultPath)
+                verifyOutput = try readTextFile(hostEvidenceResultPath)
                 let state = parseStagedProcessVerifyOutput(
                     verifyOutput,
                     markerPrefix: "macvz-r9-id",
@@ -3192,17 +3266,27 @@ struct LinuxPodSharedNamespacePoC: AsyncParsableCommand {
                 )
                 resultVerified = state.identityMatched
                 namespaceVerified = state.rootfsMatched
-                if !resultVerified || !namespaceVerified {
+                if resultVerified && !namespaceVerified {
+                    errors["namespaceEvidence"] = "bind-mounted handoff verified rootfs identity; proc_root did not expose the host-visible prepared-rootfs path"
+                }
+                if !resultVerified {
                     errors["verify"] = "identityMatched=\(resultVerified) namespaceVerified=\(namespaceVerified): \(verifyOutput)"
                 }
             } catch {
-                errors["verify"] = describe(error)
-                if processExitCode == 0 {
-                    errors["resultVisibility"] = "process exit 0 proves the script completed after writing /macvz-r9-result inside the vmexec namespace, but vminitd could not stat \(resultPath)"
+                errors["evidenceChannel"] = describe(error)
+                do {
+                    _ = try await vminitd.stat(path: URL(fileURLWithPath: resultPath))
+                    errors["rootfsResultVisibility"] = "rootfs result unexpectedly visible at \(resultPath)"
+                } catch {
+                    errors["rootfsResultVisibility"] = describe(error)
                 }
             }
         } else if prepareSucceeded {
             errors["verify"] = "skipped because process did not start and exit successfully"
+            if !stderrOutput.isEmpty {
+                verifyOutput = stderrOutput
+                errors["processStderr"] = stderrOutput
+            }
         }
 
         if processCreateSucceeded {
@@ -3269,10 +3353,10 @@ struct LinuxPodSharedNamespacePoC: AsyncParsableCommand {
         if !processStartSucceeded {
             return "vminitdContainerStartFailed"
         }
-        if processExitCode == 0 && (!resultVerified || !namespaceVerified) {
-            return "lateRootfsResultVisibilityExplained"
+        if processExitCode == 0 && !resultVerified {
+            return "lateRootfsEvidenceChannelStillBlocked"
         }
-        if processExitCode != 0 || !resultVerified || !namespaceVerified {
+        if processExitCode != 0 || !resultVerified {
             return "vminitdRootfsIdentityMismatch"
         }
         if !cleanupSucceeded {
@@ -3317,6 +3401,16 @@ struct LinuxPodSharedNamespacePoC: AsyncParsableCommand {
 
     private func readTextFile(_ url: URL) throws -> String {
         String(decoding: try Data(contentsOf: url), as: UTF8.self)
+    }
+
+    private func captureVsockStream(_ listener: VsockListener) async throws -> String {
+        guard let conn = await listener.first(where: { _ in true }) else {
+            throw probeError("R9 stdio capture: vsock connection not established")
+        }
+        try listener.finish()
+        defer { conn.closeFile() }
+        let data = try conn.readToEnd() ?? Data()
+        return String(decoding: data, as: UTF8.self)
     }
 
     private func copyGuestPathToHost(
@@ -3761,6 +3855,11 @@ private struct GuestBlockDevice: Encodable {
 private struct ExecCaptureResult {
     let exitCode: Int32
     let output: String
+}
+
+private enum StdioCaptureEvent {
+    case stderr(String)
+    case exitCode(Int32)
 }
 
 private struct DiscoveryOutputState {

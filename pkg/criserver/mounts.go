@@ -1,9 +1,12 @@
 package criserver
 
 import (
+	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/chimerakang/macvz/internal/types"
 	"github.com/chimerakang/macvz/pkg/criserver/store"
@@ -151,6 +154,57 @@ func (s *Server) translateMounts(mounts []*runtimeapi.Mount) ([]types.Mount, []s
 		})
 	}
 	return rtMounts, recMounts, nil
+}
+
+const (
+	mountSourceReadyTimeout  = 5 * time.Second
+	mountSourceReadyInterval = 50 * time.Millisecond
+)
+
+func (s *Server) waitForKubeletMountSources(ctx context.Context, mounts []types.Mount) error {
+	podsDir := s.mountPolicy.kubeletPodsDir()
+	var pending []string
+	for _, m := range mounts {
+		if m.Source != "" && withinPrefix(filepath.Clean(m.Source), podsDir) {
+			pending = append(pending, m.Source)
+		}
+	}
+	if len(pending) == 0 {
+		return nil
+	}
+
+	deadline := time.NewTimer(mountSourceReadyTimeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(mountSourceReadyInterval)
+	defer ticker.Stop()
+
+	for {
+		missing := pending[:0]
+		for _, source := range pending {
+			if _, err := os.Stat(source); err == nil {
+				continue
+			} else if os.IsNotExist(err) {
+				missing = append(missing, source)
+			} else {
+				return status.Errorf(codes.FailedPrecondition,
+					"CreateContainer: kubelet mount source %q is not ready: %v", source, err)
+			}
+		}
+		if len(missing) == 0 {
+			return nil
+		}
+		pending = missing
+
+		select {
+		case <-ctx.Done():
+			return status.Errorf(codes.Canceled,
+				"CreateContainer: waiting for kubelet mount source %q: %v", pending[0], ctx.Err())
+		case <-deadline.C:
+			return status.Errorf(codes.FailedPrecondition,
+				"CreateContainer: kubelet mount source %q did not appear within %s", pending[0], mountSourceReadyTimeout)
+		case <-ticker.C:
+		}
+	}
 }
 
 // withinPrefix reports whether clean (an absolute, cleaned path) is at or below

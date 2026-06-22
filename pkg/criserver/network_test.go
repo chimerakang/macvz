@@ -26,6 +26,7 @@ type fakePodNet struct {
 	attachCalls int
 	attachErr   error
 	detachErr   error
+	attachIface string
 }
 
 func newFakePodNet() *fakePodNet {
@@ -38,6 +39,9 @@ func (f *fakePodNet) Attach(_ context.Context, ep podnet.Endpoint) error {
 	f.attachCalls++
 	if f.attachErr != nil {
 		return f.attachErr
+	}
+	if ep.Interface == "" && f.attachIface != "" {
+		ep.Interface = f.attachIface
 	}
 	f.attached[ep.PodKey] = ep
 	return nil
@@ -59,6 +63,16 @@ func (f *fakePodNet) isAttached(key string) (podnet.Endpoint, bool) {
 	defer f.mu.Unlock()
 	ep, ok := f.attached[key]
 	return ep, ok
+}
+
+func (f *fakePodNet) Endpoints() []podnet.Endpoint {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]podnet.Endpoint, 0, len(f.attached))
+	for _, ep := range f.attached {
+		out = append(out, ep)
+	}
+	return out
 }
 
 const testPodCIDR = "10.244.1.0/24"
@@ -436,7 +450,9 @@ func TestRecoverNetworkReservesAndReattaches(t *testing.T) {
 	rt := newFakeRuntime()
 	rt.startIP = "192.168.64.11"
 	ipam1, _ := network.NewPodIPAM(testPodCIDR)
-	s1 := New(Options{Runtime: rt, IPAM: ipam1, PodNetwork: newFakePodNet(), Sandboxes: sandboxes1, Containers: containers1})
+	pnet1 := newFakePodNet()
+	pnet1.attachIface = "bridge101"
+	s1 := New(Options{Runtime: rt, IPAM: ipam1, PodNetwork: pnet1, Sandboxes: sandboxes1, Containers: containers1})
 	s1.vmIPPollAttempts = 3
 	s1.vmIPPollInterval = time.Millisecond
 	sandboxID := runSandbox(t, s1, "web", "default", "uid-web")
@@ -473,8 +489,8 @@ func TestRecoverNetworkReservesAndReattaches(t *testing.T) {
 	if !ok {
 		t.Fatalf("pod %q not re-attached after recovery", key)
 	}
-	if ep.PodIP != wantIP || ep.VMIP != "192.168.64.11" {
-		t.Errorf("re-attached endpoint = {PodIP:%q VMIP:%q}, want {PodIP:%q VMIP:192.168.64.11}", ep.PodIP, ep.VMIP, wantIP)
+	if ep.PodIP != wantIP || ep.VMIP != "192.168.64.11" || ep.Interface != "bridge101" {
+		t.Errorf("re-attached endpoint = {PodIP:%q VMIP:%q Interface:%q}, want {PodIP:%q VMIP:192.168.64.11 Interface:bridge101}", ep.PodIP, ep.VMIP, ep.Interface, wantIP)
 	}
 	// Status still reports the Pod IP after recovery.
 	if got := sandboxNetworkIP(t, s2, sandboxID); got != wantIP {

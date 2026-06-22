@@ -2,7 +2,10 @@ package criserver
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/chimerakang/macvz/pkg/criserver/store"
 	"google.golang.org/grpc/codes"
@@ -17,17 +20,40 @@ func mountReq(sandboxID, name string, mounts []*runtimeapi.Mount) *runtimeapi.Cr
 	return req
 }
 
+func newServerWithMountRoot(t *testing.T, rt ContainerRuntime, podsDir string) (*Server, string) {
+	t.Helper()
+	s := New(Options{Runtime: rt, Mounts: MountPolicy{KubeletPodsDir: podsDir}})
+	return s, mustRunSandbox(t, s)
+}
+
+func touchMountSource(t *testing.T, path string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir source parent: %v", err)
+	}
+	if err := os.WriteFile(path, []byte("mount-source"), 0o644); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+}
+
 func TestCreateContainerTranslatesKubeletManagedMounts(t *testing.T) {
 	rt := newFakeRuntime()
-	s, sandboxID := newServerWithRuntime(t, rt)
+	podsDir := t.TempDir()
+	s, sandboxID := newServerWithMountRoot(t, rt, podsDir)
 	ctx := context.Background()
 
+	cfgPath := filepath.Join(podsDir, "uid-1/volumes/kubernetes.io~configmap/cfg")
+	scratchPath := filepath.Join(podsDir, "uid-1/volumes/kubernetes.io~empty-dir/scratch")
+	touchMountSource(t, cfgPath)
+	if err := os.MkdirAll(scratchPath, 0o755); err != nil {
+		t.Fatalf("mkdir scratch source: %v", err)
+	}
 	mounts := []*runtimeapi.Mount{
 		// A projected ConfigMap/Secret/SA-token volume the kubelet materialized
 		// under its pods dir, mounted read-only.
-		{HostPath: "/var/lib/kubelet/pods/uid-1/volumes/kubernetes.io~configmap/cfg", ContainerPath: "/etc/app", Readonly: true},
+		{HostPath: cfgPath, ContainerPath: "/etc/app", Readonly: true},
 		// An emptyDir the kubelet backs under its pods dir, writable.
-		{HostPath: "/var/lib/kubelet/pods/uid-1/volumes/kubernetes.io~empty-dir/scratch", ContainerPath: "/scratch"},
+		{HostPath: scratchPath, ContainerPath: "/scratch"},
 		// A Memory-medium emptyDir: empty host path -> guest tmpfs.
 		{HostPath: "", ContainerPath: "/cache"},
 	}
@@ -42,7 +68,7 @@ func TestCreateContainerTranslatesKubeletManagedMounts(t *testing.T) {
 	if len(got) != 3 {
 		t.Fatalf("expected 3 runtime mounts, got %d: %+v", len(got), got)
 	}
-	if got[0].Source != "/var/lib/kubelet/pods/uid-1/volumes/kubernetes.io~configmap/cfg" ||
+	if got[0].Source != cfgPath ||
 		got[0].Target != "/etc/app" || !got[0].ReadOnly {
 		t.Errorf("configmap mount = %+v", got[0])
 	}
@@ -60,6 +86,29 @@ func TestCreateContainerTranslatesKubeletManagedMounts(t *testing.T) {
 	}
 	if len(st.GetStatus().GetMounts()) != 3 {
 		t.Errorf("status mounts = %d, want 3", len(st.GetStatus().GetMounts()))
+	}
+}
+
+func TestCreateContainerWaitsForKubeletMountSource(t *testing.T) {
+	rt := newFakeRuntime()
+	podsDir := t.TempDir()
+	s, sandboxID := newServerWithMountRoot(t, rt, podsDir)
+	ctx := context.Background()
+	source := filepath.Join(podsDir, "uid-1/containers/app/termination-log")
+
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		_ = os.MkdirAll(filepath.Dir(source), 0o755)
+		_ = os.WriteFile(source, []byte(""), 0o644)
+	}()
+
+	if _, err := s.CreateContainer(ctx, mountReq(sandboxID, "app", []*runtimeapi.Mount{
+		{HostPath: source, ContainerPath: "/dev/termination-log"},
+	})); err != nil {
+		t.Fatalf("CreateContainer: %v", err)
+	}
+	if len(rt.created) != 1 {
+		t.Fatalf("expected one create, got %d", len(rt.created))
 	}
 }
 
@@ -219,16 +268,19 @@ func TestCreateContainerRejectsReservedRuntimeMountTargets(t *testing.T) {
 
 func TestCreateContainerCustomKubeletPodsDir(t *testing.T) {
 	rt := newFakeRuntime()
+	podsDir := filepath.Join(t.TempDir(), "pods")
 	s := New(Options{
 		Runtime: rt,
-		Mounts:  MountPolicy{KubeletPodsDir: "/private/var/lib/kubelet/pods"},
+		Mounts:  MountPolicy{KubeletPodsDir: podsDir},
 	})
 	sandboxID := mustRunSandbox(t, s)
 	ctx := context.Background()
 
 	// A mount under the custom pods dir is allowed; the default dir is not implied.
+	okPath := filepath.Join(podsDir, "uid-1/volumes/x/cfg")
+	touchMountSource(t, okPath)
 	ok := mountReq(sandboxID, "app", []*runtimeapi.Mount{
-		{HostPath: "/private/var/lib/kubelet/pods/uid-1/volumes/x/cfg", ContainerPath: "/etc/app"},
+		{HostPath: okPath, ContainerPath: "/etc/app"},
 	})
 	if _, err := s.CreateContainer(ctx, ok); err != nil {
 		t.Fatalf("custom pods dir mount rejected: %v", err)

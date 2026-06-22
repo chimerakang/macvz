@@ -57,14 +57,17 @@ type Sandbox struct {
 	} `json:"dns,omitempty"`
 	// Network records the CRI-P5 Pod networking state (#77). PodIP is the
 	// MacVz-assigned address reserved at RunPodSandbox; VMIP is the micro-VM's
-	// host-only address observed when the container starts; Attached is true only
-	// once the Pod network path is actually programmed. Persisting these lets a
+	// host-only address observed when the container starts; Interface is the
+	// vmnet bridge the router resolved for that VMIP; Attached is true only once
+	// the Pod network path is actually programmed. Persisting these lets a
 	// restarted adapter re-reserve the Pod IP and re-attach the network path
-	// without leaking addresses or wiping other Pods' rules.
+	// without leaking addresses, re-resolving a stale VMIP to the wrong host
+	// interface, or wiping other Pods' rules.
 	Network struct {
-		PodIP    string `json:"podIP,omitempty"`
-		VMIP     string `json:"vmIP,omitempty"`
-		Attached bool   `json:"attached,omitempty"`
+		PodIP     string `json:"podIP,omitempty"`
+		VMIP      string `json:"vmIP,omitempty"`
+		Interface string `json:"interface,omitempty"`
+		Attached  bool   `json:"attached,omitempty"`
 	} `json:"network,omitempty"`
 }
 

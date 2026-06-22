@@ -322,12 +322,11 @@ func setupStreaming(srv *criserver.Server, addr string) (func(), error) {
 		klog.InfoS("CRI streaming disabled; exec and port-forward will return FailedPrecondition")
 		return func() {}, nil
 	}
-	listenAddr, err := concreteStreamingAddr(addr)
-	if err != nil {
-		return nil, err
-	}
+	listenAddr := addr
+	baseURL := &url.URL{Scheme: "http", Host: listenAddr}
 	cfg := streaming.DefaultConfig
 	cfg.Addr = listenAddr
+	cfg.BaseURL = baseURL
 	streamServer, err := streaming.NewServer(cfg, srv.StreamingRuntime())
 	if err != nil {
 		return nil, fmt.Errorf("build CRI streaming server on %q: %w", listenAddr, err)
@@ -340,40 +339,16 @@ func setupStreaming(srv *criserver.Server, addr string) (func(), error) {
 		}
 	}()
 
-	if err := waitForStreamingReady(listenAddr, errc); err != nil {
+	if err := waitForStreamingReady(baseURL, listenAddr, errc); err != nil {
 		_ = streamServer.Stop()
 		return nil, err
 	}
 	srv.SetStreamingServer(streamServer)
-	klog.InfoS("CRI streaming server started", "addr", listenAddr)
+	klog.InfoS("CRI streaming server started", "addr", baseURL.Host)
 	return func() { _ = streamServer.Stop() }, nil
 }
 
-func concreteStreamingAddr(addr string) (string, error) {
-	host, port, err := net.SplitHostPort(addr)
-	if err != nil {
-		return "", fmt.Errorf("parse streaming address %q: %w", addr, err)
-	}
-	if port != "0" {
-		return addr, nil
-	}
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		return "", fmt.Errorf("reserve streaming address %q: %w", addr, err)
-	}
-	actual := ln.Addr().String()
-	if host != "" {
-		if _, actualPort, splitErr := net.SplitHostPort(actual); splitErr == nil {
-			actual = net.JoinHostPort(host, actualPort)
-		}
-	}
-	if err := ln.Close(); err != nil {
-		return "", fmt.Errorf("release reserved streaming address %q: %w", actual, err)
-	}
-	return actual, nil
-}
-
-func waitForStreamingReady(addr string, errc <-chan error) error {
+func waitForStreamingReady(baseURL *url.URL, addr string, errc <-chan error) error {
 	deadline := time.NewTimer(streamingStartTimeout)
 	defer deadline.Stop()
 	tick := time.NewTicker(10 * time.Millisecond)
@@ -389,7 +364,11 @@ func waitForStreamingReady(addr string, errc <-chan error) error {
 		case <-deadline.C:
 			return fmt.Errorf("start CRI streaming server on %q: timed out waiting for listener", addr)
 		case <-tick.C:
-			conn, err := net.DialTimeout("tcp", addr, 200*time.Millisecond)
+			readyAddr := baseURL.Host
+			if _, port, err := net.SplitHostPort(readyAddr); err != nil || port == "0" {
+				continue
+			}
+			conn, err := net.DialTimeout("tcp", readyAddr, 200*time.Millisecond)
 			if err == nil {
 				_ = conn.Close()
 				return nil

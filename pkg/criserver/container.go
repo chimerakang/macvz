@@ -135,6 +135,9 @@ func (s *Server) CreateContainer(ctx context.Context, req *runtimeapi.CreateCont
 	if err != nil {
 		return nil, err
 	}
+	if err := s.waitForKubeletMountSources(ctx, rtMounts); err != nil {
+		return nil, err
+	}
 
 	id, err := store.NewID()
 	if err != nil {

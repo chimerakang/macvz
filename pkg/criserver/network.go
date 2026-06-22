@@ -35,6 +35,10 @@ type PodNetwork interface {
 	Detach(ctx context.Context, podKey string) error
 }
 
+type podNetworkEndpointLister interface {
+	Endpoints() []podnet.Endpoint
+}
+
 // PodIPAllocator hands out stable Pod IPs from the node's Pod CIDR. It is
 // satisfied by *network.PodIPAM and is optional: when nil, no Pod IP is assigned.
 // The subset mirrors the operations the provider's IPAM helpers use, so the CRI
@@ -118,7 +122,11 @@ func (s *Server) attachSandboxNetwork(ctx context.Context, sb *store.Sandbox, wo
 		return status.Errorf(codes.Internal,
 			"attach pod %q network path (%s -> %s): %v", key, sb.Network.PodIP, vmIP, err)
 	}
+	if attached, ok := s.attachedPodNetworkEndpoint(key); ok {
+		ep = attached
+	}
 	sb.Network.VMIP = vmIP
+	sb.Network.Interface = ep.Interface
 	sb.Network.Attached = true
 	if err := s.sandboxes.Put(sb); err != nil {
 		// The binat rule is live but the record did not persist: detach so we do
@@ -149,6 +157,7 @@ func (s *Server) detachSandboxNetwork(ctx context.Context, sandboxID string) err
 	if sb.Network.Attached || sb.Network.VMIP != "" {
 		sb.Network.Attached = false
 		sb.Network.VMIP = ""
+		sb.Network.Interface = ""
 		if err := s.sandboxes.Put(&sb); err != nil {
 			return status.Errorf(codes.Internal, "persist sandbox %q network state: %v", sandboxID, err)
 		}
@@ -248,7 +257,7 @@ func (s *Server) RecoverNetwork(ctx context.Context) {
 			}
 		}
 		if s.podNet != nil && sb.Network.Attached && sb.Network.PodIP != "" && sb.Network.VMIP != "" {
-			ep := podnet.Endpoint{PodKey: key, PodIP: sb.Network.PodIP, VMIP: sb.Network.VMIP}
+			ep := podnet.Endpoint{PodKey: key, PodIP: sb.Network.PodIP, VMIP: sb.Network.VMIP, Interface: sb.Network.Interface}
 			if err := s.podNet.Attach(ctx, ep); err != nil {
 				klog.ErrorS(err, "failed to re-attach CRI Pod network after restart", "pod", key)
 			} else {
@@ -259,6 +268,19 @@ func (s *Server) RecoverNetwork(ctx context.Context) {
 	if reserved > 0 || reattached > 0 {
 		klog.InfoS("recovered CRI Pod networking state", "reservedIPs", reserved, "reattached", reattached)
 	}
+}
+
+func (s *Server) attachedPodNetworkEndpoint(key string) (podnet.Endpoint, bool) {
+	lister, ok := s.podNet.(podNetworkEndpointLister)
+	if !ok {
+		return podnet.Endpoint{}, false
+	}
+	for _, ep := range lister.Endpoints() {
+		if ep.PodKey == key {
+			return ep, true
+		}
+	}
+	return podnet.Endpoint{}, false
 }
 
 // networkInfo returns adapter-level network detail for verbose Status/PodSandboxStatus.

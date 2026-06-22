@@ -37,6 +37,27 @@ func TestHandoffMountShape(t *testing.T) {
 	}
 }
 
+func TestHandoffIdentityMountShape(t *testing.T) {
+	layout := testLayout()
+	m, err := HandoffIdentityMount(layout)
+	if err != nil {
+		t.Fatalf("HandoffIdentityMount: %v", err)
+	}
+	wantSource := filepath.Join(layout.RootfsDir, "etc", "macvz-container-identity")
+	if m.Source != wantSource {
+		t.Errorf("Source = %q, want %q", m.Source, wantSource)
+	}
+	if m.Target != RootfsIdentityPath {
+		t.Errorf("Target = %q, want %q", m.Target, RootfsIdentityPath)
+	}
+	if !m.ReadOnly {
+		t.Error("staged identity mount must be read-only")
+	}
+	if m.Tmpfs {
+		t.Error("staged identity mount must be a host bind mount, not a tmpfs")
+	}
+}
+
 func TestInjectHandoffMountAppends(t *testing.T) {
 	layout := testLayout()
 	spec := &types.ContainerSpec{
@@ -49,12 +70,18 @@ func TestInjectHandoffMountAppends(t *testing.T) {
 	if err := InjectHandoffMount(spec, layout); err != nil {
 		t.Fatalf("InjectHandoffMount: %v", err)
 	}
-	if len(spec.Mounts) != 2 {
-		t.Fatalf("Mounts len = %d, want 2", len(spec.Mounts))
+	if len(spec.Mounts) != 3 {
+		t.Fatalf("Mounts len = %d, want 3", len(spec.Mounts))
 	}
-	last := spec.Mounts[len(spec.Mounts)-1]
-	if last != HandoffMount(layout) {
-		t.Errorf("appended mount = %+v, want handoff mount %+v", last, HandoffMount(layout))
+	if got := spec.Mounts[1]; got != HandoffMount(layout) {
+		t.Errorf("handoff mount = %+v, want %+v", got, HandoffMount(layout))
+	}
+	wantIdentity, err := HandoffIdentityMount(layout)
+	if err != nil {
+		t.Fatalf("HandoffIdentityMount: %v", err)
+	}
+	if got := spec.Mounts[2]; got != wantIdentity {
+		t.Errorf("identity mount = %+v, want %+v", got, wantIdentity)
 	}
 	// The original mount is preserved and untouched.
 	if spec.Mounts[0].Target != "/data" {
@@ -70,8 +97,18 @@ func TestInjectHandoffMountIdempotent(t *testing.T) {
 			t.Fatalf("InjectHandoffMount call %d: %v", i, err)
 		}
 	}
-	if len(spec.Mounts) != 1 {
-		t.Fatalf("repeated injection produced %d mounts, want 1 (idempotent)", len(spec.Mounts))
+	if len(spec.Mounts) != 2 {
+		t.Fatalf("repeated injection produced %d mounts, want 2 (idempotent)", len(spec.Mounts))
+	}
+	if !hasMount(spec.Mounts, HandoffMount(layout)) {
+		t.Errorf("missing handoff mount: %+v", spec.Mounts)
+	}
+	wantIdentity, err := HandoffIdentityMount(layout)
+	if err != nil {
+		t.Fatalf("HandoffIdentityMount: %v", err)
+	}
+	if !hasMount(spec.Mounts, wantIdentity) {
+		t.Errorf("missing identity mount: %+v", spec.Mounts)
 	}
 }
 
@@ -101,6 +138,22 @@ func TestInjectHandoffMountRejectsReservedTargetConflict(t *testing.T) {
 	}
 }
 
+func TestInjectHandoffMountRejectsIdentityTargetConflict(t *testing.T) {
+	layout := testLayout()
+	spec := &types.ContainerSpec{
+		Name:   "w",
+		Image:  "alpine",
+		Mounts: []types.Mount{{Source: "/user/identity", Target: RootfsIdentityPath}},
+	}
+	err := InjectHandoffMount(spec, layout)
+	if !errors.Is(err, ErrHandoffMountConflict) {
+		t.Fatalf("error = %v, want ErrHandoffMountConflict", err)
+	}
+	if len(spec.Mounts) != 1 {
+		t.Errorf("Mounts len = %d, want 1 (unchanged on conflict)", len(spec.Mounts))
+	}
+}
+
 func TestInjectHandoffMountAllowsSiblingNamespace(t *testing.T) {
 	layout := testLayout()
 	// /run/macvz-data is a sibling, not inside /run/macvz; it must be allowed.
@@ -112,8 +165,8 @@ func TestInjectHandoffMountAllowsSiblingNamespace(t *testing.T) {
 	if err := InjectHandoffMount(spec, layout); err != nil {
 		t.Fatalf("InjectHandoffMount with sibling namespace: %v", err)
 	}
-	if len(spec.Mounts) != 2 {
-		t.Errorf("Mounts len = %d, want 2", len(spec.Mounts))
+	if len(spec.Mounts) != 3 {
+		t.Errorf("Mounts len = %d, want 3", len(spec.Mounts))
 	}
 }
 
@@ -125,6 +178,9 @@ func TestInjectHandoffMountRejectsBadInput(t *testing.T) {
 	spec := &types.ContainerSpec{Name: "w", Image: "alpine"}
 	if err := InjectHandoffMount(spec, HandoffLayout{}); err == nil {
 		t.Error("empty layout should error")
+	}
+	if _, err := HandoffIdentityMount(HandoffLayout{}); err == nil {
+		t.Error("empty layout should error for identity mount")
 	}
 	if err := InjectHandoffMount(spec, HandoffLayout{HandoffDir: "/h", MountPoint: "run/macvz/handoff"}); err == nil {
 		t.Error("relative mount point should error")
@@ -216,4 +272,13 @@ func TestRootfsGuestPathCleansInsideRootfs(t *testing.T) {
 	if got != want {
 		t.Errorf("rootfsGuestPath escaped rootfs: got %q, want %q", got, want)
 	}
+}
+
+func hasMount(mounts []types.Mount, want types.Mount) bool {
+	for _, m := range mounts {
+		if m == want {
+			return true
+		}
+	}
+	return false
 }

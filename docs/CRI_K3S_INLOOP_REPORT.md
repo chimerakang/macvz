@@ -17,13 +17,14 @@ shipped Virtual Kubelet path.
 
 ## Status
 
-**Short live in-loop run passed for the supported workload class.** On
+**Short live in-loop runs passed for the supported workload class.** On
 2026-06-23, the fixture passed scheduling, rollout, logs, exec, port-forward,
 ClusterIP Service reachability from a Linux-node probe, `macvz-cri` restart
-recovery, kubelet restart recovery, a bounded short soak, cleanup, and host
-orphan audit on the local two-Mac lab. Handoff was skipped because the default
-adapter path was under test (`MACVZ_HANDOFF=0`). A multi-day soak is still
-pending. The CRI route-two decision **remains no-go for replacement** until #82
+recovery, kubelet restart recovery, bounded short soaks, cleanup, and host
+orphan audit on the local two-Mac lab. The default adapter path passed first
+(`MACVZ_HANDOFF=0`), then the experimental handoff-aware path passed with
+`MACVZ_HANDOFF=1` and `identityVerified=true`. A multi-day soak is still pending.
+The CRI route-two decision **remains no-go for replacement** until #82
 multi-container support is resolved and the longer operator run is complete.
 
 ## Topology
@@ -57,6 +58,9 @@ multi-container support is resolved and the longer operator run is complete.
 - projected ConfigMap + Secret (read-only mounts),
 - an HTTP readiness/liveness probe the kubelet drives,
 - a ClusterIP Service.
+- experimental handoff evidence when enabled: if the runtime-private identity
+  file and handoff mount are present, the fixture copies the staged rootfs
+  identity into `/run/macvz/handoff/identity` before starting `httpd`.
 
 ## Runbook
 
@@ -156,6 +160,58 @@ diagnostics: /tmp/cri-inloop-restartk3s-20260623040202
 | Duration / samples | 10 samples at 5s interval |
 | First / last adapter RSS | `27840 KB` / `27968 KB` |
 | RSS growth (bound 64 MiB) | `128 KB` |
+| Pod restartCount over soak | `0` |
+| Residual host workloads at end | `0` |
+
+### Handoff-Aware Run
+
+The default CRI adapter was temporarily restarted with:
+
+```text
+--experimental-handoff --handoff-root /Users/test/macvz-cri-i5-test/service-default-handoff
+```
+
+After the run, those temporary flags were removed and the default adapter was
+restarted back on the non-handoff path. The macOS default route remained
+`192.168.1.1` via `en0` before and after the test.
+
+```sh
+KUBECONFIG=$HOME/.kube/config \
+MACVZ_INTEGRATION=1 \
+MACVZ_NODE=macvz-b-cri \
+MACVZ_HANDOFF=1 \
+MACVZ_CRI_OUT_DIR=/tmp/cri-inloop-handoff-20260623041435 \
+MACVZ_INLOOP_SOAK_ITERATIONS=10 \
+MACVZ_INLOOP_SOAK_INTERVAL=5 \
+MACVZ_HANDOFF_STATUS_CMD="<crictl inspect through /run/macvz-cri-default.sock>" \
+bash test/e2e/cri-k3s/k3s-inloop.sh
+```
+
+Result:
+
+```text
+PASS CRI-P9 in-loop suite: all checks passed
+diagnostics: /tmp/cri-inloop-handoff-20260623041435
+```
+
+Handoff diagnostics:
+
+```text
+handoffPrepared=true
+identityVerified=true
+expectedIdentity=macvz-rootfs-id=macvz-cri-66f891c7889567332eccb97d
+observedIdentity=macvz-rootfs-id=macvz-cri-66f891c7889567332eccb97d
+identitySource=handoff
+handoffWritePolicy=world-writable-fallback
+```
+
+Handoff soak summary:
+
+| Metric | Value |
+| --- | --- |
+| Duration / samples | 10 samples at 5s interval |
+| First / last adapter RSS | `28160 KB` / `28480 KB` |
+| RSS growth (bound 64 MiB) | `320 KB` |
 | Pod restartCount over soak | `0` |
 | Residual host workloads at end | `0` |
 

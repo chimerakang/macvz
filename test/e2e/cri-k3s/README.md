@@ -72,9 +72,13 @@ bundled containerd.
    With the node running this way, the k3s in-loop harness exercises the handoff
    path end to end: StartContainer gates a Pod's container to Running only after
    the launched process reports the expected rootfs identity through the
-   runtime-private evidence channel (#116). Run the harness with `MACVZ_HANDOFF=1`
-   (and optionally `MACVZ_HANDOFF_STATUS_CMD` to surface on-node
-   `identityVerified` diagnostics). See `docs/CRI_RUNTIME_I4_2_INLOOP_HANDOFF_REPORT.md`.
+   runtime-private evidence channel (#116). The in-loop fixture writes the
+   staged `/etc/macvz-container-identity` value to
+   `/run/macvz/handoff/identity` when those runtime-private paths are present,
+   and skips that branch on the default adapter path. Run the harness with
+   `MACVZ_HANDOFF=1` (and optionally `MACVZ_HANDOFF_STATUS_CMD` to surface
+   on-node `identityVerified` diagnostics). See
+   `docs/CRI_RUNTIME_I4_2_INLOOP_HANDOFF_REPORT.md`.
 
 2. Start k3s (agent) against the external endpoint:
 

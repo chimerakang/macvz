@@ -61,14 +61,37 @@ func HandoffMount(layout HandoffLayout) types.Mount {
 	}
 }
 
-// InjectHandoffMount appends the handoff bind mount to spec.Mounts. It is a pure
-// spec mutation and touches no filesystem; call PrepareHandoffMountpoint to
-// create the in-rootfs destination before launch.
+// HandoffIdentityMount returns the read-only bind mount that exposes the staged
+// expected-identity file at RootfsIdentityPath inside the guest. The file is
+// still staged in the prepared rootfs for recovery, but the current
+// apple/container path does not boot from that prepared rootfs; this mount makes
+// the same staged identity visible to the late process without exposing the
+// writable evidence channel as trusted input.
+func HandoffIdentityMount(layout HandoffLayout) (types.Mount, error) {
+	if layout.RootfsDir == "" {
+		return types.Mount{}, errors.New("runtime: handoff identity mount: empty rootfs dir")
+	}
+	src, err := rootfsGuestPath(layout.RootfsDir, RootfsIdentityPath)
+	if err != nil {
+		return types.Mount{}, fmt.Errorf("runtime: handoff identity mount: %w", err)
+	}
+	return types.Mount{
+		Source:   filepath.Clean(src),
+		Target:   RootfsIdentityPath,
+		ReadOnly: true,
+		Tmpfs:    false,
+	}, nil
+}
+
+// InjectHandoffMount appends the handoff bind mounts to spec.Mounts. It is a
+// pure spec mutation and touches no filesystem; call PrepareHandoffMountpoint
+// and StageIdentityFile before launch so the mount targets have backing paths.
 //
 // It rejects a layout with empty paths and any pre-existing mount that targets
 // the reserved /run/macvz namespace from a non-handoff source
-// (ErrHandoffMountConflict). Re-injecting the identical handoff mount is a no-op
-// so the call is idempotent.
+// (ErrHandoffMountConflict). It also rejects any user mount that targets the
+// runtime-owned RootfsIdentityPath. Re-injecting the identical handoff mounts is
+// a no-op so the call is idempotent.
 func InjectHandoffMount(spec *types.ContainerSpec, layout HandoffLayout) error {
 	if spec == nil {
 		return errors.New("runtime: inject handoff mount: nil spec")
@@ -83,19 +106,38 @@ func InjectHandoffMount(spec *types.ContainerSpec, layout HandoffLayout) error {
 		return fmt.Errorf("runtime: inject handoff mount: mount point %q is outside reserved runtime namespace %q",
 			layout.MountPoint, HandoffRuntimeRoot)
 	}
-	want := HandoffMount(layout)
+	wantHandoff := HandoffMount(layout)
+	wantIdentity, err := HandoffIdentityMount(layout)
+	if err != nil {
+		return fmt.Errorf("runtime: inject handoff mount: %w", err)
+	}
+	haveHandoff := false
+	haveIdentity := false
 	for _, m := range spec.Mounts {
+		if m.Target == RootfsIdentityPath {
+			if m == wantIdentity {
+				haveIdentity = true
+				continue
+			}
+			return fmt.Errorf("%w: existing mount target %q (source %q) blocks the staged identity mount",
+				ErrHandoffMountConflict, m.Target, m.Source)
+		}
 		if !withinReservedRuntimeNamespace(m.Target) {
 			continue
 		}
-		if m == want {
-			// Already injected: idempotent success, do not duplicate.
-			return nil
+		if m == wantHandoff {
+			haveHandoff = true
+			continue
 		}
 		return fmt.Errorf("%w: existing mount target %q (source %q) blocks the handoff at %q",
 			ErrHandoffMountConflict, m.Target, m.Source, layout.MountPoint)
 	}
-	spec.Mounts = append(spec.Mounts, want)
+	if !haveHandoff {
+		spec.Mounts = append(spec.Mounts, wantHandoff)
+	}
+	if !haveIdentity {
+		spec.Mounts = append(spec.Mounts, wantIdentity)
+	}
 	return nil
 }
 

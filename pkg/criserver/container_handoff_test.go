@@ -64,6 +64,13 @@ func TestCreateContainerPreparesHandoff(t *testing.T) {
 	if !hasMount(rt.created[0].Mounts, runtime.HandoffMount(layout)) {
 		t.Errorf("workload spec missing handoff mount; mounts=%+v", rt.created[0].Mounts)
 	}
+	wantIdentityMount, err := runtime.HandoffIdentityMount(layout)
+	if err != nil {
+		t.Fatalf("HandoffIdentityMount: %v", err)
+	}
+	if !hasMount(rt.created[0].Mounts, wantIdentityMount) {
+		t.Errorf("workload spec missing staged identity mount; mounts=%+v", rt.created[0].Mounts)
+	}
 
 	// Only the minimal CRI mapping is persisted: HandoffPrepared, and the record
 	// stays Created (not started).
@@ -93,7 +100,7 @@ func TestCreateContainerWithoutHandoffIsUnchanged(t *testing.T) {
 		t.Fatalf("expected one create, got %d", len(rt.created))
 	}
 	for _, m := range rt.created[0].Mounts {
-		if m.Target == runtime.HandoffMountPoint {
+		if m.Target == runtime.HandoffMountPoint || m.Target == runtime.RootfsIdentityPath {
 			t.Errorf("default path injected a handoff mount: %+v", m)
 		}
 	}

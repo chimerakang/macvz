@@ -87,9 +87,13 @@ spec:
           image: busybox:1.36.1
           # Serve the projected ConfigMap index over HTTP so readiness, the
           # Service, and port-forward all exercise a real listener in the
-          # micro-VM. The boot echo gives `kubectl logs` a deterministic marker;
-          # httpd -f then keeps the container in the foreground.
-          command: ["sh", "-c", "echo macvz-cri-p9-inloop-boot; httpd -f -p 8080 -h /www"]
+          # micro-VM. When the adapter runs with --experimental-handoff, echo the
+          # staged rootfs identity into the runtime-private evidence channel
+          # before httpd starts; the default adapter path lacks these files and
+          # skips this branch harmlessly. The boot echo gives `kubectl logs` a
+          # deterministic marker; httpd -f then keeps the container in the
+          # foreground.
+          command: ["sh", "-c", "if [ -r /etc/macvz-container-identity ] && [ -d /run/macvz/handoff ]; then cat /etc/macvz-container-identity > /run/macvz/handoff/identity; fi; echo macvz-cri-p9-inloop-boot; httpd -f -p 8080 -h /www"]
           ports:
             - name: http
               containerPort: 8080

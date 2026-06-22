@@ -29,6 +29,23 @@ const inspectNoDigest = `[
   }
 ]`
 
+// inspectContainerOne is the container 1.0 shape: the image reference and
+// manifest digest are nested under configuration, and the top-level id omits the
+// sha256: prefix.
+const inspectContainerOne = `[
+  {
+    "configuration": {
+      "name": "docker.io/library/busybox:1.36.1",
+      "descriptor": {"digest": "sha256:73aaf090", "size": 9535}
+    },
+    "id": "73aaf090",
+    "variants": [
+      {"digest": "sha256:bd44eb", "platform": {"architecture": "arm64", "os": "linux"}, "size": 1897352},
+      {"digest": "sha256:b7f3d8", "platform": {"architecture": "amd64", "os": "linux"}, "size": 2207471}
+    ]
+  }
+]`
+
 func TestImageStatusParsesDigestAndSize(t *testing.T) {
 	f := &fakeRunner{outputs: map[string][]byte{"image inspect": []byte(inspectWithDigest)}}
 	info, err := driverWith(f).ImageStatus(context.Background(), "docker.io/library/alpine:3.20")
@@ -49,6 +66,43 @@ func TestImageStatusParsesDigestAndSize(t *testing.T) {
 	}
 	if len(info.RepoDigests) != 2 || info.RepoDigests[0] != "docker.io/library/alpine@sha256:aaaa" || info.RepoDigests[1] != "sha256:aaaa" {
 		t.Errorf("RepoDigests = %v, want name@digest plus raw digest", info.RepoDigests)
+	}
+}
+
+func TestImageStatusParsesContainerOneShape(t *testing.T) {
+	f := &fakeRunner{outputs: map[string][]byte{"image inspect": []byte(inspectContainerOne)}}
+	info, err := driverWith(f).ImageStatus(context.Background(), "docker.io/library/busybox:1.36.1")
+	if err != nil {
+		t.Fatalf("ImageStatus: %v", err)
+	}
+	if info.ID != "docker.io/library/busybox@sha256:73aaf090" {
+		t.Errorf("ID = %q, want repo digest from configuration descriptor", info.ID)
+	}
+	if got := info.Size; got != 4104823 {
+		t.Errorf("Size = %d, want sum of variant sizes", got)
+	}
+	if len(info.RepoTags) != 1 || info.RepoTags[0] != "docker.io/library/busybox:1.36.1" {
+		t.Errorf("RepoTags = %v", info.RepoTags)
+	}
+	if len(info.RepoDigests) != 2 || info.RepoDigests[0] != "docker.io/library/busybox@sha256:73aaf090" || info.RepoDigests[1] != "sha256:73aaf090" {
+		t.Errorf("RepoDigests = %v, want name@digest plus raw digest", info.RepoDigests)
+	}
+}
+
+func TestImageStatusFallsBackToListForRepoDigest(t *testing.T) {
+	f := &fakeRunner{
+		outputs: map[string][]byte{"image ls": []byte(inspectContainerOne)},
+		errs:    map[string]error{"image inspect": &CommandError{Stderr: "image not found", ExitCode: 1}},
+	}
+	info, err := driverWith(f).ImageStatus(context.Background(), "docker.io/library/busybox@sha256:73aaf090")
+	if err != nil {
+		t.Fatalf("ImageStatus(repo digest): %v", err)
+	}
+	if info.ID != "docker.io/library/busybox@sha256:73aaf090" {
+		t.Errorf("ID = %q, want matched repo digest", info.ID)
+	}
+	if len(f.calls) != 2 || !argsContain(f.calls[0], "image", "inspect") || !argsContain(f.calls[1], "image", "ls") {
+		t.Fatalf("calls = %v, want inspect then ls fallback", f.calls)
 	}
 }
 

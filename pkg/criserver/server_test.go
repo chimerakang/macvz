@@ -33,6 +33,9 @@ func TestVersion(t *testing.T) {
 	if resp.GetRuntimeApiVersion() != runtimeAPIVersion {
 		t.Errorf("RuntimeApiVersion = %q, want %q", resp.GetRuntimeApiVersion(), runtimeAPIVersion)
 	}
+	if resp.GetVersion() != runtimeVersion {
+		t.Errorf("Version = %q, want %q", resp.GetVersion(), runtimeVersion)
+	}
 	if resp.GetRuntimeName() != defaultRuntimeName {
 		t.Errorf("RuntimeName = %q, want %q", resp.GetRuntimeName(), defaultRuntimeName)
 	}
@@ -103,6 +106,18 @@ func TestUnimplementedMethodReturnsCode(t *testing.T) {
 	}
 }
 
+func TestUpdateRuntimeConfigIsAccepted(t *testing.T) {
+	s := New(Options{})
+	_, err := s.UpdateRuntimeConfig(context.Background(), &runtimeapi.UpdateRuntimeConfigRequest{
+		RuntimeConfig: &runtimeapi.RuntimeConfig{
+			NetworkConfig: &runtimeapi.NetworkConfig{PodCidr: "10.244.1.0/24"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("UpdateRuntimeConfig: %v", err)
+	}
+}
+
 // TestContainerMethodsRequireRuntime verifies the container surface is honest
 // without a backend: CreateContainer reports FailedPrecondition (the method is
 // implemented but cannot act) rather than Unimplemented or a fake success.
@@ -146,6 +161,9 @@ func TestServeOverSocket(t *testing.T) {
 	}
 	if vResp.GetRuntimeApiVersion() != runtimeAPIVersion {
 		t.Errorf("RuntimeApiVersion = %q, want %q", vResp.GetRuntimeApiVersion(), runtimeAPIVersion)
+	}
+	if vResp.GetVersion() != runtimeVersion {
+		t.Errorf("Version = %q, want %q", vResp.GetVersion(), runtimeVersion)
 	}
 
 	sResp, err := rtClient.Status(ctx, &runtimeapi.StatusRequest{})

@@ -60,6 +60,11 @@ func (s *Server) RunPodSandbox(_ context.Context, req *runtimeapi.RunPodSandboxR
 	// no-op and the sandbox runs without a Pod IP, exactly as before CRI-P5.
 	podKey := md.GetNamespace() + "/" + md.GetName()
 	if existing, ok := s.sandboxByKey(podKey); ok {
+		if existing.Metadata.UID == md.GetUid() && existing.Metadata.Attempt == md.GetAttempt() && existing.State == store.StateReady {
+			klog.V(4).InfoS("CRI RunPodSandbox returning existing sandbox for idempotent retry",
+				"id", existing.ID, "namespace", md.GetNamespace(), "name", md.GetName(), "uid", md.GetUid())
+			return &runtimeapi.RunPodSandboxResponse{PodSandboxId: existing.ID}, nil
+		}
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"RunPodSandbox: Pod %q already has sandbox %q; CRI-P5 supports one sandbox per Pod key",
 			podKey, existing.ID)

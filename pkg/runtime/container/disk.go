@@ -62,9 +62,16 @@ func (d *Driver) ImageCacheUsage(ctx context.Context) (runtime.ImageCacheUsage, 
 // to derive a stable image ID for the CRI ImageService (#76); their absence
 // degrades the ID to the reference rather than failing.
 type imageListEntry struct {
-	Reference  string `json:"reference"`
-	Name       string `json:"name"`
-	Digest     string `json:"digest"`
+	Reference     string `json:"reference"`
+	Name          string `json:"name"`
+	ID            string `json:"id"`
+	Digest        string `json:"digest"`
+	Configuration struct {
+		Name       string `json:"name"`
+		Descriptor struct {
+			Digest string `json:"digest"`
+		} `json:"descriptor"`
+	} `json:"configuration"`
 	Descriptor struct {
 		Digest string `json:"digest"`
 	} `json:"descriptor"`

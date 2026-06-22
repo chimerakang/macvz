@@ -35,6 +35,10 @@ import (
 	"k8s.io/klog/v2"
 )
 
+// runtimeVersion is the legacy CRI runtime protocol version kubelet still
+// validates in VersionResponse.Version. containerd reports the same value.
+const runtimeVersion = "0.1.0"
+
 // runtimeAPIVersion is the CRI API version this skeleton speaks. kubelet and
 // crictl negotiate against "v1"; it is not the MacVz build version.
 const runtimeAPIVersion = "v1"
@@ -220,7 +224,7 @@ func (s *Server) Register(grpcServer *grpc.Server) {
 func (s *Server) Version(_ context.Context, req *runtimeapi.VersionRequest) (*runtimeapi.VersionResponse, error) {
 	klog.V(4).InfoS("CRI Version", "clientVersion", req.GetVersion())
 	return &runtimeapi.VersionResponse{
-		Version:           runtimeAPIVersion,
+		Version:           runtimeVersion,
 		RuntimeName:       s.runtimeName,
 		RuntimeVersion:    s.runtimeVersion,
 		RuntimeApiVersion: runtimeAPIVersion,
@@ -268,4 +272,19 @@ func (s *Server) Status(_ context.Context, req *runtimeapi.StatusRequest) (*runt
 		}
 	}
 	return resp, nil
+}
+
+// UpdateRuntimeConfig accepts kubelet's PodCIDR notification. MacVz does not
+// delegate Pod CIDR programming to the CRI runtime: the default CRI path has
+// networking disabled, and the MacVz network path is configured explicitly by
+// adapter flags. Still, kubelet calls this during node status sync and treats an
+// Unimplemented response as a hard node-update error, so acknowledge the update
+// as a no-op.
+func (s *Server) UpdateRuntimeConfig(_ context.Context, req *runtimeapi.UpdateRuntimeConfigRequest) (*runtimeapi.UpdateRuntimeConfigResponse, error) {
+	if netCfg := req.GetRuntimeConfig().GetNetworkConfig(); netCfg != nil {
+		klog.V(3).InfoS("CRI UpdateRuntimeConfig", "podCIDR", netCfg.GetPodCidr())
+	} else {
+		klog.V(3).InfoS("CRI UpdateRuntimeConfig")
+	}
+	return &runtimeapi.UpdateRuntimeConfigResponse{}, nil
 }

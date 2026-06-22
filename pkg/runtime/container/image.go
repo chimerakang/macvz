@@ -30,7 +30,15 @@ func (d *Driver) ImageStatus(ctx context.Context, ref string) (runtime.ImageInfo
 	}
 	out, err := d.run.output(ctx, "image", "inspect", ref)
 	if err != nil {
-		return runtime.ImageInfo{}, fmt.Errorf("image status %q: %w", ref, mapErr(err))
+		mapped := mapErr(err)
+		if errors.Is(mapped, runtime.ErrNotFound) {
+			if info, ok, ferr := d.findImageByKnownRef(ctx, ref); ferr != nil {
+				return runtime.ImageInfo{}, fmt.Errorf("image status %q: fallback list images: %w", ref, ferr)
+			} else if ok {
+				return info, nil
+			}
+		}
+		return runtime.ImageInfo{}, fmt.Errorf("image status %q: %w", ref, mapped)
 	}
 	trimmed := bytes.TrimSpace(out)
 	if len(trimmed) == 0 || string(trimmed) == "null" {
@@ -44,6 +52,36 @@ func (d *Driver) ImageStatus(ctx context.Context, ref string) (runtime.ImageInfo
 		return runtime.ImageInfo{}, fmt.Errorf("image status %q: %w", ref, runtime.ErrNotFound)
 	}
 	return imageInfoFromEntry(entries[0]), nil
+}
+
+func (d *Driver) findImageByKnownRef(ctx context.Context, ref string) (runtime.ImageInfo, bool, error) {
+	infos, err := d.ListImages(ctx)
+	if err != nil {
+		return runtime.ImageInfo{}, false, err
+	}
+	for _, info := range infos {
+		if imageInfoMatchesRef(info, ref) {
+			return info, true, nil
+		}
+	}
+	return runtime.ImageInfo{}, false, nil
+}
+
+func imageInfoMatchesRef(info runtime.ImageInfo, ref string) bool {
+	if info.ID == ref {
+		return true
+	}
+	for _, tag := range info.RepoTags {
+		if tag == ref {
+			return true
+		}
+	}
+	for _, digest := range info.RepoDigests {
+		if digest == ref {
+			return true
+		}
+	}
+	return false
 }
 
 // ListImages enumerates every locally cached image by parsing
@@ -90,10 +128,7 @@ func (d *Driver) RemoveImage(ctx context.Context, ref string) error {
 // not used as ID because kubelet feeds ImageRef back into CreateContainer and
 // RemoveImage.
 func imageInfoFromEntry(e imageListEntry) runtime.ImageInfo {
-	ref := e.Reference
-	if ref == "" {
-		ref = e.Name
-	}
+	ref := entryReference(e)
 	info := runtime.ImageInfo{Size: uint64(e.Size)}
 	if ref != "" {
 		info.RepoTags = []string{ref}
@@ -112,6 +147,9 @@ func imageInfoFromEntry(e imageListEntry) runtime.ImageInfo {
 	} else {
 		info.ID = ref
 	}
+	if info.ID == "" && e.ID != "" {
+		info.ID = normalizeDigest(e.ID)
+	}
 
 	// Some builds report size only under the platform variants; sum them when the
 	// top-level size is absent so the figure stays honest for multi-arch images.
@@ -123,11 +161,26 @@ func imageInfoFromEntry(e imageListEntry) runtime.ImageInfo {
 	return info
 }
 
+// entryReference returns the tag/reference field across apple/container JSON
+// schema versions. container 1.0 nests it under configuration.name.
+func entryReference(e imageListEntry) string {
+	if e.Reference != "" {
+		return e.Reference
+	}
+	if e.Name != "" {
+		return e.Name
+	}
+	return e.Configuration.Name
+}
+
 // entryDigest returns the first digest the runtime reported for an image, in
 // preference order, or "" when none is present.
 func entryDigest(e imageListEntry) string {
 	if e.Digest != "" {
 		return e.Digest
+	}
+	if e.Configuration.Descriptor.Digest != "" {
+		return e.Configuration.Descriptor.Digest
 	}
 	if e.Descriptor.Digest != "" {
 		return e.Descriptor.Digest
@@ -137,7 +190,17 @@ func entryDigest(e imageListEntry) string {
 			return v.Descriptor.Digest
 		}
 	}
-	return ""
+	return normalizeDigest(e.ID)
+}
+
+func normalizeDigest(d string) string {
+	if d == "" {
+		return ""
+	}
+	if bytes.Contains([]byte(d), []byte(":")) {
+		return d
+	}
+	return "sha256:" + d
 }
 
 // repoName strips the tag from a reference so a digest can be appended as a

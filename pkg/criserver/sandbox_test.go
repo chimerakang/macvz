@@ -146,6 +146,32 @@ func TestRunPodSandboxRejectsDuplicatePodKey(t *testing.T) {
 	}
 }
 
+func TestRunPodSandboxIdempotentRetryReturnsExistingSandbox(t *testing.T) {
+	s := New(Options{})
+	ctx := context.Background()
+	req := runReq("default", "web", "uid-web")
+	req.Config.Metadata.Attempt = 2
+
+	first, err := s.RunPodSandbox(ctx, req)
+	if err != nil {
+		t.Fatalf("first RunPodSandbox: %v", err)
+	}
+	second, err := s.RunPodSandbox(ctx, req)
+	if err != nil {
+		t.Fatalf("retry RunPodSandbox: %v", err)
+	}
+	if second.GetPodSandboxId() != first.GetPodSandboxId() {
+		t.Fatalf("retry id = %q, want existing %q", second.GetPodSandboxId(), first.GetPodSandboxId())
+	}
+	list, err := s.ListPodSandbox(ctx, &runtimeapi.ListPodSandboxRequest{})
+	if err != nil {
+		t.Fatalf("ListPodSandbox: %v", err)
+	}
+	if len(list.GetItems()) != 1 {
+		t.Fatalf("sandbox count after retry = %d, want 1", len(list.GetItems()))
+	}
+}
+
 func TestRunPodSandboxRejectsHostNamespaceWithSchedulingHint(t *testing.T) {
 	s := New(Options{})
 	ctx := context.Background()

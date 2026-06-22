@@ -497,6 +497,23 @@ idempotent for ENOENT and rerun the same late-rootfs harness. Production CRI
 wiring remains blocked until a process can actually start and report rootfs
 identity from the prepared container rootfs.
 
+### R11: vmexec `/dev/ptmx` Probe (#103)
+
+R11 completed on 2026-06-22 UTC. The report is
+[CRI_RUNTIME_R11_PTMX_PROBE_REPORT.md](CRI_RUNTIME_R11_PTMX_PROBE_REPORT.md).
+
+Result: **the `/dev/ptmx` blocker was removed, and the harness advanced to the
+next device invariant**. A local apple/containerization patch changed
+`configureConsole` so `remove(ptmx)` treats ENOENT as idempotent. The rebuilt
+`vminit:macvz-r11` initfs no longer failed at `stage=remove(ptmx)`.
+
+The next observed failure is `stage=open(/dev/null) errno=2`. The observed
+outcome is `vmexecPtmxFixAdvancedToExec`.
+
+Decision: the next probe should ensure a usable `/dev/null` exists after OCI
+`/dev` tmpfs setup for late prepared rootfs starts. Production CRI wiring
+remains blocked until the late container reports rootfs identity.
+
 ### C5: Swift Helper Daemon Prototype
 
 Only if R0 later selects a LinuxPod-based bridge as a valid runtime building

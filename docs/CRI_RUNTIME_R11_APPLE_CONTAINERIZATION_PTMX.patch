@@ -1,0 +1,13 @@
+diff --git a/vminitd/Sources/vmexec/Mount.swift b/vminitd/Sources/vmexec/Mount.swift
+index 365f310..6ed5b6e 100644
+--- a/vminitd/Sources/vmexec/Mount.swift
++++ b/vminitd/Sources/vmexec/Mount.swift
+@@ -42,7 +42,7 @@ struct ContainerMount {
+ 
+     func configureConsole() throws {
+         let ptmx = rootfs + "/dev/ptmx"
+-        guard remove(ptmx) == 0 else {
++        guard remove(ptmx) == 0 || errno == ENOENT else {
+             throw App.Errno(stage: "remove(ptmx)")
+         }
+         guard symlink("pts/ptmx", ptmx) == 0 else {

@@ -407,6 +407,25 @@ tmpfs and `/dev/pts` devpts mounts are configured. The next useful patch is to
 make that step idempotent for ENOENT, then rerun the same harness to see whether
 the late prepared rootfs reaches process identity evidence.
 
+## R11 Result
+
+R11 completed on 2026-06-22 UTC. The live probe report is published at
+[CRI_RUNTIME_R11_PTMX_PROBE_REPORT.md](CRI_RUNTIME_R11_PTMX_PROBE_REPORT.md).
+
+Outcome: `vmexecPtmxFixAdvancedToExec`.
+
+The local apple/containerization patch treated `remove(ptmx)` ENOENT as
+idempotent and rebuilt the Pod VM initfs as `vminit:macvz-r11`. The same
+late-rootfs harness no longer failed at `stage=remove(ptmx)`. It advanced to:
+
+```text
+macvz-r10-errno=1 stage=open(/dev/null) errno=2 strerror=No such file or directory
+```
+
+This confirms the ptmx invariant was real and removable, but process identity is
+still not reached. The next blocker is `/dev/null` device setup in the late
+prepared rootfs path.
+
 ## MacVz Integration Boundary
 
 Until the primitive exists, MacVz should keep production runtime code unchanged.

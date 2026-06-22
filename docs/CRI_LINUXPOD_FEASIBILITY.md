@@ -433,6 +433,27 @@ step should define the smallest upstream-compatible LinuxPod/vminitd primitive
 that prepares rootfs data in vminitd-visible state, registers the new container,
 starts it, and cleans up failure state.
 
+### R8: vminitd Rootfs/Container Primitive Design (#100)
+
+R8 completed on 2026-06-22 UTC. The design is
+[CRI_RUNTIME_R8_ROOTFS_CONTAINER_PRIMITIVE.md](CRI_RUNTIME_R8_ROOTFS_CONTAINER_PRIMITIVE.md).
+
+Decision: **MacVz needs a first-class vminitd/LinuxPod primitive, not another
+utility-container staging wrapper**. The proposed primitive splits the missing
+behavior into `PrepareContainerRootfs` and `CreateContainer`, with explicit
+state transitions for rootfs preparation, container registration, start,
+failure rollback, and cleanup.
+
+The next implementation should be both a local experimental fork/patch and an
+upstream proposal. The local patch is only for proving the state machine with a
+gated live probe; production CRI wiring remains blocked until the primitive is
+stable or capability-gated.
+
+The follow-up R9 probe should use the outcome names defined in the R8 design,
+starting with `vminitdRootfsPrimitiveLaunchSucceeded` for success and precise
+failure outcomes for prepare, create, start, identity, cleanup, or required
+upstream changes.
+
 ### C5: Swift Helper Daemon Prototype
 
 Only if R0 later selects a LinuxPod-based bridge as a valid runtime building

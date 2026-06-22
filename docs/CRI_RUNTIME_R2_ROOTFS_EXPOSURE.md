@@ -239,3 +239,20 @@ container?" question as no. The remaining rootfs exposure work should move to a
 real vminitd/LinuxPod primitive: prepare rootfs data where vminitd can consume
 it, register a new container from that rootfs, start the init process, and clean
 up consistently on failure.
+
+## R8 Design
+
+R8 completed on 2026-06-22 UTC. The design is published at
+[CRI_RUNTIME_R8_ROOTFS_CONTAINER_PRIMITIVE.md](CRI_RUNTIME_R8_ROOTFS_CONTAINER_PRIMITIVE.md).
+
+R8 selects a two-stage primitive as the next rootfs exposure direction:
+
+- `PrepareContainerRootfs`: reserve a container/rootfs handle and prepare the
+  rootfs in vminitd-visible state.
+- `CreateContainer`: create the vminitd container from that handle and a full
+  OCI spec, optionally starting only in a gated PoC convenience path.
+
+This design is intentionally upstream-compatible. MacVz should prove it with a
+local experimental fork/patch first, while treating the stable API as an
+upstream LinuxPod/vminitd proposal. Production CRI code remains unchanged until
+that primitive returns a live success outcome and has capability-gated semantics.

@@ -477,6 +477,26 @@ narrower: instrument or extend the upstream vminitd/vmexec bundle/rootfs start
 path so a rootfs prepared after Pod VM creation can be accepted, or so the exact
 missing invariant is exposed.
 
+### R10: vminitd/vmexec Start Failure Instrumentation (#102)
+
+R10 completed on 2026-06-22 UTC. The report is
+[CRI_RUNTIME_R10_VMEXEC_START_REPORT.md](CRI_RUNTIME_R10_VMEXEC_START_REPORT.md).
+
+Result: **the late prepared rootfs reaches `vmexec`, and the start failure is
+now explained**. A local apple/containerization diagnostic patch rebuilt the Pod
+VM initfs as `vminit:macvz-r10` and reran the R9 harness. The diagnostic payload
+showed the bundle, OCI config, prepared rootfs, `/bin/sh`, dynamic linker, and
+`libc` were all present where expected.
+
+The actual failure was `stage=remove(ptmx) errno=2` in `vmexec` console/device
+setup after the OCI `/dev` tmpfs and `/dev/pts` devpts mounts were configured.
+The observed outcome is `vmexecStartFailureExplained`.
+
+Decision: the next probe should patch the `vmexec` `/dev/ptmx` handling to be
+idempotent for ENOENT and rerun the same late-rootfs harness. Production CRI
+wiring remains blocked until a process can actually start and report rootfs
+identity from the prepared container rootfs.
+
 ### C5: Swift Helper Daemon Prototype
 
 Only if R0 later selects a LinuxPod-based bridge as a valid runtime building

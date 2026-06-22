@@ -386,6 +386,27 @@ files to a vminitd-visible path" but still deeper than MacVz production code:
 the next patch should instrument or extend vminitd/vmexec's bundle/rootfs start
 path so it can explain or accept a rootfs prepared after Pod VM creation.
 
+## R10 Result
+
+R10 completed on 2026-06-22 UTC. The live diagnostic report is published at
+[CRI_RUNTIME_R10_VMEXEC_START_REPORT.md](CRI_RUNTIME_R10_VMEXEC_START_REPORT.md).
+
+Outcome: `vmexecStartFailureExplained`.
+
+The local apple/containerization diagnostic patch rebuilt the Pod VM initfs as
+`vminit:macvz-r10` and reran the R9 harness. The instrumented `vmexec` error
+ruled out missing bundle, missing rootfs, missing `/bin/sh`, and missing dynamic
+linker. The actual failure was:
+
+```text
+macvz-r10-errno=1 stage=remove(ptmx) errno=2 strerror=No such file or directory
+```
+
+That places the blocker in `vmexec` console `/dev/ptmx` setup after OCI `/dev`
+tmpfs and `/dev/pts` devpts mounts are configured. The next useful patch is to
+make that step idempotent for ENOENT, then rerun the same harness to see whether
+the late prepared rootfs reaches process identity evidence.
+
 ## MacVz Integration Boundary
 
 Until the primitive exists, MacVz should keep production runtime code unchanged.

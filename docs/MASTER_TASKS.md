@@ -74,6 +74,7 @@ architecture from Virtual Kubelet provider to kubelet CRI runtime integration.
 | CRI-R7 (#99) | Prove vminitd-visible rootfs staging for new-container start | ✅ Complete (utility-container staging addressed through `/run/container/utility/rootfs/...` still cannot start a new vminitd container; outcome `vminitdVisibleRootfsPrimitiveMissing`) |
 | CRI-R8 (#100) | Design upstream-compatible vminitd rootfs/container primitive | ✅ Complete (selected two-stage `PrepareContainerRootfs` + `CreateContainer` primitive; next implementation is local experimental fork/patch plus upstream proposal, not production CRI wiring) |
 | CRI-R9 (#101) | Prototype vminitd rootfs primitive launch with local patch | ✅ Complete (vminitd Copy prepared `/run/container/<id>/rootfs` and `createProcess(id == containerID)` succeeded; `startProcess` failed in `vmexec run` with ENOENT, outcome `vminitdContainerStartFailed`) |
+| CRI-R10 (#102) | Instrument vminitd/vmexec start failure for late prepared rootfs | ✅ Complete (instrumented `vminit:macvz-r10` showed bundle/rootfs/init/dynamic linker all present; `vmexec` failed in console `/dev/ptmx` setup at `remove(ptmx)` with ENOENT, outcome `vmexecStartFailureExplained`) |
 
 **CRI-P5 evidence (#77):** Pod networking is wired through the same primitives as
 the shipped provider — `network.PodIPAM` for Pod IPs and `podnet.Router` for the

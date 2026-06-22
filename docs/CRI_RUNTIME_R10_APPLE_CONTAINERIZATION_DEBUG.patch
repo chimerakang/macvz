@@ -1,0 +1,149 @@
+diff --git a/vminitd/Sources/vmexec/RunCommand.swift b/vminitd/Sources/vmexec/RunCommand.swift
+index 4c9607f..cc9a867 100644
+--- a/vminitd/Sources/vmexec/RunCommand.swift
++++ b/vminitd/Sources/vmexec/RunCommand.swift
+@@ -46,13 +46,102 @@ struct RunCommand: ParsableCommand {
+             } catch {
+                 throw App.Failure(message: "failed to load OCI bundle at \(bundlePath): \(error)")
+             }
+-            try execInNamespace(spec: spec)
++            do {
++                try execInNamespace(spec: spec)
++            } catch {
++                let diagnostics = r10Diagnostics(error: error, spec: spec)
++                writeR10Diagnostics(diagnostics)
++                App.writeError(App.Failure(message: diagnostics))
++                throw error
++            }
+         } catch {
+             App.writeError(error)
+             throw error
+         }
+     }
+ 
++    private func r10Diagnostics(error: Error, spec: ContainerizationOCI.Spec) -> String {
++        let rootPath = spec.root?.path ?? "<missing-root>"
++        let processArgs = spec.process?.args.joined(separator: " ") ?? "<missing-process>"
++        let cwd = spec.process?.cwd ?? "<missing-cwd>"
++        let executable = spec.process?.args.first ?? "<missing-executable>"
++        let namespaces = spec.linux?.namespaces
++            .map { "\($0.type):\($0.path)" }
++            .joined(separator: ",") ?? "<default>"
++        let mounts = spec.mounts
++            .map { "\($0.type):\($0.source)->\($0.destination)" }
++            .joined(separator: ",")
++        var lines: [String] = [
++            "macvz-r10-vmexec-diagnostics=1",
++            "bundlePath=\(bundlePath)",
++            "originalError=\(error)",
++            "root.path=\(rootPath)",
++            "root.readonly=\(spec.root?.readonly.description ?? "<missing>")",
++            "process.args=\(processArgs)",
++            "process.cwd=\(cwd)",
++            "namespaces=\(namespaces)",
++            "mounts=\(mounts)",
++            "path.bundle=\(pathReport(bundlePath))",
++            "path.bundle.config=\(pathReport(URL(fileURLWithPath: bundlePath).appendingPathComponent("config.json").path))",
++            "path.rootfs=\(pathReport(rootPath))",
++            "path.rootfs.etc.identity=\(pathReport(rootPath + "/etc/macvz-r9-identity"))",
++            "path.rootfs.bin.busybox=\(pathReport(rootPath + "/bin/busybox"))",
++            "path.rootfs.bin.sh=\(pathReport(rootPath + "/bin/sh"))",
++            "path.rootfs.lib.ld-linux-aarch64=\(pathReport(rootPath + "/lib/ld-linux-aarch64.so.1"))",
++            "path.rootfs.lib64.ld-linux-aarch64=\(pathReport(rootPath + "/lib64/ld-linux-aarch64.so.1"))",
++            "path.rootfs.lib.libc=\(pathReport(rootPath + "/lib/libc.so.6"))",
++            "path.rootfs.usr.lib.libc=\(pathReport(rootPath + "/usr/lib/libc.so.6"))",
++            "path.rootfs.cwd=\(pathReport(rootPath + cwd))",
++        ]
++
++        if executable.hasPrefix("/") {
++            lines.append("path.rootfs.executable=\(pathReport(rootPath + executable))")
++        }
++        if let mountInfo = try? String(contentsOfFile: "/proc/self/mountinfo", encoding: .utf8) {
++            let relevant = mountInfo
++                .split(separator: "\n")
++                .filter { $0.contains(rootPath) || $0.contains(bundlePath) || $0.contains("/run/container") }
++                .prefix(20)
++                .joined(separator: " | ")
++            lines.append("mountinfo.relevant=\(relevant.isEmpty ? "<none>" : relevant)")
++        }
++        return lines.joined(separator: "\n")
++    }
++
++    private func writeR10Diagnostics(_ diagnostics: String) {
++        let path = "/run/macvz-r10-vmexec-diagnostics.txt"
++        let fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, mode_t(UInt16(0o644)))
++        guard fd >= 0 else {
++            return
++        }
++        defer { close(fd) }
++        let bytes = Array(diagnostics.utf8)
++        _ = bytes.withUnsafeBytes { buffer in
++            write(fd, buffer.baseAddress, buffer.count)
++        }
++    }
++
++    private func pathReport(_ path: String) -> String {
++        var st = stat()
++        if lstat(path, &st) != 0 {
++            return "\(path):missing errno=\(errno) \(String(cString: strerror(errno)))"
++        }
++        let mode = st.st_mode
++        let type: String
++        if (mode & S_IFMT) == S_IFDIR {
++            type = "dir"
++        } else if (mode & S_IFMT) == S_IFREG {
++            type = "file"
++        } else if (mode & S_IFMT) == S_IFLNK {
++            type = "symlink"
++        } else {
++            type = "other"
++        }
++        let executable = access(path, X_OK) == 0
++        let readable = access(path, R_OK) == 0
++        return "\(path):exists type=\(type) mode=\(String(mode & 0o7777, radix: 8)) size=\(st.st_size) readable=\(readable) executable=\(executable)"
++    }
++
+     private func childRootSetup(rootfs: ContainerizationOCI.Root, mounts: [ContainerizationOCI.Mount]) throws {
+         // setup rootfs
+         try prepareRoot(rootfs: rootfs.path)
+diff --git a/vminitd/Sources/vmexec/vmexec.swift b/vminitd/Sources/vmexec/vmexec.swift
+index 8141be9..5f37bd1 100644
+--- a/vminitd/Sources/vmexec/vmexec.swift
++++ b/vminitd/Sources/vmexec/vmexec.swift
+@@ -255,8 +255,18 @@ extension App {
+     }
+ 
+     static func Errno(stage: String, info: String = "") -> ContainerizationError {
+-        let posix = POSIXError(.init(rawValue: errno)!, userInfo: ["stage": stage])
+-        return ContainerizationError(.internalError, message: "\(info) \(String(describing: posix))")
++        let err = errno
++        let code = POSIXErrorCode(rawValue: err) ?? .EIO
++        let posix = POSIXError(code, userInfo: ["stage": stage])
++        let message = [
++            "macvz-r10-errno=1",
++            "stage=\(stage)",
++            "errno=\(err)",
++            "strerror=\(String(cString: strerror(err)))",
++            "info=\(info)",
++            "posix=\(String(describing: posix))",
++        ].joined(separator: " ")
++        return ContainerizationError(.internalError, message: message)
+     }
+ 
+     static func Failure(message: String) -> ContainerizationError {
+@@ -276,6 +286,15 @@ extension App {
+             errorMessage = String(describing: error)
+         }
+ 
++        let diagnosticFd = open("/run/macvz-r10-vmexec-errorpipe.txt", O_WRONLY | O_CREAT | O_TRUNC, mode_t(UInt16(0o644)))
++        if diagnosticFd >= 0 {
++            let diagnosticBytes = Array(errorMessage.utf8)
++            _ = diagnosticBytes.withUnsafeBytes { buffer in
++                write(diagnosticFd, buffer.baseAddress, buffer.count)
++            }
++            close(diagnosticFd)
++        }
++
+         let bytes = Array(errorMessage.utf8)
+         _ = try? bytes.withUnsafeBytes { buffer in
+             try errorPipe.write(buffer)

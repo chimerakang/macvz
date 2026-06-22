@@ -3056,7 +3056,7 @@ struct LinuxPodSharedNamespacePoC: AsyncParsableCommand {
             try? FileManager.default.removeItem(at: hostResultPath)
             let binDir = hostPreparedRootfs.appendingPathComponent("bin")
             let identityDir = hostPreparedRootfs.appendingPathComponent("etc")
-            for dir in ["dev", "proc", "sys", "tmp"] {
+            for dir in ["dev", "proc", "run", "sys", "tmp"] {
                 try FileManager.default.createDirectory(
                     at: hostPreparedRootfs.appendingPathComponent(dir),
                     withIntermediateDirectories: true
@@ -3148,6 +3148,22 @@ struct LinuxPodSharedNamespacePoC: AsyncParsableCommand {
                 }
             } catch {
                 errors["startOrWaitProcess"] = describe(error)
+                let diagnostics = await copyVminitdDiagnosticIfPresent(
+                    vm: vm,
+                    vminitd: vminitd,
+                    guestPath: "\(rootfsPath)/run/macvz-r10-vmexec-diagnostics.txt",
+                    hostPath: rootfsURL.appendingPathComponent("r10-vmexec-diagnostics-\(escapedID).txt"),
+                    key: "vmexecDiagnostics"
+                )
+                errors[diagnostics.key] = diagnostics.value
+                let errorPipe = await copyVminitdDiagnosticIfPresent(
+                    vm: vm,
+                    vminitd: vminitd,
+                    guestPath: "\(rootfsPath)/run/macvz-r10-vmexec-errorpipe.txt",
+                    hostPath: rootfsURL.appendingPathComponent("r10-vmexec-errorpipe-\(escapedID).txt"),
+                    key: "vmexecErrorPipe"
+                )
+                errors[errorPipe.key] = errorPipe.value
             }
         }
 
@@ -3261,6 +3277,28 @@ struct LinuxPodSharedNamespacePoC: AsyncParsableCommand {
             return "vminitdRootfsPrepareFailed"
         }
         return attempt?.outcome ?? "vminitdRootfsPrepareFailed"
+    }
+
+    private func copyVminitdDiagnosticIfPresent(
+        vm: any VirtualMachineInstance,
+        vminitd: Vminitd,
+        guestPath: String,
+        hostPath: URL,
+        key: String
+    ) async -> (key: String, value: String) {
+        do {
+            _ = try await vminitd.stat(path: URL(fileURLWithPath: guestPath))
+            try? FileManager.default.removeItem(at: hostPath)
+            try await copyGuestPathToHost(
+                vm: vm,
+                vminitd: vminitd,
+                guestPath: guestPath,
+                destination: hostPath
+            )
+            return (key, try readTextFile(hostPath))
+        } catch {
+            return ("\(key)Unavailable", describe(error))
+        }
     }
 
     private func readTextFile(_ url: URL) throws -> String {

@@ -70,7 +70,8 @@ architecture from Virtual Kubelet provider to kubelet CRI runtime integration.
 | CRI-R3 (#95) | NBD-backed pre-create rootfs identity PoC for LinuxPod containers | ✅ Complete (two NBD-served rootfs images boot as predeclared LinuxPod containers; guest virtio-block mount evidence and host-side EXT4 marker reads confirm identity) |
 | CRI-R4 (#96) | Guest-side rootfs staging PoC for already-running Pod VM | ✅ Complete (post-create guest-side file staging works with explicit request identity; agent-created bind mount is not visible to a later exec in the predeclared utility container) |
 | CRI-R5 (#97) | VM-agent process execution from staged guest rootfs | ✅ Complete (root-level VM process creation is unimplemented; `containerID=utility` can create/start a process but did not execute from the staged rootfs identity, outcome `processStartedButIdentityMismatch`) |
-| CRI-R6 (#98) | Inspect `vminitd` container/rootfs process path after staged rootfs R5 | ⬜ Planned |
+| CRI-R6 (#98) | Inspect `vminitd` container/rootfs process path after staged rootfs R5 | ✅ Complete (`id == containerID` reaches vminitd's new-container path and creates the container object; start still needs rootfs staged in the namespace vminitd can consume, outcome `vminitdContainerRootfsPathFound`) |
+| CRI-R7 (#99) | Prove vminitd-visible rootfs staging for new-container start | ⬜ Planned |
 
 **CRI-P5 evidence (#77):** Pod networking is wired through the same primitives as
 the shipped provider — `network.PodIPAM` for Pod IPs and `podnet.Router` for the

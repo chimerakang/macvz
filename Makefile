@@ -72,6 +72,10 @@ cri-linuxpod-r4: ## Run the #96 guest-side late rootfs staging probe (set MACVZ_
 cri-linuxpod-r5: ## Run the #97 VM-agent staged-rootfs process probe (set MACVZ_LINUXPOD_POC=1 to run live)
 	MACVZ_LINUXPOD_PROBE=r5 ./test/e2e/cri-linuxpod/run.sh
 
+.PHONY: cri-linuxpod-r6
+cri-linuxpod-r6: ## Run the #98 vminitd staged-rootfs container process probe (set MACVZ_LINUXPOD_POC=1 to run live)
+	MACVZ_LINUXPOD_PROBE=r6 ./test/e2e/cri-linuxpod/run.sh
+
 .PHONY: bench
 bench: ## Build the density/RAM benchmark harness into bin/mvz-bench
 	@mkdir -p $(BIN_DIR)

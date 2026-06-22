@@ -380,6 +380,34 @@ late rootfs launch path. The next research step should inspect or extend the
 guest/vminitd container creation path itself rather than adding more wrapper
 logic around existing `execInContainer` behavior.
 
+### R6: vminitd Container Rootfs Process Path (#98)
+
+R6 completed on 2026-06-22 UTC. The report is
+[CRI_RUNTIME_R6_VMINITD_CONTAINER_REPORT.md](CRI_RUNTIME_R6_VMINITD_CONTAINER_REPORT.md).
+
+Result: **the lower-level vminitd new-container path exists, but rootfs staging
+must happen in the namespace vminitd can consume**. Source inspection showed
+that `createProcess` without `containerID` is explicitly rejected, while
+`containerID=utility` is treated as exec because `utility` already exists in
+`vminitd` state. That exec branch writes only OCI `process` JSON and ignores the
+submitted `root.path`.
+
+The non-exec branch is available when `containerID` is absent from vminitd state
+and `id == containerID`. R6 called that path with `r6-late-alpha`; live evidence
+showed `createProcess` succeeded and vminitd created a new cgroup/vmexec init
+process. `startProcess` then failed with `No such file or directory`, and no
+result file was written. The likely boundary is mount namespace ownership: the
+staged rootfs was created by an exec inside the predeclared utility container,
+not by vminitd in the init namespace where `vmexec run` resolves the OCI
+`root.path`.
+
+Outcome: `vminitdContainerRootfsPathFound`.
+
+Decision: continue, but do not wire this into production yet. The next work
+should prove an init-namespace rootfs preparation path, or define the smallest
+upstream/LinuxPod primitive that stages rootfs data and registers/starts a new
+vminitd container atomically enough for kubelet `CreateContainer` ordering.
+
 ### C5: Swift Helper Daemon Prototype
 
 Only if R0 later selects a LinuxPod-based bridge as a valid runtime building

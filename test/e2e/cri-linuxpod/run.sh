@@ -52,8 +52,13 @@ case "${PROBE}" in
     REPORT_TITLE="CRI-R5 VM-Agent Process From Staged Rootfs Report (#97)"
     WORK_DIR="${MACVZ_LINUXPOD_WORK_DIR:-/tmp/macvz-runtime-r5}"
     ;;
+  r6)
+    DEFAULT_REPORT_PATH="${ROOT_DIR}/docs/CRI_RUNTIME_R6_VMINITD_CONTAINER_REPORT.md"
+    REPORT_TITLE="CRI-R6 vminitd Container Rootfs Process Path Report (#98)"
+    WORK_DIR="${MACVZ_LINUXPOD_WORK_DIR:-/tmp/macvz-runtime-r6}"
+    ;;
   *)
-    echo "unsupported MACVZ_LINUXPOD_PROBE=${PROBE}; expected c1, c2, c4, r1, r3, r4, or r5" >&2
+    echo "unsupported MACVZ_LINUXPOD_PROBE=${PROBE}; expected c1, c2, c4, r1, r3, r4, r5, or r6" >&2
     exit 1
     ;;
 esac
@@ -75,6 +80,7 @@ This gated Swift harness can run:
   - r3 (#95): NBD-backed pre-create rootfs identity probe
   - r4 (#96): guest-side late rootfs staging probe
   - r5 (#97): VM-agent process execution from staged guest rootfs
+  - r6 (#98): vminitd new-container process from staged guest rootfs
 
 Selected probe: ${PROBE}
 
@@ -130,6 +136,14 @@ R5 flow:
   4. verify the process wrote identity and rootfs evidence back into the staged
      rootfs, then clean up
 
+R6 flow:
+  1. boot one LinuxPod with a predeclared keeper utility container
+  2. after pod.create(), stage a minimal busybox rootfs under /run/macvz-r6
+  3. call VM-agent createProcess/startProcess with id == containerID so vminitd
+     takes its new-container path instead of an exec path
+  4. verify the new process wrote identity and rootfs evidence back into the
+     staged rootfs, then delete the vminitd container and clean up
+
 Set MACVZ_LINUXPOD_VMNET=1 to also attach a vmnet interface. The default
 keeps this C1 probe focused on LinuxPod shared-namespace behavior.
 
@@ -157,6 +171,7 @@ Run live:
   MACVZ_LINUXPOD_POC=1 make cri-linuxpod-r3
   MACVZ_LINUXPOD_POC=1 make cri-linuxpod-r4
   MACVZ_LINUXPOD_POC=1 make cri-linuxpod-r5
+  MACVZ_LINUXPOD_POC=1 make cri-linuxpod-r6
 EOF
   exit 0
 fi
@@ -295,13 +310,23 @@ EOF
 - [x] The report distinguishes guest staging transport unavailable, rootfs copy/unpack failure, identity mismatch, bind failure, cleanup failure, and success.
 
 EOF
-  else
+  elif [[ "${PROBE}" == "r5" ]]; then
     cat >>"${REPORT_PATH}" <<EOF
 - [x] One LinuxPod was created with a predeclared keeper utility container.
 - [x] Guest agent transport was attempted only after pod.create() and utility start.
 - [x] A post-create staged rootfs was used as the root of a VM-agent-created process, or the precise failure boundary was recorded.
 - [x] Identity is checked by explicit request ID, not by guessed /dev/sdX or /dev/vdX names.
 - [x] The report distinguishes VM-agent process API unavailable, staged rootfs unavailable, process creation failure, identity mismatch, namespace/rootfs mismatch, cleanup failure, and success.
+
+EOF
+  else
+    cat >>"${REPORT_PATH}" <<EOF
+- [x] One LinuxPod was created with a predeclared keeper utility container.
+- [x] Guest agent transport was attempted only after pod.create() and utility start.
+- [x] vminitd createProcess/startProcess was called with id == containerID to target the new-container path.
+- [x] A post-create staged rootfs was used as the OCI root for that vminitd container path, or the precise failure boundary was recorded.
+- [x] Identity is checked by explicit request ID, not by guessed /dev/sdX or /dev/vdX names.
+- [x] The report distinguishes unavailable transport, staged rootfs unavailable, upstream primitive missing, exec-like rootfs constraint, cleanup failure, and success.
 
 EOF
   fi

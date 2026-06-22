@@ -27,6 +27,7 @@ MACVZ_LINUXPOD_POC=1 make cri-linuxpod-r1
 MACVZ_LINUXPOD_POC=1 make cri-linuxpod-r3
 MACVZ_LINUXPOD_POC=1 make cri-linuxpod-r4
 MACVZ_LINUXPOD_POC=1 make cri-linuxpod-r5
+MACVZ_LINUXPOD_POC=1 make cri-linuxpod-r6
 ```
 
 Set `MACVZ_CONTAINERIZATION_DIR` if the checkout lives elsewhere. The default
@@ -48,6 +49,10 @@ then uses the running VM agent to stage, bind mount, verify, clean up, and retry
 rootfs-like guest directories with explicit request IDs after `pod.create()`.
 R5 stages a minimal busybox rootfs after `pod.create()` and asks the VM agent to
 create/start a process whose OCI root points at that staged tree.
+R6 stages a minimal busybox rootfs after `pod.create()` and asks vminitd to
+create/start a new container-scoped process with `id == containerID`, which
+targets the non-exec `ManagedContainer` path instead of the existing utility
+container's exec path.
 Set
 `MACVZ_LINUXPOD_VMNET=1` to include vmnet attachment as an additional host
 network probe.
@@ -58,6 +63,7 @@ The C1 live run writes `docs/CRI_LINUXPOD_POC_REPORT.md`; C2 writes
 `docs/CRI_RUNTIME_R1_DEVICE_DISCOVERY_REPORT.md` unless
 `MACVZ_LINUXPOD_REPORT` points to another path.
 R3 writes `docs/CRI_RUNTIME_R3_NBD_ROOTFS_REPORT.md`.
+R6 writes `docs/CRI_RUNTIME_R6_VMINITD_CONTAINER_REPORT.md`.
 R4 writes `docs/CRI_RUNTIME_R4_GUEST_STAGING_REPORT.md`.
 R5 writes `docs/CRI_RUNTIME_R5_STAGED_PROCESS_REPORT.md`.
 

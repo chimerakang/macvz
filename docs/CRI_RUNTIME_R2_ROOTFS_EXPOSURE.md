@@ -190,3 +190,31 @@ R5 therefore narrows the remaining gap: post-create file staging works, but the
 current public agent/LinuxPod path still lacks a proven "prepare rootfs, then
 start a new container process from that rootfs" primitive for normal kubelet
 ordering.
+
+## R6 Result
+
+R6 completed on 2026-06-22 UTC. The live probe is published at
+[CRI_RUNTIME_R6_VMINITD_CONTAINER_REPORT.md](CRI_RUNTIME_R6_VMINITD_CONTAINER_REPORT.md).
+
+Outcome: `vminitdContainerRootfsPathFound`.
+
+Source inspection and live evidence clarified the state model:
+
+- `containerID=nil` is rejected by vminitd with `processes in the root of the vm
+  not implemented`.
+- `containerID=utility` is exec-like because the utility container already
+  exists in vminitd state. That path writes only OCI `process` JSON and does not
+  use the submitted `root.path`.
+- `id == containerID` with a previously unknown container ID enters the
+  new-container branch. R6 proved `createProcess` can create that vminitd
+  container object from a submitted OCI spec.
+
+The process did not start successfully because `vmexec run` returned
+`No such file or directory`. The likely cause is that the rootfs was staged by a
+utility-container exec, so the populated tree was not the same rootfs tree
+visible to vminitd's init namespace at start time.
+
+This moves the remaining rootfs exposure problem one layer down: MacVz needs a
+rootfs preparation primitive that vminitd can consume directly, or an upstream
+LinuxPod/vminitd API that performs rootfs staging plus new-container registration
+and start in one coherent state transition.

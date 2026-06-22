@@ -72,6 +72,7 @@ SOAK_ITERS="${MACVZ_INLOOP_SOAK_ITERATIONS:-30}"
 SOAK_INTERVAL="${MACVZ_INLOOP_SOAK_INTERVAL:-10}"
 RSS_GROWTH_KB="${MACVZ_INLOOP_RSS_GROWTH_KB:-65536}"
 OUT_DIR="${MACVZ_CRI_OUT_DIR:-}"
+HANDOFF="${MACVZ_HANDOFF:-0}"
 
 RUNTIME_LABEL="node.macvz.io/runtime=apple-container"
 TAINT_KEY="node.macvz.io/host-namespace-unsupported"
@@ -102,6 +103,9 @@ reachable KUBECONFIG to run live):
                 + ConfigMap + Secret + ClusterIP Service); kubectl rollout status.
   scheduling    Pod landed on the MacVz node; Pod events show clean scheduling
                 (no FailedScheduling / FailedCreatePodSandBox).
+  handoff       (MACVZ_HANDOFF=1, node on macvz-cri --experimental-handoff)
+                container Running implies StartContainer's identity gate passed
+                (#116); MACVZ_HANDOFF_STATUS_CMD surfaces on-node identityVerified.
   logs          kubectl logs returns the workload boot marker.
   exec          kubectl exec reads the projected Secret + ConfigMap markers.
   port-forward  kubectl port-forward + curl localhost returns the served marker.
@@ -243,6 +247,49 @@ phase_scheduling() {
 		fail "Pod events contain scheduling/sandbox failures (see $OUT_DIR/pod-events.log)"
 	else
 		pass "Pod events clean (no FailedScheduling/FailedCreatePodSandBox)"
+	fi
+}
+
+phase_handoff() {
+	# CRI-I4-2 (#119): when the MacVz CRI node runs with the experimental
+	# handoff-aware runtime (macvz-cri --experimental-handoff, see README
+	# "Pointing k3s at macvz-cri"), a Pod reaching Running is itself evidence
+	# that StartContainer's identity gate passed — the handoff-aware runtime
+	# only persists Running after the launched process reports the expected
+	# rootfs identity through the runtime-private evidence channel (#116).
+	# This phase makes that assertion explicit and, when an operator status
+	# hook is provided, surfaces the on-node handoff diagnostics.
+	[ "$HANDOFF" = "1" ] || { skip "handoff (set MACVZ_HANDOFF=1 when the node runs macvz-cri --experimental-handoff)"; return 0; }
+	log "Phase: handoff identity verification (CRI-I4-2 #119)"
+	local pod phase; pod="$(pod_name)"
+	[ -n "$pod" ] || { fail "no Pod for handoff verification"; return 1; }
+	phase="$(kn get pod "$pod" -o jsonpath='{.status.containerStatuses[0].state.running}' 2>/dev/null)"
+	if [ -n "$phase" ]; then
+		pass "container Running through the handoff identity gate (#116: Running implies verified identity)"
+	else
+		fail "container not Running; handoff identity gate not satisfied (see $OUT_DIR/handoff-*.log)"
+		kn get pod "$pod" -o yaml >"$OUT_DIR/handoff-pod.yaml" 2>&1 || true
+	fi
+	# Optional: surface the runtime-private handoff diagnostics from the node.
+	# The hook runs `crictl inspect <id>` (Verbose) on the CRI node and prints
+	# the container status JSON; the handoff-aware status exposes
+	# handoffPrepared / identityVerified / expectedIdentity / observedIdentity
+	# under .info (CRI-I3 #117 handoffStatusInfo).
+	if [ -n "${MACVZ_HANDOFF_STATUS_CMD:-}" ]; then
+		run_hook "$MACVZ_HANDOFF_STATUS_CMD" >"$OUT_DIR/handoff-status.json" 2>"$OUT_DIR/handoff-status.err" || true
+		local verified=""
+		if command -v jq >/dev/null 2>&1; then
+			verified="$(jq -r '.identityVerified // .info.identityVerified // empty' "$OUT_DIR/handoff-status.json" 2>/dev/null)"
+		fi
+		if [ "$verified" = "true" ] || grep -Eq '"identityVerified"[[:space:]]*:[[:space:]]*"?true"?|identityVerified=true' "$OUT_DIR/handoff-status.json" 2>/dev/null; then
+			pass "node handoff diagnostics report identityVerified=true (see $OUT_DIR/handoff-status.json)"
+		elif grep -q 'handoffPrepared' "$OUT_DIR/handoff-status.json" 2>/dev/null; then
+			fail "node handoff diagnostics present but identityVerified not true (see $OUT_DIR/handoff-status.json)"
+		else
+			skip "MACVZ_HANDOFF_STATUS_CMD produced no handoffStatusInfo (node may not be running --experimental-handoff)"
+		fi
+	else
+		skip "handoff diagnostics (set MACVZ_HANDOFF_STATUS_CMD to surface on-node identityVerified/expectedIdentity)"
 	fi
 }
 
@@ -514,6 +561,7 @@ setup
 phase_preflight || die "preflight failed; not deploying onto an unverified node"
 phase_deploy
 phase_scheduling
+phase_handoff
 phase_logs
 phase_exec
 phase_portforward

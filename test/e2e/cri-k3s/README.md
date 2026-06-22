@@ -60,6 +60,22 @@ bundled containerd.
    If an argument contains spaces, put one argument per line in a file and set
    `MACVZ_CRI_EXTRA_ARGS_FILE=/path/to/args`.
 
+   To exercise the **experimental handoff-aware runtime** (CRI-I, #109..#117)
+   instead of the default apple/container path, add the handoff flags. The
+   production handoff root `/run/macvz/containers` is not writable on macOS, so
+   point `--handoff-root` at a writable per-user directory:
+
+   ```sh
+   MACVZ_CRI_EXTRA="--experimental-handoff --handoff-root $HOME/.macvz/cri/handoff"
+   ```
+
+   With the node running this way, the k3s in-loop harness exercises the handoff
+   path end to end: StartContainer gates a Pod's container to Running only after
+   the launched process reports the expected rootfs identity through the
+   runtime-private evidence channel (#116). Run the harness with `MACVZ_HANDOFF=1`
+   (and optionally `MACVZ_HANDOFF_STATUS_CMD` to surface on-node
+   `identityVerified` diagnostics). See `docs/CRI_RUNTIME_I4_2_INLOOP_HANDOFF_REPORT.md`.
+
 2. Start k3s (agent) against the external endpoint:
 
    ```sh

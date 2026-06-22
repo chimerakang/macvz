@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 )
 
@@ -190,6 +191,39 @@ func (m *HandoffManager) Cleanup(containerID string) error {
 		return fmt.Errorf("runtime: cleanup handoff for %q: %w", containerID, err)
 	}
 	return nil
+}
+
+// ListContainerIDs returns the container/workload IDs of every per-container
+// handoff subtree currently present under the manager's root. It is the basis for
+// restart-time orphan detection (CRI-I4-3, #120): the adapter compares this
+// on-disk set against its known container records and reclaims any subtree with no
+// backing record.
+//
+// A missing root means no handoff was ever prepared and yields an empty list, not
+// an error. Non-directory entries and entries whose names are not valid handoff
+// IDs are skipped: only well-formed per-container subtrees this manager could have
+// created are reported, so a stray file under the root never masquerades as an
+// orphan workload.
+func (m *HandoffManager) ListContainerIDs() ([]string, error) {
+	entries, err := os.ReadDir(m.root)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("runtime: list handoff subtrees under %s: %w", m.root, err)
+	}
+	var ids []string
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		if _, err := sanitizeHandoffID(e.Name()); err != nil {
+			continue
+		}
+		ids = append(ids, e.Name())
+	}
+	sort.Strings(ids)
+	return ids, nil
 }
 
 // sanitizeHandoffID validates that id is usable as a single path element and

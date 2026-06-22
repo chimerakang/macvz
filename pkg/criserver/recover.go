@@ -69,4 +69,9 @@ func (s *Server) RecoverContainers(ctx context.Context) {
 		klog.InfoS("recovered CRI container state after restart",
 			"reconciled", reconciled, "exited", exited, "resumedLogPumps", pumps)
 	}
+
+	// Reclaim runtime-private handoff subtrees that no surviving container record
+	// claims (CRI-I4-3, #120). Runs after reconcile so the record set reflects the
+	// recovered states; inert when the experimental handoff path is disabled.
+	s.sweepOrphanHandoffs(ctx)
 }

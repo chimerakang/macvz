@@ -32,6 +32,7 @@ import (
 	"github.com/chimerakang/macvz/pkg/criserver/store"
 	"github.com/chimerakang/macvz/pkg/network"
 	"github.com/chimerakang/macvz/pkg/network/podnet"
+	"github.com/chimerakang/macvz/pkg/runtime"
 	"github.com/chimerakang/macvz/pkg/runtime/container"
 	"google.golang.org/grpc"
 	"k8s.io/klog/v2"
@@ -56,6 +57,16 @@ func (c podNetConfig) enabled() bool { return c.podCIDR != "" && c.iface != "" }
 type mountConfig struct {
 	kubeletPodsDir  string
 	hostPathAllowed []string
+}
+
+// handoffConfig collects the experimental LinuxPod runtime handoff flags
+// (CRI-I, #109..#117). The handoff path is off unless enabled is set; root
+// overrides the runtime-private subtree root so the path can be exercised under
+// a writable per-user directory on macOS (the production /run/macvz/containers
+// does not exist there).
+type handoffConfig struct {
+	enabled bool
+	root    string
 }
 
 // stringList is a repeatable string flag (one value per occurrence), used for the
@@ -95,6 +106,8 @@ func main() {
 		kubeletPodsDir  string
 		hostPathAllowed stringList
 		multiContainer  bool
+		handoff         bool
+		handoffRoot     string
 		pn              podNetConfig
 	)
 	flag.StringVar(&listen, "listen", defaultListen,
@@ -125,6 +138,10 @@ func main() {
 		"check runtime dependencies (apple/container CLI, socket, state dir, networking) and exit without serving (CRI-P8 operator diagnostics)")
 	flag.BoolVar(&multiContainer, "experimental-multi-container", false,
 		"opt into the experimental multi-container Pod probe (#82): admits a second container only if the runtime implements pause-VM shared-netns create/join support; apple/container does not, so this turns the one-container rejection into a diagnostic naming the missing primitive")
+	flag.BoolVar(&handoff, "experimental-handoff", false,
+		"opt into the experimental LinuxPod runtime handoff path (CRI-I, #109..#117): CreateContainer prepares a runtime-private per-container rootfs/handoff subtree and StartContainer gates Running on handoff identity verification; off by default and unrelated to the shipped Virtual Kubelet runtime")
+	flag.StringVar(&handoffRoot, "handoff-root", "",
+		"root directory for the experimental handoff subtree when --experimental-handoff is set (empty uses the production /run/macvz/containers, which is not writable on macOS; point this at a writable per-user dir to exercise the path locally)")
 	flag.BoolVar(&showVersion, "version", false, "print version and exit")
 
 	klog.InitFlags(nil)
@@ -155,7 +172,9 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	if err := run(ctx, listen, stateDir, runtimeBinary, rosetta, streamingAddr, pn, mc, multiContainer); err != nil {
+	hc := handoffConfig{enabled: handoff, root: handoffRoot}
+
+	if err := run(ctx, listen, stateDir, runtimeBinary, rosetta, streamingAddr, pn, mc, multiContainer, hc); err != nil {
 		klog.ErrorS(err, "macvz-cri exited with error")
 		klog.Flush()
 		os.Exit(1)
@@ -163,7 +182,7 @@ func main() {
 	klog.Flush()
 }
 
-func run(ctx context.Context, listen, stateDir, runtimeBinary string, rosetta bool, streamingAddr string, pn podNetConfig, mc mountConfig, multiContainer bool) error {
+func run(ctx context.Context, listen, stateDir, runtimeBinary string, rosetta bool, streamingAddr string, pn podNetConfig, mc mountConfig, multiContainer bool, hc handoffConfig) error {
 	socketPath, err := socketPath(listen)
 	if err != nil {
 		return err
@@ -215,6 +234,17 @@ func run(ctx context.Context, listen, stateDir, runtimeBinary string, rosetta bo
 	}
 	defer netCleanup()
 
+	// Wire the experimental LinuxPod handoff manager only when explicitly opted in
+	// (CRI-I, #109..#117). Nil leaves CreateContainer/StartContainer on the default
+	// apple/container path with no handoff preparation or identity gate.
+	var handoffMgr *runtime.HandoffManager
+	if hc.enabled {
+		handoffMgr = runtime.NewHandoffManager(hc.root)
+		klog.InfoS("experimental LinuxPod handoff path enabled",
+			"root", hc.root,
+			"note", "CreateContainer stages a runtime-private rootfs/handoff subtree and StartContainer gates Running on identity verification (docs/CRI_RUNTIME_R16_HANDOFF_DESIGN.md)")
+	}
+
 	grpcServer := grpc.NewServer()
 	srv := criserver.New(criserver.Options{
 		RuntimeVersion: version.Version,
@@ -229,6 +259,7 @@ func run(ctx context.Context, listen, stateDir, runtimeBinary string, rosetta bo
 			HostPathAllowedPrefixes: mc.hostPathAllowed,
 		},
 		MultiContainer: multiContainer,
+		Handoff:        handoffMgr,
 	})
 	// Rebuild Pod IP reservations and re-attach surviving sandboxes so a restart
 	// neither leaks addresses nor wipes other Pods' host rules. No-op when off.

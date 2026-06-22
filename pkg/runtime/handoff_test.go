@@ -238,3 +238,47 @@ func TestHandoffCleanupInvalidIDIsNoop(t *testing.T) {
 		t.Errorf("Cleanup of invalid id should be a no-op, got: %v", err)
 	}
 }
+
+// TestListContainerIDsReportsSubtrees proves ListContainerIDs returns exactly the
+// well-formed per-container subtree names under the root and skips stray files,
+// which is what restart-time orphan detection (#120) iterates over.
+func TestListContainerIDsReportsSubtrees(t *testing.T) {
+	root := t.TempDir()
+	m := NewHandoffManager(root)
+	want := map[string]bool{"macvz-cri-aaa111": true, "macvz-cri-bbb222": true}
+	for id := range want {
+		if _, err := m.Create(id); err != nil {
+			t.Fatalf("Create %q: %v", id, err)
+		}
+	}
+	// A stray file under the root must not be reported as a subtree.
+	if err := os.WriteFile(filepath.Join(root, "stray.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := m.ListContainerIDs()
+	if err != nil {
+		t.Fatalf("ListContainerIDs: %v", err)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %d ids %v, want %d", len(got), got, len(want))
+	}
+	for _, id := range got {
+		if !want[id] {
+			t.Errorf("unexpected id %q", id)
+		}
+	}
+}
+
+// TestListContainerIDsMissingRootIsEmpty proves a never-created root yields an
+// empty list, not an error: a node that never prepared a handoff has no orphans.
+func TestListContainerIDsMissingRootIsEmpty(t *testing.T) {
+	m := NewHandoffManager(filepath.Join(t.TempDir(), "never-created"))
+	got, err := m.ListContainerIDs()
+	if err != nil {
+		t.Fatalf("ListContainerIDs on missing root: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("got %v, want empty", got)
+	}
+}

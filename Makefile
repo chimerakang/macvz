@@ -44,6 +44,10 @@ cri-soak: cri ## Run the CRI-P8 bounded soak (set MACVZ_INTEGRATION=1 to run liv
 cri-k3s-inloop: ## Run the CRI-P9 real kubelet/k3s in-loop suite (set MACVZ_INTEGRATION=1 + KUBECONFIG to run live)
 	./test/e2e/cri-k3s/k3s-inloop.sh
 
+.PHONY: cri-handoff
+cri-handoff: cri ## Run the CRI-I4-1 handoff-lifecycle crictl fixture (set MACVZ_INTEGRATION=1 to run live)
+	./test/e2e/cri-handoff/run.sh
+
 .PHONY: cri-linuxpod-poc
 cri-linuxpod-poc: ## Run the #88 LinuxPod shared-namespace PoC (set MACVZ_LINUXPOD_POC=1 to run live)
 	./test/e2e/cri-linuxpod/run.sh

@@ -80,6 +80,7 @@ architecture from Virtual Kubelet provider to kubelet CRI runtime integration.
 | CRI-R13 (#105) | Make late-rootfs identity probe userspace runnable | ✅ Complete (R9 minimal rootfs now includes relative BusyBox applet symlinks; `vminit:macvz-r12` advanced to userspace exit 0, outcome `lateRootfsUserspaceAdvanced`) |
 | CRI-R14 (#106) | Probe late-rootfs result visibility across vmexec mount namespace | ✅ Complete (process exits 0 after writing the result inside vmexec namespace, but vminitd cannot stat the prepared-rootfs result path; outcome `lateRootfsResultVisibilityExplained`) |
 | CRI-R15 (#107) | Add verifiable identity evidence channel for late-rootfs launch | ✅ Complete (shared bind handoff verified late-rootfs identity through `/run/macvz-r9-evidence/<id>/macvz-r9-result`; outcome `vminitdRootfsPrimitiveLaunchSucceeded`) |
+| CRI-R16 (#108) | Design production evidence/result handoff for late-rootfs containers | ✅ Complete (runtime-private `/run/macvz/containers/<id>/handoff` lifecycle, OCI bind mount, permissions, cleanup, and CRI mapping accepted; outcome `runtimeHandoffDesignAccepted`) |
 
 **CRI-P5 evidence (#77):** Pod networking is wired through the same primitives as
 the shipped provider — `network.PodIPAM` for Pod IPs and `podnet.Router` for the

@@ -588,6 +588,22 @@ resultVerified=true
 Decision: the research direction can move from harness proof to CRI runtime
 design for a per-container evidence/result handoff path and cleanup lifecycle.
 
+### R16: Production Evidence Handoff Design (#108)
+
+R16 completed on 2026-06-22 UTC. The design is
+[CRI_RUNTIME_R16_HANDOFF_DESIGN.md](CRI_RUNTIME_R16_HANDOFF_DESIGN.md).
+
+Result: **runtime handoff design is accepted**. The handoff remains
+runtime-private, lives under `/run/macvz/containers/<containerID>/handoff`, is
+bind-mounted into the container at `/run/macvz/handoff`, and is created,
+verified, and cleaned up by the runtime rather than the CRI server or kubelet.
+
+The observed outcome is `runtimeHandoffDesignAccepted`.
+
+Decision: no new probe is needed before implementation. The next work can split
+into runtime handoff lifecycle implementation, OCI bind mount injection, and
+gated R15-derived integration coverage.
+
 ### C5: Swift Helper Daemon Prototype
 
 Only if R0 later selects a LinuxPod-based bridge as a valid runtime building

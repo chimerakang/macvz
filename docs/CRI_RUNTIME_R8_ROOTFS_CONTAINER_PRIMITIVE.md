@@ -501,6 +501,27 @@ This proves the late prepared-rootfs process can report expected rootfs identity
 through an explicit evidence channel. The remaining work is productionizing that
 handoff shape in the CRI runtime design, not proving the launch path again.
 
+## R16 Result
+
+R16 completed on 2026-06-22 UTC. The production handoff design is published at
+[CRI_RUNTIME_R16_HANDOFF_DESIGN.md](CRI_RUNTIME_R16_HANDOFF_DESIGN.md).
+
+Outcome: `runtimeHandoffDesignAccepted`.
+
+The accepted design keeps the evidence/result handoff runtime-private:
+
+```text
+/run/macvz/containers/<containerID>/handoff
+```
+
+The runtime creates the handoff directory, injects it into the OCI spec as a
+writable bind mount at `/run/macvz/handoff`, verifies identity evidence through
+vminitd-visible state, and deletes the directory during container cleanup.
+Kubelet-provided mounts must not target this runtime-private mount point.
+
+No additional harness probe is required before implementation. The next work is
+to implement the handoff lifecycle inside the experimental LinuxPod runtime path.
+
 ## MacVz Integration Boundary
 
 Until the primitive exists, MacVz should keep production runtime code unchanged.

@@ -220,15 +220,29 @@ func (r *streamingRuntime) PortForward(ctx context.Context, podSandboxID string,
 	if port < 1 || port > 65535 {
 		return status.Errorf(codes.InvalidArgument, "port-forward: port %d is out of range", port)
 	}
-	host, err := r.s.portForwardTarget(ctx, podSandboxID)
+	target, err := r.s.portForwardTarget(ctx, podSandboxID)
 	if err != nil {
 		return err
 	}
-	addr := net.JoinHostPort(host, strconv.Itoa(int(port)))
+	addr := net.JoinHostPort(target.host, strconv.Itoa(int(port)))
 	dialer := net.Dialer{Timeout: portForwardDialTimeout}
+	if err := setPortForwardDialerInterface(&dialer, target.iface); err != nil {
+		klog.V(3).InfoS("CRI port-forward could not bind socket to interface",
+			"sandbox", podSandboxID, "target", addr, "interface", target.iface, "err", err)
+	}
+	if local, err := portForwardLocalAddr(target.host, target.iface); err == nil && local != nil {
+		dialer.LocalAddr = local
+	} else if err != nil {
+		klog.V(3).InfoS("CRI port-forward using kernel-selected source address",
+			"sandbox", podSandboxID, "target", addr, "interface", target.iface, "err", err)
+	}
 	conn, err := dialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
-		return status.Errorf(codes.Unavailable, "port-forward: dial %s: %v", addr, err)
+		if fallbackErr := portForwardDialFallback(ctx, stream, target.host, int(port), err); fallbackErr == nil {
+			return nil
+		} else {
+			return status.Errorf(codes.Unavailable, "port-forward: dial %s: %v; nc fallback: %v", addr, err, fallbackErr)
+		}
 	}
 	klog.V(4).InfoS("CRI port-forward established", "sandbox", podSandboxID, "port", port, "target", addr)
 	err = proxyStream(ctx, stream, conn)
@@ -240,14 +254,19 @@ func (r *streamingRuntime) PortForward(ctx context.Context, podSandboxID string,
 // runtime-reported micro-VM address of its single container, falling back to the
 // VM IP observed at network-attach time. The kubelet runs on the same Mac as the
 // guest, so the host-only address is always reachable.
-func (s *Server) portForwardTarget(ctx context.Context, sandboxID string) (string, error) {
+type portForwardEndpoint struct {
+	host  string
+	iface string
+}
+
+func (s *Server) portForwardTarget(ctx context.Context, sandboxID string) (portForwardEndpoint, error) {
 	sb, ok := s.sandboxes.Get(sandboxID)
 	if !ok {
-		return "", status.Errorf(codes.NotFound, "port-forward: sandbox %q not found", sandboxID)
+		return portForwardEndpoint{}, status.Errorf(codes.NotFound, "port-forward: sandbox %q not found", sandboxID)
 	}
 	containers := s.containers.ListBySandbox(sandboxID)
 	if len(containers) == 0 {
-		return "", status.Errorf(codes.FailedPrecondition, "port-forward: sandbox %q has no container", sandboxID)
+		return portForwardEndpoint{}, status.Errorf(codes.FailedPrecondition, "port-forward: sandbox %q has no container", sandboxID)
 	}
 	foundLive := false
 	for i := range containers {
@@ -257,29 +276,76 @@ func (s *Server) portForwardTarget(ctx context.Context, sandboxID string) (strin
 		}
 		foundLive = true
 		if c.State != store.ContainerRunning {
-			return "", status.Errorf(codes.FailedPrecondition,
+			return portForwardEndpoint{}, status.Errorf(codes.FailedPrecondition,
 				"port-forward: sandbox %q container %q is %s, expected Running", sandboxID, c.ID, c.State)
 		}
 		if st, err := s.containerRuntime.Status(ctx, c.WorkloadID); err == nil {
 			if st.Phase != runtime.PhaseRunning {
-				return "", status.Errorf(codes.FailedPrecondition,
+				return portForwardEndpoint{}, status.Errorf(codes.FailedPrecondition,
 					"port-forward: sandbox %q container %q is not running (%s)", sandboxID, c.ID, st.Phase)
 			}
 			if st.IP != "" {
-				return st.IP, nil
+				return portForwardEndpoint{host: st.IP, iface: sb.Network.Interface}, nil
 			}
 		}
 		if sb.Network.VMIP != "" {
-			return sb.Network.VMIP, nil
+			return portForwardEndpoint{host: sb.Network.VMIP, iface: sb.Network.Interface}, nil
 		}
 	}
 	if !foundLive {
-		return "", status.Errorf(codes.FailedPrecondition, "port-forward: sandbox %q has no running container", sandboxID)
+		return portForwardEndpoint{}, status.Errorf(codes.FailedPrecondition, "port-forward: sandbox %q has no running container", sandboxID)
 	}
 	if sb.Network.VMIP != "" {
-		return sb.Network.VMIP, nil
+		return portForwardEndpoint{host: sb.Network.VMIP, iface: sb.Network.Interface}, nil
 	}
-	return "", status.Errorf(codes.Unavailable, "port-forward: sandbox %q micro-VM has no address yet", sandboxID)
+	return portForwardEndpoint{}, status.Errorf(codes.Unavailable, "port-forward: sandbox %q micro-VM has no address yet", sandboxID)
+}
+
+func portForwardLocalAddr(host, iface string) (*net.TCPAddr, error) {
+	if iface == "" {
+		return nil, nil
+	}
+	target := net.ParseIP(host)
+	if target == nil {
+		return nil, fmt.Errorf("target %q is not an IP", host)
+	}
+	netif, err := net.InterfaceByName(iface)
+	if err != nil {
+		return nil, err
+	}
+	addrs, err := netif.Addrs()
+	if err != nil {
+		return nil, err
+	}
+	return tcpAddrOnInterface(target, addrs), nil
+}
+
+func tcpAddrOnInterface(target net.IP, addrs []net.Addr) *net.TCPAddr {
+	for _, addr := range addrs {
+		ip, ipnet, ok := addrToIPNet(addr)
+		if !ok || ip.To4() == nil || target.To4() == nil {
+			continue
+		}
+		if ipnet.Contains(target) {
+			return &net.TCPAddr{IP: ip}
+		}
+	}
+	return nil
+}
+
+func addrToIPNet(addr net.Addr) (net.IP, *net.IPNet, bool) {
+	switch a := addr.(type) {
+	case *net.IPNet:
+		return a.IP, a, true
+	case *net.IPAddr:
+		bits := 128
+		if a.IP.To4() != nil {
+			bits = 32
+		}
+		return a.IP, &net.IPNet{IP: a.IP, Mask: net.CIDRMask(bits, bits)}, true
+	default:
+		return nil, nil, false
+	}
 }
 
 // proxyStream copies bytes both ways between the port-forward stream and the

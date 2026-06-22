@@ -184,12 +184,12 @@ func TestPortForwardTargetResolvesVMIP(t *testing.T) {
 	s, sandboxID := newServerWithRuntime(t, rt)
 	startedContainer(t, s, sandboxID)
 
-	host, err := s.portForwardTarget(context.Background(), sandboxID)
+	target, err := s.portForwardTarget(context.Background(), sandboxID)
 	if err != nil {
 		t.Fatalf("portForwardTarget: %v", err)
 	}
-	if host != "192.168.64.9" {
-		t.Errorf("portForwardTarget = %q, want runtime-reported VM IP", host)
+	if target.host != "192.168.64.9" {
+		t.Errorf("portForwardTarget host = %q, want runtime-reported VM IP", target.host)
 	}
 }
 
@@ -210,12 +210,50 @@ func TestPortForwardTargetSkipsExitedRestartHistory(t *testing.T) {
 		t.Fatalf("restart returned same container id")
 	}
 
-	host, err := s.portForwardTarget(ctx, sandboxID)
+	target, err := s.portForwardTarget(ctx, sandboxID)
 	if err != nil {
 		t.Fatalf("portForwardTarget: %v", err)
 	}
-	if host != "192.168.64.21" {
-		t.Errorf("portForwardTarget = %q, want running replacement VM IP", host)
+	if target.host != "192.168.64.21" {
+		t.Errorf("portForwardTarget host = %q, want running replacement VM IP", target.host)
+	}
+}
+
+func TestPortForwardTargetIncludesAttachedInterface(t *testing.T) {
+	rt := newFakeRuntime()
+	rt.startIP = "192.168.65.20"
+	pnet := newFakePodNet()
+	pnet.attachIface = "bridge101"
+	s, _, _ := newNetworkedServer(t, rt)
+	s.podNet = pnet
+	ctx := context.Background()
+	sandboxID := runSandbox(t, s, "web", "default", "uid-web")
+	startContainerInSandbox(t, s, sandboxID)
+
+	target, err := s.portForwardTarget(ctx, sandboxID)
+	if err != nil {
+		t.Fatalf("portForwardTarget: %v", err)
+	}
+	if target.host != "192.168.65.20" || target.iface != "bridge101" {
+		t.Errorf("portForwardTarget = {host:%q iface:%q}, want {host:192.168.65.20 iface:bridge101}", target.host, target.iface)
+	}
+}
+
+func TestTCPAddrOnInterfaceSelectsSameSubnetIPv4(t *testing.T) {
+	_, same, err := net.ParseCIDR("192.168.65.1/24")
+	if err != nil {
+		t.Fatalf("ParseCIDR same: %v", err)
+	}
+	same.IP = net.ParseIP("192.168.65.1")
+	_, other, err := net.ParseCIDR("10.0.0.1/24")
+	if err != nil {
+		t.Fatalf("ParseCIDR other: %v", err)
+	}
+	other.IP = net.ParseIP("10.0.0.1")
+
+	got := tcpAddrOnInterface(net.ParseIP("192.168.65.64"), []net.Addr{other, same})
+	if got == nil || !got.IP.Equal(net.ParseIP("192.168.65.1")) {
+		t.Fatalf("tcpAddrOnInterface = %v, want 192.168.65.1", got)
 	}
 }
 

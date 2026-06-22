@@ -29,6 +29,7 @@ MACVZ_LINUXPOD_POC=1 make cri-linuxpod-r4
 MACVZ_LINUXPOD_POC=1 make cri-linuxpod-r5
 MACVZ_LINUXPOD_POC=1 make cri-linuxpod-r6
 MACVZ_LINUXPOD_POC=1 make cri-linuxpod-r7
+MACVZ_LINUXPOD_POC=1 make cri-linuxpod-r9
 ```
 
 Set `MACVZ_CONTAINERIZATION_DIR` if the checkout lives elsewhere. The default
@@ -58,6 +59,10 @@ R7 stages a rootfs through the utility container outside container-local `/run`,
 then addresses that same tree through vminitd's init-namespace path under
 `/run/container/utility/rootfs` to test whether the new-container path can
 actually start from it.
+R9 uses existing vminitd `Copy(COPY_OUT/COPY_IN archive)` transport as a local
+experimental `PrepareContainerRootfs` shape, prepares
+`/run/container/<containerID>/rootfs`, launches with `id == containerID`, and
+verifies identity plus `deleteProcess` cleanup.
 Set
 `MACVZ_LINUXPOD_VMNET=1` to include vmnet attachment as an additional host
 network probe.
@@ -70,6 +75,7 @@ The C1 live run writes `docs/CRI_LINUXPOD_POC_REPORT.md`; C2 writes
 R3 writes `docs/CRI_RUNTIME_R3_NBD_ROOTFS_REPORT.md`.
 R6 writes `docs/CRI_RUNTIME_R6_VMINITD_CONTAINER_REPORT.md`.
 R7 writes `docs/CRI_RUNTIME_R7_VMINITD_VISIBLE_ROOTFS_REPORT.md`.
+R9 writes `docs/CRI_RUNTIME_R9_ROOTFS_PRIMITIVE_REPORT.md`.
 R4 writes `docs/CRI_RUNTIME_R4_GUEST_STAGING_REPORT.md`.
 R5 writes `docs/CRI_RUNTIME_R5_STAGED_PROCESS_REPORT.md`.
 

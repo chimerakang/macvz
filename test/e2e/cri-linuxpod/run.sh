@@ -62,8 +62,13 @@ case "${PROBE}" in
     REPORT_TITLE="CRI-R7 vminitd-Visible Rootfs Launch Report (#99)"
     WORK_DIR="${MACVZ_LINUXPOD_WORK_DIR:-/tmp/macvz-runtime-r7}"
     ;;
+  r9)
+    DEFAULT_REPORT_PATH="${ROOT_DIR}/docs/CRI_RUNTIME_R9_ROOTFS_PRIMITIVE_REPORT.md"
+    REPORT_TITLE="CRI-R9 vminitd Rootfs Primitive Launch Report (#101)"
+    WORK_DIR="${MACVZ_LINUXPOD_WORK_DIR:-/tmp/macvz-runtime-r9}"
+    ;;
   *)
-    echo "unsupported MACVZ_LINUXPOD_PROBE=${PROBE}; expected c1, c2, c4, r1, r3, r4, r5, r6, or r7" >&2
+    echo "unsupported MACVZ_LINUXPOD_PROBE=${PROBE}; expected c1, c2, c4, r1, r3, r4, r5, r6, r7, or r9" >&2
     exit 1
     ;;
 esac
@@ -87,6 +92,7 @@ This gated Swift harness can run:
   - r5 (#97): VM-agent process execution from staged guest rootfs
   - r6 (#98): vminitd new-container process from staged guest rootfs
   - r7 (#99): vminitd-visible staged rootfs launch probe
+  - r9 (#101): vminitd Copy-based rootfs primitive launch probe
 
 Selected probe: ${PROBE}
 
@@ -160,6 +166,15 @@ R7 flow:
   4. verify the new process wrote identity and rootfs evidence back into the
      staged rootfs, then delete the vminitd container and clean up
 
+R9 flow:
+  1. boot one LinuxPod with a predeclared utility container
+  2. copy the utility rootfs out through vminitd Copy and copy the prepared
+     tree back to /run/container/<containerID>/rootfs through vminitd Copy
+  3. call VM-agent createProcess/startProcess with id == containerID so vminitd
+     takes its new-container path from that prepared rootfs
+  4. verify rootfs identity, process result, delete the vminitd container, and
+     verify the prepared rootfs is removed
+
 Set MACVZ_LINUXPOD_VMNET=1 to also attach a vmnet interface. The default
 keeps this C1 probe focused on LinuxPod shared-namespace behavior.
 
@@ -189,6 +204,7 @@ Run live:
   MACVZ_LINUXPOD_POC=1 make cri-linuxpod-r5
   MACVZ_LINUXPOD_POC=1 make cri-linuxpod-r6
   MACVZ_LINUXPOD_POC=1 make cri-linuxpod-r7
+  MACVZ_LINUXPOD_POC=1 make cri-linuxpod-r9
 EOF
   exit 0
 fi
@@ -346,13 +362,22 @@ EOF
 - [x] The report distinguishes unavailable transport, staged rootfs unavailable, upstream primitive missing, exec-like rootfs constraint, cleanup failure, and success.
 
 EOF
-  else
+  elif [[ "${PROBE}" == "r7" ]]; then
     cat >>"${REPORT_PATH}" <<EOF
 - [x] One LinuxPod was created with a predeclared keeper utility container.
 - [x] Guest agent transport was attempted only after pod.create() and utility start.
 - [x] The probe staged rootfs data through the utility container and addressed the same tree through vminitd's init-namespace path.
 - [x] vminitd createProcess/startProcess was called with id == containerID to target the new-container path.
 - [x] The report distinguishes unavailable transport, vminitd-visible rootfs launch success, missing primitive, cleanup failure, and upstream-change boundaries.
+
+EOF
+  else
+    cat >>"${REPORT_PATH}" <<EOF
+- [x] One LinuxPod was created with a predeclared utility container.
+- [x] The probe used existing vminitd Copy(COPY_OUT/COPY_IN archive) as a local experimental PrepareContainerRootfs shape.
+- [x] The prepared rootfs was copied to /run/container/<containerID>/rootfs, or the precise prepare failure was recorded.
+- [x] vminitd createProcess/startProcess was called with id == containerID to target the new-container path.
+- [x] Identity, namespace/rootfs evidence, deleteProcess cleanup, and the final R9 outcome were recorded.
 
 EOF
   fi

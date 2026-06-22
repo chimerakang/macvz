@@ -454,6 +454,29 @@ starting with `vminitdRootfsPrimitiveLaunchSucceeded` for success and precise
 failure outcomes for prepare, create, start, identity, cleanup, or required
 upstream changes.
 
+### R9: vminitd Rootfs Primitive Launch (#101)
+
+R9 completed on 2026-06-22 UTC. The report is
+[CRI_RUNTIME_R9_ROOTFS_PRIMITIVE_REPORT.md](CRI_RUNTIME_R9_ROOTFS_PRIMITIVE_REPORT.md).
+
+Result: **vminitd Copy can prepare a rootfs-like tree in a vminitd-visible
+path, but current `vmexec run` still cannot start the late-created container
+from it**. The harness did not patch apple/containerization source. It used the
+existing vminitd `Copy(COPY_OUT/COPY_IN archive)` RPC as a local experimental
+`PrepareContainerRootfs` shape, prepared
+`/run/container/r9-late-alpha/rootfs`, verified it with `vminitd.stat`, and
+called `createProcess(id == containerID)`.
+
+`createProcess` succeeded and cleanup through `deleteProcess` removed the
+prepared rootfs. `startProcess` failed with
+`NSPOSIXErrorDomain Code=2 "No such file or directory"`, so the observed outcome
+is `vminitdContainerStartFailed`.
+
+Decision: do not wire this into production CRI. The research path is now
+narrower: instrument or extend the upstream vminitd/vmexec bundle/rootfs start
+path so a rootfs prepared after Pod VM creation can be accepted, or so the exact
+missing invariant is exposed.
+
 ### C5: Swift Helper Daemon Prototype
 
 Only if R0 later selects a LinuxPod-based bridge as a valid runtime building

@@ -1,5 +1,6 @@
 import ArgumentParser
 import Containerization
+import ContainerizationArchive
 import ContainerizationEXT4
 import ContainerizationExtras
 import ContainerizationOCI
@@ -36,7 +37,7 @@ struct LinuxPodSharedNamespacePoC: AsyncParsableCommand {
     @Option(help: "TCP port inside the shared Pod namespace.")
     var port: Int = 18080
 
-    @Option(help: "Probe to run: c1 for pre-create two-container semantics, c2 for post-create addContainer ordering, c4 for HotplugProvider boundary, r1 for guest-side hotplug device discovery, r3 for NBD pre-create rootfs identity, r4 for guest-side late rootfs staging, r5 for VM-agent process execution from staged rootfs, r6 for vminitd new-container process from staged rootfs, r7 for vminitd-visible staged rootfs launch.")
+    @Option(help: "Probe to run: c1 for pre-create two-container semantics, c2 for post-create addContainer ordering, c4 for HotplugProvider boundary, r1 for guest-side hotplug device discovery, r3 for NBD pre-create rootfs identity, r4 for guest-side late rootfs staging, r5 for VM-agent process execution from staged rootfs, r6 for vminitd new-container process from staged rootfs, r7 for vminitd-visible staged rootfs launch, r9 for vminitd Copy-based rootfs primitive launch.")
     var probe: String = "c1"
 
     @Flag(help: "Enable Rosetta for linux/amd64 images.")
@@ -164,8 +165,19 @@ struct LinuxPodSharedNamespacePoC: AsyncParsableCommand {
             )
             return
         }
+        if probe == "r9" {
+            try await runVminitdRootfsPrimitiveProbe(
+                imageStore: imageStore,
+                vmm: vmm,
+                logger: logger,
+                startedAt: startedAt,
+                logsURL: logsURL,
+                rootfsURL: rootfsURL
+            )
+            return
+        }
         guard probe == "c1" else {
-            throw ValidationError("unsupported probe \(probe); expected c1, c2, c4, r1, r3, r4, r5, r6, or r7")
+            throw ValidationError("unsupported probe \(probe); expected c1, c2, c4, r1, r3, r4, r5, r6, r7, or r9")
         }
 
         let podID = "macvz-poc-\(Int(startedAt.timeIntervalSince1970))"
@@ -2877,8 +2889,564 @@ struct LinuxPodSharedNamespacePoC: AsyncParsableCommand {
         return attempt?.outcome ?? "vminitdVisibleRootfsPrimitiveMissing"
     }
 
+    private func runVminitdRootfsPrimitiveProbe(
+        imageStore: ImageStore,
+        vmm: VZVirtualMachineManager,
+        logger: Logger,
+        startedAt: Date,
+        logsURL: URL,
+        rootfsURL: URL
+    ) async throws {
+        let podID = "macvz-r9-\(Int(startedAt.timeIntervalSince1970))"
+        let pod = try LinuxPod(podID, vmm: vmm, logger: logger) { config in
+            config.cpus = 2
+            config.memoryInBytes = 1024 * 1024 * 1024
+            config.hostname = "macvz-runtime-r9"
+            config.bootLog = .file(path: logsURL.appendingPathComponent("boot.log"))
+        }
+
+        let baseImage = try await imageStore.get(reference: image, pull: true)
+        let utilityRootfs = try await unpackRootfs(baseImage, at: rootfsURL.appendingPathComponent("utility.ext4"))
+        let utilityLog = try FileLogWriter(path: logsURL.appendingPathComponent("utility.log"), stream: "stdout")
+        let utilityErr = try FileLogWriter(path: logsURL.appendingPathComponent("utility.log"), stream: "stderr")
+        let execLog = try FileLogWriter(path: logsURL.appendingPathComponent("exec.log"), stream: "stdout")
+
+        var podCreated = false
+        var utilityStarted = false
+        var transportAvailable = false
+        var attempt: StagedRootfsProcessAttemptSummary?
+        var errors: [String: String] = [:]
+
+        do {
+            try await pod.addContainer("utility", rootfs: utilityRootfs) { config in
+                config.process.arguments = ["/bin/sh", "-c", "exec sleep 300"]
+                config.process.environmentVariables = ["PATH=\(LinuxProcessConfiguration.defaultPath)"]
+                config.process.workingDirectory = "/"
+                config.process.stdout = utilityLog
+                config.process.stderr = utilityErr
+                config.useInit = true
+            }
+
+            try await pod.create()
+            podCreated = true
+            try await pod.startContainer("utility")
+            utilityStarted = true
+
+            attempt = try await pod.withVirtualMachineInstance { vm in
+                let agent = try await vm.dialAgent()
+                let result = try await runVminitdRootfsPrimitiveAttempt(
+                    vm: vm,
+                    agent: agent,
+                    podID: podID,
+                    requestID: "late-alpha",
+                    rootfsURL: rootfsURL
+                )
+                try? await agent.close()
+                return result
+            }
+            transportAvailable = true
+
+            if utilityStarted {
+                try? await pod.stopContainer("utility")
+            }
+            try await pod.stop()
+            try close(utilityLog, utilityErr, execLog)
+
+            let result = StagedRootfsProcessSummary(
+                podID: podID,
+                image: image,
+                kernel: kernel,
+                workDir: workDir,
+                durationSeconds: Date().timeIntervalSince(startedAt),
+                podCreated: podCreated,
+                utilityStarted: utilityStarted,
+                transportAvailable: transportAvailable,
+                attempt: attempt,
+                outcome: vminitdRootfsPrimitiveOutcome(
+                    podCreated: podCreated,
+                    utilityStarted: utilityStarted,
+                    transportAvailable: transportAvailable,
+                    attempt: attempt
+                ),
+                note: "R9 uses existing vminitd Copy archive transport as a local experimental PrepareContainerRootfs shape, then launches through the existing new-container process path",
+                errors: errors,
+                logs: [
+                    "utility": logsURL.appendingPathComponent("utility.log").path,
+                    "exec": logsURL.appendingPathComponent("exec.log").path,
+                    "boot": logsURL.appendingPathComponent("boot.log").path,
+                ]
+            )
+            print(try result.jsonString())
+        } catch {
+            if !transportAvailable {
+                errors["transport"] = describe(error)
+            } else {
+                errors["probe"] = describe(error)
+            }
+            if utilityStarted {
+                try? await pod.stopContainer("utility")
+            }
+            if podCreated {
+                try? await pod.stop()
+            }
+            try? close(utilityLog, utilityErr, execLog)
+
+            let result = StagedRootfsProcessSummary(
+                podID: podID,
+                image: image,
+                kernel: kernel,
+                workDir: workDir,
+                durationSeconds: Date().timeIntervalSince(startedAt),
+                podCreated: podCreated,
+                utilityStarted: utilityStarted,
+                transportAvailable: transportAvailable,
+                attempt: attempt,
+                outcome: vminitdRootfsPrimitiveOutcome(
+                    podCreated: podCreated,
+                    utilityStarted: utilityStarted,
+                    transportAvailable: transportAvailable,
+                    attempt: attempt
+                ),
+                note: "R9 uses existing vminitd Copy archive transport as a local experimental PrepareContainerRootfs shape, then launches through the existing new-container process path",
+                errors: errors,
+                logs: [
+                    "utility": logsURL.appendingPathComponent("utility.log").path,
+                    "exec": logsURL.appendingPathComponent("exec.log").path,
+                    "boot": logsURL.appendingPathComponent("boot.log").path,
+                ]
+            )
+            print(try result.jsonString())
+        }
+    }
+
+    private func runVminitdRootfsPrimitiveAttempt(
+        vm: any VirtualMachineInstance,
+        agent: some VirtualMachineAgent,
+        podID: String,
+        requestID: String,
+        rootfsURL: URL
+    ) async throws -> StagedRootfsProcessAttemptSummary {
+        guard let vminitd = agent as? Vminitd else {
+            throw ValidationError("R9 requires Vminitd agent")
+        }
+
+        let escapedID = requestID.replacingOccurrences(of: "/", with: "_")
+        let processID = "r9-\(escapedID)"
+        let rootfsPath = "/run/container/\(processID)/rootfs"
+        let resultPath = "\(rootfsPath)/macvz-r9-result"
+        let hostPreparedRootfs = rootfsURL.appendingPathComponent("r9-prepared-\(escapedID)")
+        let hostResultPath = rootfsURL.appendingPathComponent("r9-result-\(escapedID).txt")
+        var prepareSucceeded = false
+        var processCreateSucceeded = false
+        var processStartSucceeded = false
+        var processExitCode: Int32?
+        var resultVerified = false
+        var namespaceVerified = false
+        var cleanupSucceeded = false
+        var prepareOutput = ""
+        var verifyOutput = ""
+        var cleanupOutput = ""
+        var errors: [String: String] = [
+            "experimentalApiShape": "existing vminitd Copy(COPY_OUT/COPY_IN archive) used as PrepareContainerRootfs",
+            "rootfsPath": rootfsPath,
+        ]
+
+        do {
+            try? FileManager.default.removeItem(at: hostPreparedRootfs)
+            try? FileManager.default.removeItem(at: hostResultPath)
+            let binDir = hostPreparedRootfs.appendingPathComponent("bin")
+            let identityDir = hostPreparedRootfs.appendingPathComponent("etc")
+            for dir in ["dev", "proc", "sys", "tmp"] {
+                try FileManager.default.createDirectory(
+                    at: hostPreparedRootfs.appendingPathComponent(dir),
+                    withIntermediateDirectories: true
+                )
+            }
+            try FileManager.default.createDirectory(at: binDir, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(at: identityDir, withIntermediateDirectories: true)
+            try await copyGuestPathToHost(
+                vm: vm,
+                vminitd: vminitd,
+                guestPath: "/run/container/utility/rootfs/bin/busybox",
+                destination: binDir.appendingPathComponent("busybox")
+            )
+            try await copyGuestPathToHost(
+                vm: vm,
+                vminitd: vminitd,
+                guestPath: "/run/container/utility/rootfs/lib",
+                destination: hostPreparedRootfs.appendingPathComponent("lib")
+            )
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o755],
+                ofItemAtPath: binDir.appendingPathComponent("busybox").path
+            )
+            try FileManager.default.copyItem(
+                at: binDir.appendingPathComponent("busybox"),
+                to: binDir.appendingPathComponent("sh")
+            )
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o755],
+                ofItemAtPath: binDir.appendingPathComponent("sh").path
+            )
+            try "macvz-r9-id=\(requestID)\n".write(
+                to: identityDir.appendingPathComponent("macvz-r9-identity"),
+                atomically: true,
+                encoding: .utf8
+            )
+            try? FileManager.default.removeItem(at: hostPreparedRootfs.appendingPathComponent("macvz-r9-result"))
+
+            try await copyHostPathToGuest(
+                vm: vm,
+                vminitd: vminitd,
+                source: hostPreparedRootfs,
+                guestPath: rootfsPath
+            )
+            _ = try await vminitd.stat(path: URL(fileURLWithPath: "\(rootfsPath)/bin/sh"))
+            _ = try await vminitd.stat(path: URL(fileURLWithPath: "\(rootfsPath)/etc/macvz-r9-identity"))
+            try await vminitd.sync()
+            prepareSucceeded = true
+            prepareOutput = "prepare_ok source=/run/container/utility/rootfs/bin/busybox rootfs=\(rootfsPath)"
+        } catch {
+            errors["prepare"] = describe(error)
+        }
+
+        if prepareSucceeded {
+            let spec = stagedRootfsProcessSpec(
+                podID: podID,
+                requestID: requestID,
+                rootfsPath: rootfsPath,
+                markerPrefix: "macvz-r9-id",
+                identityFileName: "macvz-r9-identity",
+                resultFileName: "macvz-r9-result",
+                hostnamePrefix: "macvz-r9"
+            )
+            do {
+                try await vminitd.createProcess(
+                    id: processID,
+                    containerID: processID,
+                    stdinPort: nil,
+                    stdoutPort: nil,
+                    stderrPort: nil,
+                    ociRuntimePath: nil,
+                    configuration: spec,
+                    options: nil
+                )
+                processCreateSucceeded = true
+            } catch {
+                errors["createProcessContainer"] = describe(error)
+            }
+        }
+
+        if processCreateSucceeded {
+            do {
+                _ = try await vminitd.startProcess(id: processID, containerID: processID)
+                processStartSucceeded = true
+                let status = try await vminitd.waitProcess(id: processID, containerID: processID, timeoutInSeconds: 10)
+                processExitCode = status.exitCode
+                if status.exitCode != 0 {
+                    errors["processExit"] = "exit \(status.exitCode)"
+                }
+            } catch {
+                errors["startOrWaitProcess"] = describe(error)
+            }
+        }
+
+        if prepareSucceeded && processStartSucceeded && processExitCode == 0 {
+            do {
+                _ = try await vminitd.stat(path: URL(fileURLWithPath: resultPath))
+                try await copyGuestPathToHost(
+                    vm: vm,
+                    vminitd: vminitd,
+                    guestPath: resultPath,
+                    destination: hostResultPath
+                )
+                verifyOutput = try readTextFile(hostResultPath)
+                let state = parseStagedProcessVerifyOutput(
+                    verifyOutput,
+                    markerPrefix: "macvz-r9-id",
+                    rootfsPrefix: "/run/container/r9-late-alpha"
+                )
+                resultVerified = state.identityMatched
+                namespaceVerified = state.rootfsMatched
+                if !resultVerified || !namespaceVerified {
+                    errors["verify"] = "identityMatched=\(resultVerified) namespaceVerified=\(namespaceVerified): \(verifyOutput)"
+                }
+            } catch {
+                errors["verify"] = describe(error)
+            }
+        } else if prepareSucceeded {
+            errors["verify"] = "skipped because process did not start and exit successfully"
+        }
+
+        if processCreateSucceeded {
+            do {
+                try await vminitd.deleteProcess(id: processID, containerID: processID)
+                do {
+                    _ = try await vminitd.stat(path: URL(fileURLWithPath: rootfsPath))
+                    errors["cleanupVerify"] = "rootfs still exists after deleteProcess: \(rootfsPath)"
+                } catch {
+                    cleanupSucceeded = true
+                    cleanupOutput = "cleanup_ok container=\(processID) rootfs=\(rootfsPath)"
+                }
+            } catch {
+                errors["deleteProcess"] = describe(error)
+            }
+        } else if prepareSucceeded {
+            cleanupOutput = "cleanup_skipped_no_container rootfs=\(rootfsPath)"
+        }
+
+        return StagedRootfsProcessAttemptSummary(
+            requestID: requestID,
+            processID: processID,
+            processContainerID: processID,
+            stagePath: rootfsPath,
+            resultPath: resultPath,
+            stageSucceeded: prepareSucceeded,
+            processCreateSucceeded: processCreateSucceeded,
+            processStartSucceeded: processStartSucceeded,
+            processExitCode: processExitCode,
+            resultVerified: resultVerified,
+            namespaceVerified: namespaceVerified,
+            cleanupSucceeded: cleanupSucceeded,
+            stageOutput: prepareOutput,
+            verifyOutput: verifyOutput,
+            cleanupOutput: cleanupOutput,
+            outcome: vminitdRootfsPrimitiveAttemptOutcome(
+                prepareSucceeded: prepareSucceeded,
+                processCreateSucceeded: processCreateSucceeded,
+                processStartSucceeded: processStartSucceeded,
+                processExitCode: processExitCode,
+                resultVerified: resultVerified,
+                namespaceVerified: namespaceVerified,
+                cleanupSucceeded: cleanupSucceeded
+            ),
+            errors: errors
+        )
+    }
+
+    private func vminitdRootfsPrimitiveAttemptOutcome(
+        prepareSucceeded: Bool,
+        processCreateSucceeded: Bool,
+        processStartSucceeded: Bool,
+        processExitCode: Int32?,
+        resultVerified: Bool,
+        namespaceVerified: Bool,
+        cleanupSucceeded: Bool
+    ) -> String {
+        if !prepareSucceeded {
+            return "vminitdRootfsPrepareFailed"
+        }
+        if !processCreateSucceeded {
+            return "vminitdContainerCreateFailed"
+        }
+        if !processStartSucceeded {
+            return "vminitdContainerStartFailed"
+        }
+        if processExitCode != 0 || !resultVerified || !namespaceVerified {
+            return "vminitdRootfsIdentityMismatch"
+        }
+        if !cleanupSucceeded {
+            return "vminitdRootfsCleanupFailed"
+        }
+        return "vminitdRootfsPrimitiveLaunchSucceeded"
+    }
+
+    private func vminitdRootfsPrimitiveOutcome(
+        podCreated: Bool,
+        utilityStarted: Bool,
+        transportAvailable: Bool,
+        attempt: StagedRootfsProcessAttemptSummary?
+    ) -> String {
+        if !podCreated || !utilityStarted || !transportAvailable {
+            return "vminitdRootfsPrepareFailed"
+        }
+        return attempt?.outcome ?? "vminitdRootfsPrepareFailed"
+    }
+
     private func readTextFile(_ url: URL) throws -> String {
         String(decoding: try Data(contentsOf: url), as: UTF8.self)
+    }
+
+    private func copyGuestPathToHost(
+        vm: any VirtualMachineInstance,
+        vminitd: Vminitd,
+        guestPath: String,
+        destination: URL,
+        chunkSize: Int = 1024 * 1024
+    ) async throws {
+        try FileManager.default.createDirectory(
+            at: destination.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+
+        let port = randomVsockPort()
+        let listener = try vm.listen(port)
+        let (metadataStream, metadataCont) = AsyncStream.makeStream(of: Vminitd.CopyMetadata.self)
+
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask {
+                try await vminitd.copy(
+                    direction: .copyOut,
+                    guestPath: URL(fileURLWithPath: guestPath),
+                    vsockPort: port,
+                    onMetadata: { metadata in
+                        metadataCont.yield(metadata)
+                        metadataCont.finish()
+                    }
+                )
+            }
+
+            group.addTask {
+                guard let metadata = await metadataStream.first(where: { _ in true }) else {
+                    throw probeError("R9 copyOut: no metadata received")
+                }
+                guard let conn = await listener.first(where: { _ in true }) else {
+                    throw probeError("R9 copyOut: vsock connection not established")
+                }
+                try listener.finish()
+
+                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
+                    DispatchQueue.global(qos: .utility).async {
+                        do {
+                            defer { conn.closeFile() }
+
+                            if metadata.isArchive {
+                                try FileManager.default.createDirectory(
+                                    at: destination,
+                                    withIntermediateDirectories: true
+                                )
+                                let fh = FileHandle(fileDescriptor: dup(conn.fileDescriptor), closeOnDealloc: true)
+                                let reader = try ArchiveReader(format: .pax, filter: .gzip, fileHandle: fh)
+                                _ = try reader.extractContents(to: destination)
+                            } else {
+                                let destFd = open(destination.path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+                                guard destFd != -1 else {
+                                    throw probeError("R9 copyOut: failed to open '\(destination.path)': \(String(cString: strerror(errno)))")
+                                }
+                                defer { close(destFd) }
+
+                                var buf = [UInt8](repeating: 0, count: chunkSize)
+                                while true {
+                                    let n = read(conn.fileDescriptor, &buf, buf.count)
+                                    if n == 0 {
+                                        break
+                                    }
+                                    guard n > 0 else {
+                                        throw probeError("R9 copyOut: vsock read error: \(String(cString: strerror(errno)))")
+                                    }
+                                    var written = 0
+                                    while written < n {
+                                        let w = buf.withUnsafeBytes { ptr in
+                                            write(destFd, ptr.baseAddress! + written, n - written)
+                                        }
+                                        guard w > 0 else {
+                                            throw probeError("R9 copyOut: write error: \(String(cString: strerror(errno)))")
+                                        }
+                                        written += w
+                                    }
+                                }
+                            }
+                            continuation.resume()
+                        } catch {
+                            continuation.resume(throwing: error)
+                        }
+                    }
+                }
+            }
+
+            try await group.waitForAll()
+        }
+    }
+
+    private func copyHostPathToGuest(
+        vm: any VirtualMachineInstance,
+        vminitd: Vminitd,
+        source: URL,
+        guestPath: String,
+        chunkSize: Int = 1024 * 1024
+    ) async throws {
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: source.path, isDirectory: &isDirectory) else {
+            throw probeError("R9 copyIn: source not found '\(source.path)'")
+        }
+
+        let port = randomVsockPort()
+        let listener = try vm.listen(port)
+        let isArchive = isDirectory.boolValue
+
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask {
+                try await vminitd.copy(
+                    direction: .copyIn,
+                    guestPath: URL(fileURLWithPath: guestPath),
+                    vsockPort: port,
+                    createParents: true,
+                    isArchive: isArchive
+                )
+            }
+
+            group.addTask {
+                guard let conn = await listener.first(where: { _ in true }) else {
+                    throw probeError("R9 copyIn: vsock connection not established")
+                }
+                try listener.finish()
+
+                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
+                    DispatchQueue.global(qos: .utility).async {
+                        do {
+                            defer { conn.closeFile() }
+
+                            if isArchive {
+                                let writer = try ArchiveWriter(configuration: .init(format: .pax, filter: .gzip))
+                                try writer.open(fileDescriptor: conn.fileDescriptor)
+                                try writer.archiveDirectory(source)
+                                try writer.finishEncoding()
+                            } else {
+                                let srcFd = open(source.path, O_RDONLY)
+                                guard srcFd != -1 else {
+                                    throw probeError("R9 copyIn: failed to open '\(source.path)': \(String(cString: strerror(errno)))")
+                                }
+                                defer { close(srcFd) }
+
+                                var buf = [UInt8](repeating: 0, count: chunkSize)
+                                while true {
+                                    let n = read(srcFd, &buf, buf.count)
+                                    if n == 0 {
+                                        break
+                                    }
+                                    guard n > 0 else {
+                                        throw probeError("R9 copyIn: read error: \(String(cString: strerror(errno)))")
+                                    }
+                                    var written = 0
+                                    while written < n {
+                                        let w = buf.withUnsafeBytes { ptr in
+                                            write(conn.fileDescriptor, ptr.baseAddress! + written, n - written)
+                                        }
+                                        guard w > 0 else {
+                                            throw probeError("R9 copyIn: vsock write error: \(String(cString: strerror(errno)))")
+                                        }
+                                        written += w
+                                    }
+                                }
+                            }
+                            continuation.resume()
+                        } catch {
+                            continuation.resume(throwing: error)
+                        }
+                    }
+                }
+            }
+
+            try await group.waitForAll()
+        }
+    }
+
+    private func randomVsockPort() -> UInt32 {
+        UInt32.random(in: 0x2000_0000 ... 0x2fff_ffff)
+    }
+
+    private func probeError(_ message: String) -> ValidationError {
+        ValidationError(message)
     }
 
     private func readExt4File(_ diskURL: URL, path: String) throws -> String {

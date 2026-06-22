@@ -354,6 +354,38 @@ R9 success does not mean full CRI support. It only proves the missing primitive'
 state machine. Production CRI wiring remains blocked until the primitive has a
 stable upstream or vendored experimental boundary with capability gating.
 
+## R9 Result
+
+R9 completed on 2026-06-22 UTC. The live probe is published at
+[CRI_RUNTIME_R9_ROOTFS_PRIMITIVE_REPORT.md](CRI_RUNTIME_R9_ROOTFS_PRIMITIVE_REPORT.md).
+
+Outcome: `vminitdContainerStartFailed`.
+
+The local experimental shape did **not** modify the apple/containerization
+checkout. Instead, the MacVz harness used existing vminitd
+`Copy(COPY_OUT/COPY_IN archive)` as a temporary `PrepareContainerRootfs`
+transport:
+
+1. copy a minimal busybox rootfs payload out of the utility container rootfs;
+2. copy it back to `/run/container/r9-late-alpha/rootfs`;
+3. call existing `createProcess(id == containerID)` with OCI `root.path` set to
+   that prepared path;
+4. call `startProcess`;
+5. call `deleteProcess` and verify cleanup.
+
+The prepare step succeeded, `createProcess` created the new vminitd container
+object, and cleanup removed the prepared rootfs. The start step failed inside
+`vmexec run` with:
+
+```text
+NSPOSIXErrorDomain Code=2 "No such file or directory"
+```
+
+This is useful negative evidence. The missing primitive is narrower than "copy
+files to a vminitd-visible path" but still deeper than MacVz production code:
+the next patch should instrument or extend vminitd/vmexec's bundle/rootfs start
+path so it can explain or accept a rootfs prepared after Pod VM creation.
+
 ## MacVz Integration Boundary
 
 Until the primitive exists, MacVz should keep production runtime code unchanged.

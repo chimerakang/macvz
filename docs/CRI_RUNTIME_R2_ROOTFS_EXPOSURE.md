@@ -238,7 +238,31 @@ This closes the "can MacVz fake a late rootfs by staging through a keeper
 container?" question as no. The remaining rootfs exposure work should move to a
 real vminitd/LinuxPod primitive: prepare rootfs data where vminitd can consume
 it, register a new container from that rootfs, start the init process, and clean
-up consistently on failure.
+up failure state coherently.
+
+## R9 Result
+
+R9 completed on 2026-06-22 UTC. The live probe is published at
+[CRI_RUNTIME_R9_ROOTFS_PRIMITIVE_REPORT.md](CRI_RUNTIME_R9_ROOTFS_PRIMITIVE_REPORT.md).
+
+Outcome: `vminitdContainerStartFailed`.
+
+R9 used existing vminitd `Copy(COPY_OUT/COPY_IN archive)` as a local
+experimental `PrepareContainerRootfs` transport. That was enough to prepare a
+minimal rootfs at `/run/container/r9-late-alpha/rootfs`, verify expected files
+with `vminitd.stat`, create a new vminitd container object through
+`createProcess(id == containerID)`, and clean up the prepared rootfs through
+`deleteProcess`.
+
+The remaining failure is `startProcess`: `vmexec run` returned
+`NSPOSIXErrorDomain Code=2 "No such file or directory"` before the process could
+write identity evidence. This narrows the fallback research result:
+
+- guest-visible file/rootfs staging can be achieved through vminitd Copy;
+- current vminitd new-container start still cannot launch from that late
+  prepared rootfs;
+- the next useful work is an upstream/vminitd debug or API patch around
+  bundle/rootfs start semantics, not MacVz production CRI wiring.
 
 ## R8 Design
 

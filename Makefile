@@ -80,6 +80,10 @@ cri-linuxpod-r6: ## Run the #98 vminitd staged-rootfs container process probe (s
 cri-linuxpod-r7: ## Run the #99 vminitd-visible rootfs launch probe (set MACVZ_LINUXPOD_POC=1 to run live)
 	MACVZ_LINUXPOD_PROBE=r7 ./test/e2e/cri-linuxpod/run.sh
 
+.PHONY: cri-linuxpod-r9
+cri-linuxpod-r9: ## Run the #101 vminitd rootfs primitive launch probe (set MACVZ_LINUXPOD_POC=1 to run live)
+	MACVZ_LINUXPOD_PROBE=r9 ./test/e2e/cri-linuxpod/run.sh
+
 .PHONY: bench
 bench: ## Build the density/RAM benchmark harness into bin/mvz-bench
 	@mkdir -p $(BIN_DIR)

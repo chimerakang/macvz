@@ -499,7 +499,7 @@ Design decisions:
 
 Wiring: `cmd/macvz-cri` gains `--pod-cidr` and `--pod-network-interface` (plus
 optional `--pod-network-mesh-interface`, `--pod-network-helper-socket`, and
-`--pod-network-enable-forwarding`). Pod networking is **off unless both
+`--pod-network-ingress-interface`, and `--pod-network-enable-forwarding`). Pod networking is **off unless both
 `--pod-cidr` and `--pod-network-interface` are set**; until then sandboxes run
 without a Pod IP and `Status` reports `NetworkReady=false`, exactly as before
 CRI-P5. The privileged pf/route operations route through `macvz-netd` when a

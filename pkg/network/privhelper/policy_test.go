@@ -15,6 +15,9 @@ func samplePolicy() Policy {
 	return Policy{
 		MeshInterface:  "utun7",
 		VMNetInterface: "bridge100",
+		PodIngressInterfaces: map[string]bool{
+			"en0": true,
+		},
 		Anchor:         "macvz/pods",
 		MeshAddressIP:  "10.99.0.1",
 		MTU:            1380,
@@ -57,6 +60,7 @@ func TestPolicyAllowsConfiguredCommands(t *testing.T) {
 		{"pfctl", "enable pf", Request{Name: "pfctl", Args: []string{"-e"}}},
 		{"pfctl", "flush managed anchor", Request{Name: "pfctl", Args: []string{"-a", "macvz/pods", "-F", "all"}}},
 		{"pfctl", "load managed anchor", Request{Name: "pfctl", Args: []string{"-a", "macvz/pods", "-f", "-"}, Stdin: validAnchorRuleset}},
+		{"pfctl", "load Pod ingress binat", Request{Name: "pfctl", Args: []string{"-a", "macvz/pods", "-f", "-"}, Stdin: "binat on en0 from 192.168.64.3 to any -> 10.244.1.5\n"}},
 		{"route", "add configured pod CIDR", Request{Name: "route", Args: []string{"-q", "-n", "add", "-inet", "10.244.1.0/24", "-interface", "utun7"}}},
 		{"route", "delete configured mesh CIDR", Request{Name: "route", Args: []string{"-q", "-n", "delete", "-inet", "10.99.0.2/32", "-interface", "utun7"}}},
 		{"route", "resolve vmnet interface for guest IP", Request{Name: "route", Args: []string{"-n", "get", "192.168.65.16"}}},
@@ -95,7 +99,7 @@ func TestPolicyRefusesOutOfScopeCommands(t *testing.T) {
 		{"load main ruleset (no anchor)", Request{Name: "pfctl", Args: []string{"-f", "-"}, Stdin: "pass in all\n"}},
 		{"flush everything", Request{Name: "pfctl", Args: []string{"-F", "all"}}},
 		{"non-binat/rdr rule in anchor", Request{Name: "pfctl", Args: []string{"-a", "macvz/pods", "-f", "-"}, Stdin: "pass in all\n"}},
-		{"rule on foreign interface", Request{Name: "pfctl", Args: []string{"-a", "macvz/pods", "-f", "-"}, Stdin: "binat on en0 from 1.2.3.4 to any -> 5.6.7.8\n"}},
+		{"rule on foreign interface", Request{Name: "pfctl", Args: []string{"-a", "macvz/pods", "-f", "-"}, Stdin: "binat on en1 from 1.2.3.4 to any -> 5.6.7.8\n"}},
 		{"binat from foreign vmnet ip", Request{Name: "pfctl", Args: []string{"-a", "macvz/pods", "-f", "-"}, Stdin: "binat on bridge100 from 172.16.0.2 to any -> 10.244.1.5\n"}},
 		{"binat to foreign pod ip", Request{Name: "pfctl", Args: []string{"-a", "macvz/pods", "-f", "-"}, Stdin: "binat on bridge100 from 192.168.64.3 to any -> 10.250.1.5\n"}},
 		{"rdr to foreign ip", Request{Name: "pfctl", Args: []string{"-a", "macvz/pods", "-f", "-"}, Stdin: "rdr on bridge100 inet proto tcp from any to 10.96.0.1 port 80 -> 1.2.3.4 port 8080\n"}},
@@ -261,6 +265,19 @@ func TestLintAnchorRulesetAllowsMeshBinatButNotMeshRDR(t *testing.T) {
 	rs = "rdr on utun7 inet proto tcp from any to 10.96.0.1 port 80 -> 192.168.65.16 port 8080\n"
 	if err := p.lintAnchorRuleset(rs); err == nil {
 		t.Error("mesh rdr should be refused")
+	}
+}
+
+func TestPodIngressInterfaceAllowsOnlyBinat(t *testing.T) {
+	p := samplePolicy()
+	if err := p.lintAnchorRuleset("binat on en0 from 192.168.65.16 to any -> 10.244.1.5\n"); err != nil {
+		t.Errorf("configured Pod ingress interface binat should pass: %v", err)
+	}
+	if err := p.lintAnchorRuleset("rdr on en0 inet proto tcp from any to 10.96.0.1 port 80 -> 192.168.65.16 port 8080\n"); err == nil {
+		t.Error("configured Pod ingress interface must not allow service rdr")
+	}
+	if err := p.Validate(Request{Name: "route", Args: []string{"-q", "-n", "delete", "-inet", "default", "-ifscope", "en0"}}); err == nil {
+		t.Error("configured Pod ingress interface must not allow default-route deletion")
 	}
 }
 

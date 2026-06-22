@@ -382,6 +382,7 @@ backing the micro-VMs (commonly `bridge100`) with `ifconfig` and set it as
 | --- | --- |
 | `podNetwork.enabled` | Turn the host Pod network path on. |
 | `podNetwork.interface` | vmnet interface the micro-VMs attach to (e.g. `bridge100`). |
+| `podNetwork.ingressInterfaces` | Extra host interfaces that may receive Pod-IP traffic and need Pod `binat` rules, such as a local test bridge. They do not grant route or default-route control. |
 | `podNetwork.anchor` | pf anchor to manage (default `macvz/pods`). |
 | `podNetwork.enableForwarding` | Enable IPv4 forwarding (default `true`). |
 | `podNetwork.vmNetCIDRs` | Host-only vmnet CIDRs local micro-VMs may receive; used by `macvz-netd` to validate pf targets (default `192.168.64.0/22`). |
@@ -393,6 +394,7 @@ node:
 podNetwork:
   enabled: true
   interface: bridge100
+  ingressInterfaces: ["en0"] # optional; only for explicit non-mesh ingress paths
   vmNetCIDRs: ["192.168.64.0/22"]
 ```
 
@@ -583,8 +585,10 @@ values are pinned to this node's configuration:
 - **pf anchors** — only `podNetwork.anchor` (default `macvz/pods`) may be loaded
   or flushed; the main ruleset and any other anchor are refused. A loaded
   ruleset may contain only `binat`/`rdr` rules on the configured
-  `podNetwork.interface`, and translated targets must stay inside configured
-  Pod CIDRs or `podNetwork.vmNetCIDRs`.
+  `podNetwork.interface`; `binat` may also use explicitly configured
+  `podNetwork.ingressInterfaces` for lab or non-mesh inbound Pod-IP traffic.
+  Translated targets must stay inside configured Pod CIDRs or
+  `podNetwork.vmNetCIDRs`.
 - **interfaces/processes** — `route`, `ifconfig`, `wg`, `wireguard-go`, and the
   teardown `pkill` may only touch `mesh.interface`; the assigned address and MTU
   must equal `mesh.address` / `mesh.mtu`.

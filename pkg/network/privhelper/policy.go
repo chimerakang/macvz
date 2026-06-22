@@ -27,6 +27,10 @@ type Policy struct {
 	// to (e.g. "bridge100"). Loaded anchor rules may reference only this
 	// interface. Empty refuses anchor loads.
 	VMNetInterface string
+	// PodIngressInterfaces are additional host interfaces that may carry inbound
+	// Pod-IP traffic for binat. They are explicit opt-ins and do not grant route,
+	// ifconfig, rdr, or default-route privileges.
+	PodIngressInterfaces map[string]bool
 	// Anchor is the single pf anchor the helper may load or flush
 	// (e.g. "macvz/pods"). Empty refuses every anchor operation.
 	Anchor string
@@ -476,7 +480,10 @@ func (p Policy) checkPodNATInterface(iface string) error {
 	if p.MeshInterface != "" && iface == p.MeshInterface {
 		return nil
 	}
-	return fmt.Errorf("interface %q is not a managed vmnet bridge or mesh interface", iface)
+	if p.PodIngressInterfaces[iface] {
+		return nil
+	}
+	return fmt.Errorf("interface %q is not a managed vmnet bridge, mesh interface, or Pod ingress interface", iface)
 }
 
 func isBridgeInterface(iface string) bool {

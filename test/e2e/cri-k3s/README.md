@@ -146,6 +146,33 @@ bundled containerd.
    loudly. See `docs/CRI_K3S_INLOOP_REPORT.md` for the runbook and evidence
    template.
 
+   When the Linux control plane is a local kind cluster and the CRI adapter runs
+   on a separate Mac, wire only the fixture CIDRs instead of changing either
+   host's default route:
+
+   ```sh
+   # Local Mac: send the remote CRI node Pod CIDR to the remote Mac.
+   sudo route -n add -net <remote-pod-cidr> <remote-mac-lan-ip>
+
+   # Remote Mac: return the kind Linux-node Pod CIDR to the local Mac.
+   ssh -t <remote-mac> 'sudo route -n add -net <kind-pod-cidr> <local-mac-lan-ip>'
+
+   # kind control-plane node: SNAT Linux Pod -> remote MacVz Pod traffic so
+   # replies return through Docker Desktop's host path.
+   docker exec <kind-control-plane> iptables -t nat -I POSTROUTING 1 \
+     -s <kind-pod-cidr> -d <remote-pod-cidr> -j MASQUERADE
+   ```
+
+   Example from the local two-Mac lab:
+
+   ```sh
+   sudo route -n add -net 10.244.102.0/24 192.168.1.122
+   ssh -t test@192.168.1.122 \
+     'sudo route -n add -inet 10.244.0.0/24 192.168.1.110'
+   docker exec macvz61-control-plane iptables -t nat -I POSTROUTING 1 \
+     -s 10.244.0.0/24 -d 10.244.102.0/24 -j MASQUERADE
+   ```
+
 ## Cleanup
 
 ```sh

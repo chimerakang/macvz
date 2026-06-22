@@ -10,7 +10,7 @@ import (
 func TestPrivilegedHelperPolicyFromConfig(t *testing.T) {
 	c := Default()
 	c.Mesh = enabledMesh(t, filepath.Join(t.TempDir(), "wg.key"))
-	c.PodNetwork = PodNetworkConfig{Enabled: true, Interface: "bridge100"}
+	c.PodNetwork = PodNetworkConfig{Enabled: true, Interface: "bridge100", IngressInterfaces: []string{"en0"}}
 	c.Node.PodCIDR = "10.244.101.0/24"
 
 	p, err := c.PrivilegedHelperPolicy()
@@ -23,6 +23,9 @@ func TestPrivilegedHelperPolicyFromConfig(t *testing.T) {
 	}
 	if p.VMNetInterface != "bridge100" {
 		t.Errorf("VMNetInterface = %q, want bridge100", p.VMNetInterface)
+	}
+	if !p.PodIngressInterfaces["en0"] {
+		t.Errorf("PodIngressInterfaces missing en0: %v", p.PodIngressInterfaces)
 	}
 	if p.Anchor != "macvz/pods" {
 		t.Errorf("Anchor = %q, want macvz/pods", p.Anchor)

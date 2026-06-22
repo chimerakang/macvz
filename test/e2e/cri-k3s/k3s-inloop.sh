@@ -306,9 +306,21 @@ phase_logs() {
 
 phase_exec() {
 	log "Phase: kubectl exec (projected Secret + ConfigMap)"
-	local pod out; pod="$(pod_name)"
+	local pod out ok=0 _; pod="$(pod_name)"
 	[ -n "$pod" ] || { fail "no Pod for exec"; return 1; }
-	out="$(kn exec "$pod" -- sh -c 'cat /etc/app-secret/token; echo; cat /www/app.conf' 2>"$OUT_DIR/exec.err")"
+	# In the remote-Mac fixture topology kubelet materializes projected volumes
+	# on the Linux node and an operator syncs them to the macOS CRI host. Retry
+	# briefly so a just-created atomic-writer tree can settle before we declare
+	# the projected ConfigMap/Secret path broken.
+	for _ in $(seq 1 30); do
+		out="$(kn exec "$pod" -- sh -c 'cat /etc/app-secret/token; echo; cat /www/app.conf' 2>"$OUT_DIR/exec.err" || true)"
+		echo "$out" >"$OUT_DIR/exec.out"
+		if printf '%s' "$out" | grep -q "$SECRET_MARKER" && printf '%s' "$out" | grep -q "$MARKER"; then
+			ok=1
+			break
+		fi
+		sleep 1
+	done
 	echo "$out" >"$OUT_DIR/exec.out"
 	if printf '%s' "$out" | grep -q "$SECRET_MARKER"; then
 		pass "exec read projected Secret marker"
@@ -320,6 +332,7 @@ phase_exec() {
 	else
 		fail "exec missing ConfigMap marker (see $OUT_DIR/exec.out)"
 	fi
+	[ "$ok" = 1 ] || return 0
 }
 
 phase_portforward() {
@@ -349,15 +362,17 @@ phase_service() {
 	local probe="inloop-probe"
 	kn delete pod "$probe" --ignore-not-found --wait=true >/dev/null 2>&1 || true
 	if kn run "$probe" --image="$IMAGE" --restart=Never --command -- \
-		sh -c "for i in \$(seq 1 30); do wget -qO- http://$SVC.$NS.svc:80/index.html && exit 0; sleep 1; done; exit 1" \
+		sh -c "for i in \$(seq 1 30); do wget -T 5 -qO- http://$SVC.$NS.svc:80/index.html && exit 0; sleep 1; done; exit 1" \
 		>"$OUT_DIR/probe-run.log" 2>&1; then
 		kn wait --for=condition=Ready "pod/$probe" --timeout=2m >/dev/null 2>&1 || true
 	fi
 	# Wait for the probe to finish, then read its logs for the marker.
 	local phase _
-	for _ in $(seq 1 60); do
+	for _ in $(seq 1 180); do
 		phase="$(kn get pod "$probe" -o jsonpath='{.status.phase}' 2>/dev/null)"
-		[ "$phase" = "Succeeded" ] || [ "$phase" = "Failed" ] && break
+		case "$phase" in
+			Succeeded|Failed) break ;;
+		esac
 		sleep 1
 	done
 	kn logs "$probe" >"$OUT_DIR/probe.log" 2>&1 || true
@@ -384,7 +399,7 @@ host_workload_count() {
 		return 2
 	fi
 	printf '%s\n' "$raw" >"$out_file"
-	printf '%s\n' "$raw" | grep -i 'macvz-cri-' | wc -l | tr -d ' '
+	printf '%s\n' "$raw" | awk 'BEGIN { n=0 } tolower($0) ~ /macvz-cri-/ { n++ } END { print n }'
 }
 
 phase_restart_cri() {

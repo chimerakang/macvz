@@ -195,6 +195,40 @@ func TestAttachUsesResolvedVMNetInterface(t *testing.T) {
 	}
 }
 
+func TestAttachRendersConfiguredIngressInterfaces(t *testing.T) {
+	fr := newFakeRunner()
+	rt := New(Config{
+		Interface:         "bridge100",
+		MeshInterface:     "utun7",
+		IngressInterfaces: []string{"en0", "en0", " bridge9 "},
+		EnableForwarding:  true,
+	}, WithRunner(fr))
+	ctx := context.Background()
+	if err := rt.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := rt.Attach(ctx, Endpoint{PodKey: "default/web", PodIP: "10.244.1.2", VMIP: "192.168.65.5"}); err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	rules, ok := fr.lastAnchorLoad()
+	if !ok {
+		t.Fatal("no anchor load recorded")
+	}
+	for _, want := range []string{
+		"binat on bridge101 from 192.168.65.5 to any -> 10.244.1.2",
+		"binat on bridge9 from 192.168.65.5 to any -> 10.244.1.2",
+		"binat on en0 from 192.168.65.5 to any -> 10.244.1.2",
+		"binat on utun7 from 192.168.65.5 to any -> 10.244.1.2",
+	} {
+		if !strings.Contains(rules, want) {
+			t.Errorf("anchor missing ingress binat %q\n---\n%s", want, rules)
+		}
+	}
+	if got := strings.Count(rules, "binat on en0 "); got != 1 {
+		t.Errorf("duplicate ingress interface rendered %d times\n---\n%s", got, rules)
+	}
+}
+
 func countContaining(haystack []string, sub string) int {
 	n := 0
 	for _, s := range haystack {
@@ -282,8 +316,8 @@ func TestRenderAnchorDeterministic(t *testing.T) {
 		{PodKey: "default/a", PodIP: "10.244.1.2", VMIP: "192.168.64.5"},
 		{PodKey: "default/b", PodIP: "10.244.1.3", VMIP: "192.168.65.6", Interface: "bridge101"},
 	}
-	first := renderAnchor("bridge100", "utun7", eps)
-	second := renderAnchor("bridge100", "utun7", eps)
+	first := renderAnchor("bridge100", "utun7", []string{"en0"}, eps)
+	second := renderAnchor("bridge100", "utun7", []string{"en0"}, eps)
 	if first != second {
 		t.Error("renderAnchor is not deterministic")
 	}

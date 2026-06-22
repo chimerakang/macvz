@@ -151,7 +151,8 @@ func helperServer(socket, configPath string, allowUnsafeNoConfig bool) (*privhel
 			"config", configPath, "meshInterface", policy.MeshInterface,
 			"vmnetInterface", policy.VMNetInterface, "anchor", policy.Anchor,
 			"routeCIDRs", len(policy.RouteCIDRs), "podCIDRs", len(policy.PodCIDRs),
-			"vmNetCIDRs", len(policy.VMNetCIDRs), "peers", len(policy.PeerPublicKeys))
+			"vmNetCIDRs", len(policy.VMNetCIDRs), "podIngressInterfaces", len(policy.PodIngressInterfaces),
+			"peers", len(policy.PeerPublicKeys))
 		return policy, nil
 	}
 	srv, err := privhelper.NewServerWithPolicyLoader(socket, loader)

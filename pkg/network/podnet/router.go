@@ -67,6 +67,10 @@ type Config struct {
 	// When set, local Pod binat rules are also installed on this interface so
 	// packets arriving from peers at a Pod IP are translated to the local VM IP.
 	MeshInterface string
+	// IngressInterfaces are additional host interfaces where Pod-IP traffic may
+	// arrive outside the WireGuard mesh (for example a lab/kind bridge). They are
+	// used only for Pod binat rules, never for route or default-route changes.
+	IngressInterfaces []string
 	// Anchor is the pf anchor to manage. Defaults to DefaultAnchor.
 	Anchor string
 	// EnableForwarding turns on IPv4 forwarding during Start. Disable only when
@@ -113,6 +117,7 @@ func New(cfg Config, opts ...Option) *Router {
 	if cfg.Anchor == "" {
 		cfg.Anchor = DefaultAnchor
 	}
+	cfg.IngressInterfaces = normalizeInterfaces(cfg.IngressInterfaces)
 	rt := &Router{
 		run:       cliRunner{},
 		cfg:       cfg,
@@ -297,7 +302,7 @@ func (rt *Router) Stop(ctx context.Context) error {
 // loadAnchorLocked renders the current ruleset and loads it into the anchor
 // atomically via `pfctl -a <anchor> -f -`. Caller holds rt.mu.
 func (rt *Router) loadAnchorLocked(ctx context.Context) error {
-	rules := renderAnchor(rt.cfg.Interface, rt.cfg.MeshInterface, rt.endpointsSortedLocked())
+	rules := renderAnchor(rt.cfg.Interface, rt.cfg.MeshInterface, rt.cfg.IngressInterfaces, rt.endpointsSortedLocked())
 	rules += renderServiceRules(rt.vmnetInterfacesLocked(), rt.services, rt.vmipByPodIPLocked())
 	_, err := rt.run.run(ctx, command{
 		Name:  rt.pfctl,
@@ -322,19 +327,19 @@ func (rt *Router) endpointsSortedLocked() []Endpoint {
 // renderAnchor builds the pf anchor body: one bidirectional NAT rule per Pod,
 // mapping the VM's host-only address to its Pod IP. Rendering is deterministic
 // (endpoints are pre-sorted) so identical state yields identical rules.
-func renderAnchor(iface, meshIface string, endpoints []Endpoint) string {
+func renderAnchor(iface, meshIface string, ingressIfaces []string, endpoints []Endpoint) string {
 	var b strings.Builder
 	b.WriteString("# Managed by macvz (issue #22). Do not edit by hand.\n")
 	for _, ep := range endpoints {
 		fmt.Fprintf(&b, "# %s\n", ep.PodKey)
-		for _, epIface := range endpointBinatInterfaces(iface, meshIface, ep) {
+		for _, epIface := range endpointBinatInterfaces(iface, meshIface, ingressIfaces, ep) {
 			fmt.Fprintf(&b, "binat on %s from %s to any -> %s\n", epIface, ep.VMIP, ep.PodIP)
 		}
 	}
 	return b.String()
 }
 
-func endpointBinatInterfaces(defaultIface, meshIface string, ep Endpoint) []string {
+func endpointBinatInterfaces(defaultIface, meshIface string, ingressIfaces []string, ep Endpoint) []string {
 	seen := map[string]struct{}{}
 	add := func(iface string) {
 		if iface != "" {
@@ -346,6 +351,25 @@ func endpointBinatInterfaces(defaultIface, meshIface string, ep Endpoint) []stri
 		add(defaultIface)
 	}
 	add(meshIface)
+	for _, iface := range ingressIfaces {
+		add(iface)
+	}
+	out := make([]string, 0, len(seen))
+	for iface := range seen {
+		out = append(out, iface)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func normalizeInterfaces(in []string) []string {
+	seen := map[string]struct{}{}
+	for _, iface := range in {
+		iface = strings.TrimSpace(iface)
+		if iface != "" {
+			seen[iface] = struct{}{}
+		}
+	}
 	out := make([]string, 0, len(seen))
 	for iface := range seen {
 		out = append(out, iface)

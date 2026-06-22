@@ -43,11 +43,12 @@ import (
 // off unless both PodCIDR and Interface are set; until then the adapter runs
 // sandboxes without a Pod IP and reports NetworkReady=false honestly.
 type podNetConfig struct {
-	podCIDR          string
-	iface            string
-	meshInterface    string
-	helperSocket     string
-	enableForwarding bool
+	podCIDR           string
+	iface             string
+	meshInterface     string
+	ingressInterfaces stringList
+	helperSocket      string
+	enableForwarding  bool
 }
 
 func (c podNetConfig) enabled() bool { return c.podCIDR != "" && c.iface != "" }
@@ -126,6 +127,8 @@ func main() {
 		"vmnet bridge backing the micro-VMs for the Pod network binat path (required with --pod-cidr to enable Pod networking)")
 	flag.StringVar(&pn.meshInterface, "pod-network-mesh-interface", "",
 		"WireGuard mesh interface for cross-node Pod binat rules (optional)")
+	flag.Var(&pn.ingressInterfaces, "pod-network-ingress-interface",
+		"extra host interface where Pod-IP traffic may arrive and need binat, such as a local test bridge (repeatable; optional)")
 	flag.StringVar(&pn.helperSocket, "pod-network-helper-socket", "",
 		"macvz-netd privileged helper socket for pf/route operations (empty runs pfctl/route directly, requiring root)")
 	flag.BoolVar(&pn.enableForwarding, "pod-network-enable-forwarding", false,
@@ -408,15 +411,17 @@ func setupPodNetwork(ctx context.Context, pn podNetConfig) (criserver.PodNetwork
 		pnOpts = append(pnOpts, podnet.WithHelperSocket(pn.helperSocket))
 	}
 	router := podnet.New(podnet.Config{
-		Interface:        pn.iface,
-		MeshInterface:    pn.meshInterface,
-		EnableForwarding: pn.enableForwarding,
+		Interface:         pn.iface,
+		MeshInterface:     pn.meshInterface,
+		IngressInterfaces: pn.ingressInterfaces,
+		EnableForwarding:  pn.enableForwarding,
 	}, pnOpts...)
 	if err := router.Start(ctx); err != nil {
 		return nil, nil, noop, fmt.Errorf("start pod network path: %w", err)
 	}
 	klog.InfoS("Pod networking enabled for CRI adapter",
-		"podCIDR", ipam.CIDR(), "interface", pn.iface, "meshInterface", pn.meshInterface)
+		"podCIDR", ipam.CIDR(), "interface", pn.iface, "meshInterface", pn.meshInterface,
+		"ingressInterfaces", []string(pn.ingressInterfaces))
 
 	cleanup := func() {
 		if err := router.Stop(context.Background()); err != nil {

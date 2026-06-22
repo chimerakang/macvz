@@ -35,13 +35,24 @@ func TestValidatePodNetworkWithHelperRequiresStaticPodCIDR(t *testing.T) {
 
 func TestPodNetworkRouterConfigDefaultsForwardingTrue(t *testing.T) {
 	c := Default()
-	c.PodNetwork = PodNetworkConfig{Enabled: true, Interface: "bridge100"}
+	c.PodNetwork = PodNetworkConfig{Enabled: true, Interface: "bridge100", IngressInterfaces: []string{"en0"}}
 	rc := c.PodNetworkRouterConfig()
 	if rc.Interface != "bridge100" {
 		t.Errorf("Interface = %q, want bridge100", rc.Interface)
 	}
+	if len(rc.IngressInterfaces) != 1 || rc.IngressInterfaces[0] != "en0" {
+		t.Errorf("IngressInterfaces = %v, want [en0]", rc.IngressInterfaces)
+	}
 	if !rc.EnableForwarding {
 		t.Error("EnableForwarding should default to true")
+	}
+}
+
+func TestValidatePodNetworkRejectsBlankIngressInterface(t *testing.T) {
+	c := Default()
+	c.PodNetwork = PodNetworkConfig{Enabled: true, Interface: "bridge100", IngressInterfaces: []string{" en0"}}
+	if err := c.Validate(); err == nil {
+		t.Error("enabled Pod network with whitespace-padded ingress interface should fail validation")
 	}
 }
 

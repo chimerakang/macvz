@@ -17,17 +17,15 @@ shipped Virtual Kubelet path.
 
 ## Status
 
-**Harness complete; live operator run pending.** The repeatable harness
-(`test/e2e/cri-k3s/k3s-inloop.sh`), the single-container fixture
-(`test/e2e/cri-k3s/fixtures/workload.yaml`), and this runbook are committed and
-pass `bash -n` / plan-only validation in CI. The **live** run requires a real
-topology the dev host cannot stand up unattended — a Linux k3s control plane
-plus a macOS host serving `macvz-cri` as that node's external CRI endpoint — so
-it is explicitly gated (`MACVZ_INTEGRATION=1` + a reachable `KUBECONFIG`) and
-operator-run. The "Run evidence" section below is the template an operator fills
-in from a live run; until it is filled and all acceptance boxes are checked, the
-CRI route-two decision **remains no-go for replacement** (and #82 multi-container
-remains independently blocked regardless).
+**Short live in-loop run passed for the supported workload class.** On
+2026-06-23, the fixture passed scheduling, rollout, logs, exec, port-forward,
+ClusterIP Service reachability from a Linux-node probe, `macvz-cri` restart
+recovery, a bounded short soak, cleanup, and host orphan audit on the local
+two-Mac lab. Handoff was skipped because the default adapter path was under test
+(`MACVZ_HANDOFF=0`), and k3s/kubelet restart recovery was skipped because no
+operator hook was provided. A multi-day soak is still pending. The CRI route-two
+decision **remains no-go for replacement** until #82 multi-container support is
+resolved and the longer operator run is complete.
 
 ## Topology
 
@@ -94,53 +92,72 @@ scheduling → logs → exec → port-forward → service → restart-cri → re
 soak → cleanup. A phase whose operator hook is unset is **skipped loudly**, never
 silently passed.
 
-## Run evidence (operator fills in)
+## Run evidence
 
-> Replace the bracketed placeholders from a live run. Leave a phase marked
-> `PENDING` if hardware availability blocked it, with the reason.
+Short live run:
+
+```sh
+KUBECONFIG=$HOME/.kube/config \
+MACVZ_INTEGRATION=1 \
+MACVZ_NODE=macvz-b-cri \
+MACVZ_CRI_OUT_DIR=/tmp/cri-inloop-20260623031334 \
+MACVZ_INLOOP_SOAK_ITERATIONS=3 \
+MACVZ_INLOOP_SOAK_INTERVAL=2 \
+MACVZ_HOST_AUDIT_CMD="ssh test@192.168.1.122 '/opt/homebrew/bin/container list --all'" \
+MACVZ_ADAPTER_RSS_CMD="ssh test@192.168.1.122 \"ps -axo rss,command | awk '/[m]acvz-cri --listen unix:\\/\\/\\/Users\\/test\\/macvz-cri-i5-test\\/service-default\\/macvz-cri.sock/ {print \\$1; exit}'\"" \
+MACVZ_RESTART_CRI_CMD="ssh test@192.168.1.122 'launchctl kickstart -k gui/501/io.macvz.cri.default'" \
+bash test/e2e/cri-k3s/k3s-inloop.sh
+```
+
+Result:
+
+```text
+PASS CRI-P9 in-loop suite: checks passed with 2 skipped hook-dependent phase(s)
+diagnostics: /tmp/cri-inloop-20260623031334
+```
 
 ### Build under test
 
 | Item | Value |
 | --- | --- |
-| Commit | `[git describe]` |
-| `macvz-cri` version | `[version]` |
-| k3s / kubelet version | `[k3s version]` |
-| `apple/container` version | `[version]` |
-| Test image | `[busybox:1.36.1 arm64]` |
+| Commit | working tree based on `7f28326` |
+| `macvz-cri` version | `7f28326-dirty` |
+| k3s / kubelet version | Kubernetes `v1.35.0` |
+| `apple/container` version | `1.0.0_1` |
+| Test image | `busybox:1.36.1` arm64 |
 
 ### Hosts
 
 | Role | Detail |
 | --- | --- |
-| Linux control plane | `[distro, arch, k3s server]` |
-| macOS CRI node | `[Mac model, chip, RAM, macOS version]` |
+| Linux control plane | local kind node `macvz61-control-plane` |
+| macOS CRI node | `test@192.168.1.122`, node `macvz-b-cri` |
 
 ### Acceptance checklist
 
 | # | Acceptance criterion | Result | Evidence |
 | --- | --- | --- | --- |
-| 1 | k3s/kubelet schedules the fixture onto the MacVz node | `[PASS/PENDING]` | `pod-events.log`, `kubectl get pod -o wide` |
-| 2 | Fixture uses #84 node selection + toleration intentionally | `[PASS]` | `fixtures/workload.yaml` |
-| 3 | `kubectl rollout status` succeeds | `[PASS/PENDING]` | `rollout.log` |
-| 4 | `kubectl logs` returns the boot marker | `[PASS/PENDING]` | logs phase |
-| 5 | `kubectl exec` reads projected Secret + ConfigMap | `[PASS/PENDING]` | `exec.out` |
-| 6 | `kubectl port-forward` + curl returns the served marker | `[PASS/PENDING]` | `pf.log` |
-| 7 | ClusterIP Service reachable from a Linux-node probe | `[PASS/PENDING]` | `probe.log` |
-| 8 | Restarting `macvz-cri` keeps the Pod (no dup/loss) | `[PASS/PENDING]` | `restart-cri.log`, host audit |
-| 9 | Restarting k3s/kubelet keeps the Pod (no orphan) | `[PASS/PENDING]` | `restart-k3s.log` |
-| 10 | Soak: bounded adapter RSS, no crash loop | `[PASS/PENDING]` | `soak-samples.csv` |
-| 11 | Final host audit: no stale `macvz-cri-*` workloads | `[PASS/PENDING]` | `cleanup.log`, host audit |
+| 1 | k3s/kubelet schedules the fixture onto the MacVz node | `PASS` | `pod-events.log`, `kubectl get pod -o wide` |
+| 2 | Fixture uses #84 node selection + toleration intentionally | `PASS` | `fixtures/workload.yaml` |
+| 3 | `kubectl rollout status` succeeds | `PASS` | `rollout.log` |
+| 4 | `kubectl logs` returns the boot marker | `PASS` | logs phase |
+| 5 | `kubectl exec` reads projected Secret + ConfigMap | `PASS` | `exec.out` |
+| 6 | `kubectl port-forward` + curl returns the served marker | `PASS` | `pf.log` |
+| 7 | ClusterIP Service reachable from a Linux-node probe | `PASS` | `probe.log` |
+| 8 | Restarting `macvz-cri` keeps the Pod (no dup/loss) | `PASS` | `restart-cri.log`, host audit |
+| 9 | Restarting k3s/kubelet keeps the Pod (no orphan) | `SKIP` | no `MACVZ_RESTART_K3S_CMD` hook |
+| 10 | Soak: bounded adapter RSS, no crash loop | `PASS` | `soak-samples.csv` |
+| 11 | Final host audit: no stale `macvz-cri-*` workloads | `PASS` | `cleanup.log`, host audit |
 
 ### Soak summary
 
 | Metric | Value |
 | --- | --- |
-| Duration / samples | `[e.g. 24h / 8640 samples]` |
-| First / last adapter RSS | `[KB] / [KB]` |
-| RSS growth (bound 64 MiB) | `[KB]` |
-| Pod restartCount over soak | `[n]` |
-| Residual host workloads at end | `[0]` |
+| Duration / samples | short smoke / 3 samples |
+| First / last adapter RSS | `22688 KB` / `24608 KB` |
+| RSS growth (bound 64 MiB) | `1920 KB` |
+| Pod restartCount over soak | `0` |
+| Residual host workloads at end | `0` |
 
 ## Decision impact
 
@@ -153,8 +170,9 @@ by Kubernetes, not only when driven by `crictl`?*
   gate 1 (multi-container Pods, #82) remains blocked on a missing `apple/container`
   shared-netns primitive. Per the issue's own acceptance text, *until #82 is
   unblocked and this issue passes, the answer remains no-go for replacement.*
-- Until this report's evidence is filled from a live run, the in-loop validation
-  is **pending**, and the route-two decision is unchanged.
+- The short live run clears the basic in-loop smoke for the supported
+  single-container class, but the route-two decision is unchanged until #82 and
+  the longer operator run are complete.
 
 See [CRI_FEASIBILITY.md](CRI_FEASIBILITY.md) "CRI-P9 Follow-up (#85)" for how
 this fits the full decision package, and

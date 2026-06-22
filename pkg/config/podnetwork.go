@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"net"
+	"strings"
 
 	"github.com/chimerakang/macvz/pkg/network/podnet"
 )
@@ -23,6 +24,11 @@ type PodNetworkConfig struct {
 	// Interface is the host vmnet interface apple/container micro-VMs attach to
 	// (e.g. "bridge100"). The binat rules are scoped to it.
 	Interface string `yaml:"interface"`
+
+	// IngressInterfaces are extra host interfaces where Pod-IP traffic may arrive
+	// outside the WireGuard mesh, such as a local test bridge. They only add
+	// Pod binat rules; they do not grant route/default-route control.
+	IngressInterfaces []string `yaml:"ingressInterfaces"`
 
 	// Anchor is the pf anchor MacVz manages. Defaults to podnet.DefaultAnchor.
 	// The operator must reference this anchor from the main pf.conf.
@@ -54,6 +60,11 @@ func (c Config) validatePodNetwork() error {
 			return fmt.Errorf("podNetwork.vmNetCIDRs entry %q is not a CIDR: %w", cidr, err)
 		}
 	}
+	for _, iface := range pn.IngressInterfaces {
+		if iface == "" || iface != strings.TrimSpace(iface) {
+			return fmt.Errorf("podNetwork.ingressInterfaces entry %q is not a valid interface name", iface)
+		}
+	}
 	return nil
 }
 
@@ -66,10 +77,11 @@ func (c Config) PodNetworkRouterConfig() podnet.Config {
 		forwarding = *pn.EnableForwarding
 	}
 	return podnet.Config{
-		Interface:        pn.Interface,
-		MeshInterface:    c.Mesh.Interface,
-		Anchor:           pn.Anchor,
-		EnableForwarding: forwarding,
+		Interface:         pn.Interface,
+		MeshInterface:     c.Mesh.Interface,
+		IngressInterfaces: pn.IngressInterfaces,
+		Anchor:            pn.Anchor,
+		EnableForwarding:  forwarding,
 	}
 }
 

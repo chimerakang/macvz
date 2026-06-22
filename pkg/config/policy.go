@@ -19,12 +19,13 @@ import (
 // helper needs to canonicalise peer keys and route targets.
 func (c Config) PrivilegedHelperPolicy() (privhelper.Policy, error) {
 	p := privhelper.Policy{
-		VMNetInterface: c.PodNetwork.Interface,
-		Anchor:         podnet.DefaultAnchor,
-		RouteCIDRs:     map[string]bool{},
-		PodCIDRs:       map[string]bool{},
-		VMNetCIDRs:     map[string]bool{},
-		PeerPublicKeys: map[string]bool{},
+		VMNetInterface:       c.PodNetwork.Interface,
+		Anchor:               podnet.DefaultAnchor,
+		PodIngressInterfaces: map[string]bool{},
+		RouteCIDRs:           map[string]bool{},
+		PodCIDRs:             map[string]bool{},
+		VMNetCIDRs:           map[string]bool{},
+		PeerPublicKeys:       map[string]bool{},
 	}
 	if c.PodNetwork.Anchor != "" {
 		p.Anchor = c.PodNetwork.Anchor
@@ -38,6 +39,9 @@ func (c Config) PrivilegedHelperPolicy() (privhelper.Policy, error) {
 			vmnet = []string{DefaultVMNetCIDR}
 		}
 		p.VMNetCIDRs = privhelper.NormalizeCIDRSet(vmnet)
+		for _, iface := range c.PodNetwork.IngressInterfaces {
+			p.PodIngressInterfaces[iface] = true
+		}
 	}
 
 	if !c.Mesh.Enabled {

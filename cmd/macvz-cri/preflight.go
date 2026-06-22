@@ -263,16 +263,24 @@ func checkPodNetwork(pn podNetConfig, p preflightProbes) checkResult {
 				Detail: fmt.Sprintf("--pod-network-helper-socket %s is not present: %v; start macvz-netd or run the adapter as root", pn.helperSocket, err),
 			}
 		}
+		detail := fmt.Sprintf("enabled via helper socket %s on %s", pn.helperSocket, pn.iface)
+		if len(pn.ingressInterfaces) > 0 {
+			detail += fmt.Sprintf(" with ingress interfaces %s", strings.Join([]string(pn.ingressInterfaces), ","))
+		}
 		return checkResult{
 			Name:   "Pod networking",
 			Status: checkOK,
-			Detail: fmt.Sprintf("enabled via helper socket %s on %s", pn.helperSocket, pn.iface),
+			Detail: detail,
 		}
+	}
+	detail := fmt.Sprintf("enabled on %s without a helper socket: pf/route operations require running the adapter as root", pn.iface)
+	if len(pn.ingressInterfaces) > 0 {
+		detail += fmt.Sprintf("; ingress interfaces %s", strings.Join([]string(pn.ingressInterfaces), ","))
 	}
 	return checkResult{
 		Name:   "Pod networking",
 		Status: checkWarn,
-		Detail: fmt.Sprintf("enabled on %s without a helper socket: pf/route operations require running the adapter as root", pn.iface),
+		Detail: detail,
 	}
 }
 

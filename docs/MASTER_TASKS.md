@@ -82,6 +82,40 @@ architecture from Virtual Kubelet provider to kubelet CRI runtime integration.
 | CRI-R15 (#107) | Add verifiable identity evidence channel for late-rootfs launch | ✅ Complete (shared bind handoff verified late-rootfs identity through `/run/macvz-r9-evidence/<id>/macvz-r9-result`; outcome `vminitdRootfsPrimitiveLaunchSucceeded`) |
 | CRI-R16 (#108) | Design production evidence/result handoff for late-rootfs containers | ✅ Complete (runtime-private `/run/macvz/containers/<id>/handoff` lifecycle, OCI bind mount, permissions, cleanup, and CRI mapping accepted; outcome `runtimeHandoffDesignAccepted`) |
 
+## CRI Implementation Track
+
+The R-series research work proved the late-rootfs route and accepted the
+production handoff design. The I-series implementation track turns that evidence
+into an experimental LinuxPod-backed CRI runtime path. It remains separate from
+the shipped Virtual Kubelet node-provider path until kubelet/k3s validation is
+strong enough to change the product posture.
+
+| Phase | Title | Goal | Issues | Status |
+| --- | --- | --- | --- | --- |
+| CRI-I1 | Runtime Handoff Foundation | Build the runtime-private path, metadata, and mount-collision foundation needed by all later work | #109, #110, #111 | ⬜ Planned |
+| CRI-I2 | Late Rootfs Launch Primitive | Move the R15 handoff proof into the experimental runtime launch primitive and gated integration coverage | #112, #113, #114 | ⬜ Planned |
+| CRI-I3 | CRI Lifecycle Integration | Map Create/Start/Stop/Remove/Status onto the handoff-aware runtime lifecycle | #115, #116, #117 | ⬜ Planned |
+| CRI-I4 | Kubelet Validation | Validate the handoff-aware runtime through crictl, kubelet/k3s smoke, and restart/cleanup scenarios | #118, #119, #120 | ⬜ Planned |
+| CRI-I5 | Hardening & Upstream Alignment | Harden permissions, draft upstream primitive proposal, and define the experimental feature gate/operator contract | #121, #122, #123 | ⬜ Planned |
+
+| Issue | Phase | Task | Acceptance Focus |
+| --- | --- | --- | --- |
+| #109 | CRI-I1 | Add runtime handoff path lifecycle helper | Hermetic path derivation, sanitization, permissions, and idempotent cleanup tests |
+| #110 | CRI-I1 | Define runtime metadata for rootfs and handoff state | Minimal recoverable metadata shape and restart behavior |
+| #111 | CRI-I1 | Guard kubelet mounts from runtime-private handoff path collisions | Reserved target validation for `/run/macvz/handoff` and runtime paths |
+| #112 | CRI-I2 | Build late-rootfs OCI spec handoff bind mount injection | Runtime-private writable bind mount in the late-rootfs OCI spec |
+| #113 | CRI-I2 | Implement late-rootfs identity file and handoff writer contract | Exact identity evidence format and parser behavior |
+| #114 | CRI-I2 | Add gated LinuxPod integration for runtime handoff launch | R15-derived live integration outcome for production path layout |
+| #115 | CRI-I3 | Map CRI CreateContainer to LinuxPod rootfs and handoff preparation | Create prepares runtime state and cleans up on failure |
+| #116 | CRI-I3 | Map CRI StartContainer to identity verification before Running | Start marks Running only after handoff identity verification |
+| #117 | CRI-I3 | Map StopContainer, RemoveContainer, and Status to handoff lifecycle | Stop preserves evidence, Remove cleans up idempotently, Status exposes debug info only when verbose |
+| #118 | CRI-I4 | Build local crictl fixture for LinuxPod handoff lifecycle | Repeatable CRI socket fixture with expected output and cleanup |
+| #119 | CRI-I4 | Re-run kubelet/k3s in-loop fixture against handoff-aware runtime | Honest kubelet smoke result or precise blocker |
+| #120 | CRI-I4 | Add restart and cleanup validation for handoff-aware containers | Restart recovery and orphan handoff/rootfs cleanup evidence |
+| #121 | CRI-I5 | Harden handoff permissions and user mapping | Non-root write support with narrower permission policy where possible |
+| #122 | CRI-I5 | Draft upstream apple/containerization primitive proposal | Upstream-ready proposal grounded in R9-R16 evidence |
+| #123 | CRI-I5 | Decide experimental feature gate and operator documentation | Explicit feature gate, honest unsupported behavior, and operator docs |
+
 **CRI-P5 evidence (#77):** Pod networking is wired through the same primitives as
 the shipped provider — `network.PodIPAM` for Pod IPs and `podnet.Router` for the
 host pf binat path — reached via narrow interfaces in `pkg/criserver/network.go`.

@@ -147,6 +147,76 @@ func TestCreateContainerRejectsBidirectionalPropagation(t *testing.T) {
 	}
 }
 
+func TestCreateContainerRejectsReservedRuntimeMountTargets(t *testing.T) {
+	// Every reserved target must be rejected even when its host source is an
+	// otherwise-allowed kubelet pods path or an allowlisted hostPath: the guard
+	// is on the container_path destination, not the source.
+	rt := newFakeRuntime()
+	s := New(Options{
+		Runtime: rt,
+		Mounts:  MountPolicy{HostPathAllowedPrefixes: []string{"/Users/me/data"}},
+	})
+	sandboxID := mustRunSandbox(t, s)
+	ctx := context.Background()
+
+	cases := []struct {
+		name  string
+		mount *runtimeapi.Mount
+	}{
+		{
+			name:  "handoff bind point",
+			mount: &runtimeapi.Mount{HostPath: "/Users/me/data", ContainerPath: "/run/macvz/handoff"},
+		},
+		{
+			name:  "child of handoff",
+			mount: &runtimeapi.Mount{HostPath: "/var/lib/kubelet/pods/uid-1/volumes/x/cfg", ContainerPath: "/run/macvz/handoff/identity"},
+		},
+		{
+			name:  "reserved namespace root",
+			mount: &runtimeapi.Mount{HostPath: "/Users/me/data", ContainerPath: "/run/macvz"},
+		},
+		{
+			name:  "other reserved runtime path",
+			mount: &runtimeapi.Mount{HostPath: "/var/lib/kubelet/pods/uid-1/volumes/x/cfg", ContainerPath: "/run/macvz/containers/c1/rootfs"},
+		},
+		{
+			name:  "memory emptyDir at reserved target",
+			mount: &runtimeapi.Mount{HostPath: "", ContainerPath: "/run/macvz/handoff"},
+		},
+		{
+			name:  "uncleaned path resolving into reserved namespace",
+			mount: &runtimeapi.Mount{HostPath: "/Users/me/data", ContainerPath: "/run/macvz/../macvz/handoff"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, c := range s.containers.ListBySandbox(sandboxID) {
+				_, _ = s.RemoveContainer(ctx, &runtimeapi.RemoveContainerRequest{ContainerId: c.ID})
+			}
+			before := len(rt.created)
+			_, err := s.CreateContainer(ctx, mountReq(sandboxID, "app", []*runtimeapi.Mount{tc.mount}))
+			if status.Code(err) != codes.FailedPrecondition {
+				t.Fatalf("err = %v, want FailedPrecondition", err)
+			}
+			if len(rt.created) != before {
+				t.Errorf("workload created despite reserved target: %d", len(rt.created)-before)
+			}
+		})
+	}
+
+	// A non-reserved target that merely shares a string prefix with the reserved
+	// namespace ("/run/macvz-data") is still allowed: matching is segment-aware.
+	for _, c := range s.containers.ListBySandbox(sandboxID) {
+		_, _ = s.RemoveContainer(ctx, &runtimeapi.RemoveContainerRequest{ContainerId: c.ID})
+	}
+	ok := mountReq(sandboxID, "app", []*runtimeapi.Mount{
+		{HostPath: "/Users/me/data", ContainerPath: "/run/macvz-data"},
+	})
+	if _, err := s.CreateContainer(ctx, ok); err != nil {
+		t.Errorf("sibling of reserved namespace rejected: %v", err)
+	}
+}
+
 func TestCreateContainerCustomKubeletPodsDir(t *testing.T) {
 	rt := newFakeRuntime()
 	s := New(Options{

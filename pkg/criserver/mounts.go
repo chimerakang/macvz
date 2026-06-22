@@ -7,6 +7,7 @@ import (
 
 	"github.com/chimerakang/macvz/internal/types"
 	"github.com/chimerakang/macvz/pkg/criserver/store"
+	macvzruntime "github.com/chimerakang/macvz/pkg/runtime"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
@@ -31,6 +32,22 @@ import (
 // volumes (ConfigMap, Secret, projected SA token, Downward API) and emptyDir
 // storage, and are always allowed regardless of the hostPath allowlist.
 const defaultKubeletPodsDir = "/var/lib/kubelet/pods"
+
+// reservedRuntimePrefix is the MacVz-owned runtime namespace inside a container.
+// The runtime (pkg/runtime) injects its private handoff bind mount at
+// reservedHandoffPath and stages rootfs/handoff state under this namespace
+// (R16 handoff design, #108). A kubelet- or user-provided mount that targets
+// this namespace would shadow, hijack, or corrupt the runtime-private identity
+// and result handoff, so such targets are rejected outright. This is a
+// destination (container_path) guard and is independent of the hostPath source
+// allowlist: no operator opt-in can re-enable a reserved target.
+const reservedRuntimePrefix = macvzruntime.HandoffRuntimeRoot
+
+// reservedHandoffPath is the runtime-private handoff bind-mount point. It lives
+// under reservedRuntimePrefix and is named here only to make rejection errors
+// actionable; the guard covers the whole reservedRuntimePrefix namespace, not
+// just this single path.
+const reservedHandoffPath = macvzruntime.HandoffMountPoint
 
 // MountPolicy governs which kubelet-provided host mounts the CRI adapter binds
 // into a micro-VM (CRI-P7, #79). The zero value is safe and restrictive: only
@@ -79,6 +96,15 @@ func (s *Server) translateMounts(mounts []*runtimeapi.Mount) ([]types.Mount, []s
 				"CreateContainer: mount container_path %q must be absolute", target)
 		}
 		target = filepath.Clean(target)
+
+		// The runtime owns the /run/macvz namespace for its private handoff bind
+		// mount (R16, #108). A kubelet mount targeting it — tmpfs or bind — would
+		// collide with that handoff, so reject the target regardless of source.
+		if withinPrefix(target, reservedRuntimePrefix) {
+			return nil, nil, status.Errorf(codes.FailedPrecondition,
+				"CreateContainer: mount container_path %q targets the reserved MacVz runtime namespace %q (used for the runtime-private handoff at %q); choose a different mount point",
+				target, reservedRuntimePrefix, reservedHandoffPath)
+		}
 
 		// An empty host path is a guest-local tmpfs (Memory-medium emptyDir): no
 		// host source to validate, allocate in-guest memory at the target.

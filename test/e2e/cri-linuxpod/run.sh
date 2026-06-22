@@ -57,8 +57,13 @@ case "${PROBE}" in
     REPORT_TITLE="CRI-R6 vminitd Container Rootfs Process Path Report (#98)"
     WORK_DIR="${MACVZ_LINUXPOD_WORK_DIR:-/tmp/macvz-runtime-r6}"
     ;;
+  r7)
+    DEFAULT_REPORT_PATH="${ROOT_DIR}/docs/CRI_RUNTIME_R7_VMINITD_VISIBLE_ROOTFS_REPORT.md"
+    REPORT_TITLE="CRI-R7 vminitd-Visible Rootfs Launch Report (#99)"
+    WORK_DIR="${MACVZ_LINUXPOD_WORK_DIR:-/tmp/macvz-runtime-r7}"
+    ;;
   *)
-    echo "unsupported MACVZ_LINUXPOD_PROBE=${PROBE}; expected c1, c2, c4, r1, r3, r4, r5, or r6" >&2
+    echo "unsupported MACVZ_LINUXPOD_PROBE=${PROBE}; expected c1, c2, c4, r1, r3, r4, r5, r6, or r7" >&2
     exit 1
     ;;
 esac
@@ -81,6 +86,7 @@ This gated Swift harness can run:
   - r4 (#96): guest-side late rootfs staging probe
   - r5 (#97): VM-agent process execution from staged guest rootfs
   - r6 (#98): vminitd new-container process from staged guest rootfs
+  - r7 (#99): vminitd-visible staged rootfs launch probe
 
 Selected probe: ${PROBE}
 
@@ -144,6 +150,16 @@ R6 flow:
   4. verify the new process wrote identity and rootfs evidence back into the
      staged rootfs, then delete the vminitd container and clean up
 
+R7 flow:
+  1. boot one LinuxPod with a predeclared keeper utility container
+  2. after pod.create(), stage a minimal busybox rootfs under the utility
+     container's rootfs, outside container-local /run tmpfs
+  3. call VM-agent createProcess/startProcess with id == containerID, but point
+     OCI root.path at /run/container/utility/rootfs/... so vminitd resolves
+     the same staged tree from its init mount namespace
+  4. verify the new process wrote identity and rootfs evidence back into the
+     staged rootfs, then delete the vminitd container and clean up
+
 Set MACVZ_LINUXPOD_VMNET=1 to also attach a vmnet interface. The default
 keeps this C1 probe focused on LinuxPod shared-namespace behavior.
 
@@ -172,6 +188,7 @@ Run live:
   MACVZ_LINUXPOD_POC=1 make cri-linuxpod-r4
   MACVZ_LINUXPOD_POC=1 make cri-linuxpod-r5
   MACVZ_LINUXPOD_POC=1 make cri-linuxpod-r6
+  MACVZ_LINUXPOD_POC=1 make cri-linuxpod-r7
 EOF
   exit 0
 fi
@@ -319,7 +336,7 @@ EOF
 - [x] The report distinguishes VM-agent process API unavailable, staged rootfs unavailable, process creation failure, identity mismatch, namespace/rootfs mismatch, cleanup failure, and success.
 
 EOF
-  else
+  elif [[ "${PROBE}" == "r6" ]]; then
     cat >>"${REPORT_PATH}" <<EOF
 - [x] One LinuxPod was created with a predeclared keeper utility container.
 - [x] Guest agent transport was attempted only after pod.create() and utility start.
@@ -327,6 +344,15 @@ EOF
 - [x] A post-create staged rootfs was used as the OCI root for that vminitd container path, or the precise failure boundary was recorded.
 - [x] Identity is checked by explicit request ID, not by guessed /dev/sdX or /dev/vdX names.
 - [x] The report distinguishes unavailable transport, staged rootfs unavailable, upstream primitive missing, exec-like rootfs constraint, cleanup failure, and success.
+
+EOF
+  else
+    cat >>"${REPORT_PATH}" <<EOF
+- [x] One LinuxPod was created with a predeclared keeper utility container.
+- [x] Guest agent transport was attempted only after pod.create() and utility start.
+- [x] The probe staged rootfs data through the utility container and addressed the same tree through vminitd's init-namespace path.
+- [x] vminitd createProcess/startProcess was called with id == containerID to target the new-container path.
+- [x] The report distinguishes unavailable transport, vminitd-visible rootfs launch success, missing primitive, cleanup failure, and upstream-change boundaries.
 
 EOF
   fi

@@ -408,6 +408,31 @@ should prove an init-namespace rootfs preparation path, or define the smallest
 upstream/LinuxPod primitive that stages rootfs data and registers/starts a new
 vminitd container atomically enough for kubelet `CreateContainer` ordering.
 
+### R7: vminitd-Visible Rootfs Launch (#99)
+
+R7 completed on 2026-06-22 UTC. The report is
+[CRI_RUNTIME_R7_VMINITD_VISIBLE_ROOTFS_REPORT.md](CRI_RUNTIME_R7_VMINITD_VISIBLE_ROOTFS_REPORT.md).
+
+Result: **current public APIs still do not provide a proven vminitd-visible
+rootfs staging primitive**. R7 tested the direct follow-up from R6: stage rootfs
+data through the utility container, but address the same tree from vminitd using
+`/run/container/utility/rootfs/...` as the OCI `root.path`.
+
+Two variants were tried. Staging under the utility container's `/run` failed,
+which is consistent with `/run` being container-local mount state. The final
+probe staged under `/macvz-r7/...` to avoid `/run` tmpfs and used
+`/run/container/utility/rootfs/macvz-r7/...` as the vminitd-visible path.
+`createProcess` still succeeded and reached the new-container branch, but
+`startProcess` failed with `No such file or directory`, and no result file was
+written.
+
+Outcome: `vminitdVisibleRootfsPrimitiveMissing`.
+
+Decision: stop adding wrappers around utility-container exec staging. The next
+step should define the smallest upstream-compatible LinuxPod/vminitd primitive
+that prepares rootfs data in vminitd-visible state, registers the new container,
+starts it, and cleans up failure state.
+
 ### C5: Swift Helper Daemon Prototype
 
 Only if R0 later selects a LinuxPod-based bridge as a valid runtime building

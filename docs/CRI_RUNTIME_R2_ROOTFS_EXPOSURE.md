@@ -218,3 +218,24 @@ This moves the remaining rootfs exposure problem one layer down: MacVz needs a
 rootfs preparation primitive that vminitd can consume directly, or an upstream
 LinuxPod/vminitd API that performs rootfs staging plus new-container registration
 and start in one coherent state transition.
+
+## R7 Result
+
+R7 completed on 2026-06-22 UTC. The live probe is published at
+[CRI_RUNTIME_R7_VMINITD_VISIBLE_ROOTFS_REPORT.md](CRI_RUNTIME_R7_VMINITD_VISIBLE_ROOTFS_REPORT.md).
+
+Outcome: `vminitdVisibleRootfsPrimitiveMissing`.
+
+R7 tested whether rootfs data staged by the utility container could be addressed
+through vminitd's init-namespace view under `/run/container/utility/rootfs`.
+Staging under utility `/run` was not sufficient, likely because it is
+container-local mount state. Staging under utility `/macvz-r7/...` and using
+`/run/container/utility/rootfs/macvz-r7/...` as OCI `root.path` still let
+`createProcess` create the new vminitd container object, but `startProcess`
+failed with `No such file or directory`.
+
+This closes the "can MacVz fake a late rootfs by staging through a keeper
+container?" question as no. The remaining rootfs exposure work should move to a
+real vminitd/LinuxPod primitive: prepare rootfs data where vminitd can consume
+it, register a new container from that rootfs, start the init process, and clean
+up consistently on failure.

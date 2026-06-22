@@ -181,17 +181,28 @@ func (s *Server) releaseSandboxIP(sb *store.Sandbox) {
 // best-effort: failures are logged, not returned, because the caller already has
 // the original attach error to surface.
 func (s *Server) unwindContainerStart(ctx context.Context, c *store.Container) {
+	s.unwindContainerStartReason(ctx, c, "NetworkSetupFailed",
+		"pod network attach failed during container start")
+}
+
+// unwindContainerStartReason stops a workload whose start could not complete and
+// records it as Exited with the given reason/message, so a half-started container
+// is never left Running. It is best-effort on both the stop and the persist: a
+// failure to persist the Exited state (e.g. the store is unwritable) is logged,
+// not returned, because the workload has already been stopped — the important
+// cleanup — and the caller is already returning the original start error.
+func (s *Server) unwindContainerStartReason(ctx context.Context, c *store.Container, reason, message string) {
 	if err := s.containerRuntime.Stop(context.WithoutCancel(ctx), c.WorkloadID, defaultStopTimeout); err != nil {
-		klog.ErrorS(err, "StartContainer: failed to stop workload after network attach failure",
-			"containerID", c.ID, "workloadID", c.WorkloadID)
+		klog.ErrorS(err, "StartContainer: failed to stop workload after start failure",
+			"containerID", c.ID, "workloadID", c.WorkloadID, "reason", reason)
 	}
 	c.State = store.ContainerExited
 	c.FinishedAt = s.now().UnixNano()
-	c.Reason = "NetworkSetupFailed"
-	c.Message = "pod network attach failed during container start"
+	c.Reason = reason
+	c.Message = message
 	if err := s.containers.Put(c); err != nil {
-		klog.ErrorS(err, "StartContainer: failed to persist exited state after network attach failure",
-			"containerID", c.ID)
+		klog.ErrorS(err, "StartContainer: failed to persist exited state after start failure",
+			"containerID", c.ID, "reason", reason)
 	}
 }
 

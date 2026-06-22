@@ -194,6 +194,23 @@ func (s *Server) CreateContainer(ctx context.Context, req *runtimeapi.CreateCont
 		Env:     c.Env,
 		Mounts:  rtMounts,
 	}
+
+	// Experimental LinuxPod handoff preparation (CRI-I3, #115): for the
+	// single-container path, prepare the runtime-private rootfs/handoff subtree and
+	// inject the handoff bind mount into the spec before the workload is created.
+	// Gated by Options.LinuxPodHandoff; the joined multi-container path is excluded
+	// because it does not own a private rootfs. If anything after this point fails,
+	// handoffCleanup undoes the staged subtree so the create leaves nothing behind.
+	var handoffCleanup func()
+	if joinRuntime == nil && s.handoffEnabled() {
+		cleanup, herr := s.prepareHandoff(&spec, workloadID)
+		if herr != nil {
+			return nil, herr
+		}
+		handoffCleanup = cleanup
+		c.HandoffPrepared = true
+	}
+
 	var createErr error
 	if joinRuntime != nil {
 		_, createErr = joinRuntime.CreateInPodSandbox(ctx, joinSandboxWorkloadID, spec)
@@ -201,15 +218,22 @@ func (s *Server) CreateContainer(ctx context.Context, req *runtimeapi.CreateCont
 		_, createErr = s.containerRuntime.Create(ctx, spec)
 	}
 	if createErr != nil {
+		if handoffCleanup != nil {
+			handoffCleanup()
+		}
 		return nil, runtimeError("CreateContainer", "create workload", createErr)
 	}
 
 	// Persist only after the workload exists. If persistence fails, reclaim the
-	// workload so the create leaves neither an orphan record nor an orphan VM.
+	// workload and any prepared handoff so the create leaves neither an orphan
+	// record nor an orphan VM nor an orphan handoff subtree.
 	if err := s.containers.Put(c); err != nil {
 		if derr := s.containerRuntime.Destroy(context.WithoutCancel(ctx), workloadID); derr != nil {
 			klog.ErrorS(derr, "CreateContainer: failed to reclaim workload after persist error",
 				"containerID", id, "workloadID", workloadID)
+		}
+		if handoffCleanup != nil {
+			handoffCleanup()
 		}
 		return nil, status.Errorf(codes.Internal, "CreateContainer: persist: %v", err)
 	}
@@ -242,10 +266,24 @@ func (s *Server) StartContainer(ctx context.Context, req *runtimeapi.StartContai
 	if err := s.containerRuntime.Start(ctx, c.WorkloadID); err != nil {
 		return nil, runtimeError("StartContainer", "start workload", err)
 	}
+
+	// Gate Running on handoff identity verification for the experimental late-rootfs
+	// path (CRI-I3-2, #116). For the default apple/container path this is a no-op.
+	// A failed verification unwinds the just-started workload inside the helper, so
+	// the container is never persisted Running after a missing/mismatched identity.
+	if err := s.verifyHandoffIdentity(ctx, &c); err != nil {
+		return nil, err
+	}
+
 	c.State = store.ContainerRunning
 	c.StartedAt = s.now().UnixNano()
 	if err := s.containers.Put(&c); err != nil {
-		return nil, status.Errorf(codes.Internal, "StartContainer: persist: %v", err)
+		// Persisting Running failed after the workload started (and any handoff
+		// identity verified). Stop the workload so it is not left running behind a
+		// record that still says Created — a leaked micro-VM the kubelet cannot see.
+		s.unwindContainerStartReason(context.WithoutCancel(ctx), &c, "PersistFailed",
+			"failed to persist running state during container start")
+		return nil, status.Errorf(codes.Internal, "StartContainer: persist running state for %q: %v", id, err)
 	}
 
 	// Attach the Pod network path now that the micro-VM is booting (CRI-P5, #77).
@@ -376,6 +414,12 @@ func (s *Server) ContainerStatus(ctx context.Context, req *runtimeapi.ContainerS
 			"workloadID": c.WorkloadID,
 			"sandboxID":  c.SandboxID,
 			"mounts":     mountSummary(c.Mounts),
+		}
+		// Surface runtime-private handoff identity-verification diagnostics under
+		// verbose only (CRI-I3-3, #117). They are debug detail, never part of the
+		// stable CRI status and never a Kubernetes volume surface.
+		for k, v := range s.handoffStatusInfo(c) {
+			resp.Info[k] = v
 		}
 	}
 	return resp, nil
@@ -514,6 +558,10 @@ func (s *Server) removeContainerRecord(ctx context.Context, c store.Container, m
 	if err := s.containers.Delete(c.ID); err != nil {
 		return status.Errorf(codes.Internal, "%s: delete container %q: %v", method, c.ID, err)
 	}
+	// Remove the runtime-private handoff subtree after the workload and record are
+	// gone. This is idempotent and best-effort: a missing subtree is fine, and a
+	// cleanup error is logged rather than failing an otherwise-successful remove.
+	s.cleanupHandoff(c)
 	return nil
 }
 

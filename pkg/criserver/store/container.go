@@ -74,6 +74,13 @@ type Container struct {
 	// any other container in the Pod is still live. False for the sandbox owner and
 	// for every single-container Pod.
 	SharesPodNetwork bool           `json:"sharesPodNetwork,omitempty"`
+	// HandoffPrepared marks a container whose runtime-private rootfs/handoff
+	// subtree was prepared by the experimental LinuxPod handoff path (CRI-I3, #115)
+	// under the runtime handoff root. It is the only CRI mapping needed to recover
+	// and clean up that subtree: the paths themselves are recomputed from
+	// WorkloadID via runtime.HandoffManager, so nothing host-specific is persisted.
+	// False for the default apple/container path, which prepares no handoff.
+	HandoffPrepared bool           `json:"handoffPrepared,omitempty"`
 	State            ContainerState `json:"state"`
 	CreatedAt        int64          `json:"createdAt"`            // unix nanoseconds
 	StartedAt        int64          `json:"startedAt,omitempty"`  // unix nanoseconds

@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/chimerakang/macvz/pkg/criserver/store"
+	"github.com/chimerakang/macvz/pkg/runtime"
 	"google.golang.org/grpc"
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
 	"k8s.io/klog/v2"
@@ -94,6 +95,17 @@ type Options struct {
 	// rejects — but with a diagnostic naming the exact missing primitive rather
 	// than a flat one-container error.
 	MultiContainer bool
+
+	// Handoff manages the runtime-private per-container rootfs/handoff subtree
+	// (/run/macvz/containers/<id>) for the experimental LinuxPod late-rootfs path.
+	// Nil (the default) keeps the apple/container path, which prepares no handoff,
+	// so non-handoff workloads are unaffected. When set, CreateContainer prepares
+	// the subtree and injects the handoff bind mount before the workload is created
+	// (CRI-I3, #115) but does not start the container, and RemoveContainer cleans
+	// the subtree up idempotently. It enables no k3s/kubelet compatibility claim on
+	// its own. Tests pass a manager rooted at a temp dir so preparation stays
+	// hermetic and never writes under the real /run.
+	Handoff *runtime.HandoffManager
 }
 
 // Server is the experimental MacVz CRI server. It implements the CRI
@@ -120,6 +132,12 @@ type Server struct {
 	// Options.MultiContainer and multicontainer.go.
 	multiContainer bool
 
+	// handoff prepares and cleans up the runtime-private per-container
+	// rootfs/handoff subtree for the experimental LinuxPod path (CRI-I3, #115). Nil
+	// unless Options.Handoff is set, in which case CreateContainer prepares the
+	// handoff and RemoveContainer cleans it up. See container_handoff.go.
+	handoff *runtime.HandoffManager
+
 	// streamServer mints the per-request streaming URLs kubelet redirects exec and
 	// port-forward clients to (CRI-P6, #78). Nil leaves those surfaces returning a
 	// clear FailedPrecondition rather than a dead URL. Set via SetStreamingServer.
@@ -136,6 +154,13 @@ type Server struct {
 	// address before attaching the Pod network. Tests shorten them.
 	vmIPPollAttempts int
 	vmIPPollInterval time.Duration
+
+	// handoffVerify* bound how long StartContainer waits for a late-rootfs
+	// container's handoff identity evidence before failing the start (CRI-I3-2,
+	// #116). Used only on the experimental LinuxPod handoff path. Tests shorten
+	// them.
+	handoffVerifyTimeout  time.Duration
+	handoffVerifyInterval time.Duration
 }
 
 // New builds a CRI skeleton server with the given options.
@@ -163,20 +188,23 @@ func New(opts Options) *Server {
 		now = time.Now
 	}
 	return &Server{
-		runtimeName:      name,
-		runtimeVersion:   version,
-		sandboxes:        sandboxes,
-		containers:       containers,
-		containerRuntime: opts.Runtime,
-		imageRuntime:     opts.Images,
-		podNet:           opts.PodNetwork,
-		ipam:             opts.IPAM,
-		mountPolicy:      opts.Mounts,
-		now:              now,
-		multiContainer:   opts.MultiContainer,
-		logPumps:         make(map[string]*logPump),
-		vmIPPollAttempts: defaultVMIPPollAttempts,
-		vmIPPollInterval: defaultVMIPPollInterval,
+		runtimeName:           name,
+		runtimeVersion:        version,
+		sandboxes:             sandboxes,
+		containers:            containers,
+		containerRuntime:      opts.Runtime,
+		imageRuntime:          opts.Images,
+		podNet:                opts.PodNetwork,
+		ipam:                  opts.IPAM,
+		mountPolicy:           opts.Mounts,
+		now:                   now,
+		multiContainer:        opts.MultiContainer,
+		handoff:               opts.Handoff,
+		logPumps:              make(map[string]*logPump),
+		vmIPPollAttempts:      defaultVMIPPollAttempts,
+		vmIPPollInterval:      defaultVMIPPollInterval,
+		handoffVerifyTimeout:  defaultHandoffVerifyTimeout,
+		handoffVerifyInterval: defaultHandoffVerifyInterval,
 	}
 }
 

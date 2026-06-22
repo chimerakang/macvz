@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -8,6 +9,73 @@ import (
 	"testing"
 	"time"
 )
+
+func TestWaitForHandoffIdentityArrivesLate(t *testing.T) {
+	now := func() time.Time { return time.Date(2026, 6, 22, 10, 0, 0, 0, time.UTC) }
+	m := metaWithEvidence(t, "id=late-alpha", "") // no evidence yet
+	// Write the evidence shortly after the wait begins.
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		_ = os.WriteFile(m.IdentityFile, []byte("identity=id=late-alpha\n"), 0o644)
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if _, err := WaitForHandoffIdentity(ctx, m, now, 5*time.Millisecond); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !m.Verified() {
+		t.Errorf("meta not verified after late arrival: %+v", m)
+	}
+}
+
+func TestWaitForHandoffIdentityTimeout(t *testing.T) {
+	now := func() time.Time { return time.Date(2026, 6, 22, 10, 0, 0, 0, time.UTC) }
+	m := metaWithEvidence(t, "id=late-alpha", "") // evidence never written
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	_, err := WaitForHandoffIdentity(ctx, m, now, 5*time.Millisecond)
+	if !errors.Is(err, ErrEvidenceMissing) {
+		t.Fatalf("err = %v, want ErrEvidenceMissing", err)
+	}
+	if m.Status != IdentityMissing {
+		t.Errorf("Status = %q, want Missing", m.Status)
+	}
+}
+
+func TestWaitForHandoffIdentityMismatchIsTerminal(t *testing.T) {
+	now := func() time.Time { return time.Date(2026, 6, 22, 10, 0, 0, 0, time.UTC) }
+	m := metaWithEvidence(t, "id=late-alpha", "identity=id=late-beta\n")
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	// A mismatch must return promptly, not block until the deadline.
+	start := time.Now()
+	_, err := WaitForHandoffIdentity(ctx, m, now, 50*time.Millisecond)
+	if !errors.Is(err, ErrIdentityMismatch) {
+		t.Fatalf("err = %v, want ErrIdentityMismatch", err)
+	}
+	if time.Since(start) > time.Second {
+		t.Errorf("mismatch should be terminal, took %v", time.Since(start))
+	}
+}
+
+func TestWaitForHandoffIdentityBadInputs(t *testing.T) {
+	now := func() time.Time { return time.Date(2026, 6, 22, 10, 0, 0, 0, time.UTC) }
+	if _, err := WaitForHandoffIdentity(context.Background(), nil, now, time.Millisecond); err == nil {
+		t.Fatalf("nil metadata should error, not panic")
+	}
+
+	m := metaWithEvidence(t, "id=late-alpha", "") // evidence never written
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	start := time.Now()
+	_, err := WaitForHandoffIdentity(ctx, m, now, time.Second)
+	if !errors.Is(err, ErrEvidenceMissing) {
+		t.Fatalf("err = %v, want ErrEvidenceMissing", err)
+	}
+	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
+		t.Fatalf("canceled context waited for poll interval: %v", elapsed)
+	}
+}
 
 func TestParseHandoffEvidenceSuccess(t *testing.T) {
 	// R15's exact format: identity value itself contains '=', plus an expected

@@ -19,6 +19,7 @@ package runtime
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -244,6 +245,57 @@ func VerifyHandoffIdentity(meta *HandoffMeta, now time.Time) (HandoffEvidence, e
 		return ev, fmt.Errorf("%w: expected %q, observed %q", ErrIdentityMismatch, meta.ExpectedIdentity, ev.Identity)
 	default: // IdentityMissing (empty observed value despite a present key)
 		return ev, fmt.Errorf("%w: empty observed identity (expected %q)", ErrEvidenceMissing, meta.ExpectedIdentity)
+	}
+}
+
+// WaitForHandoffIdentity blocks until the handoff identity is verified, a
+// terminal failure occurs, or ctx is done, polling the evidence file every
+// interval. A missing or empty evidence file is retried (the late process may
+// not have written it yet); a mismatch or malformed file is terminal and returns
+// immediately. meta is updated in place with the final result via
+// VerifyHandoffIdentity, so meta.Status reflects the outcome. The now function
+// supplies VerifiedAt for each attempt (tests pass a fixed clock).
+//
+// On ctx expiry it returns the last attempt's evidence and an error wrapping
+// ErrEvidenceMissing that names the expected identity and the ctx cause, so a
+// timeout is reported as "evidence never arrived", not a generic deadline error.
+func WaitForHandoffIdentity(ctx context.Context, meta *HandoffMeta, now func() time.Time, interval time.Duration) (HandoffEvidence, error) {
+	if meta == nil {
+		return HandoffEvidence{}, errors.New("runtime: wait for handoff identity: nil metadata")
+	}
+	if now == nil {
+		now = time.Now
+	}
+	if interval <= 0 {
+		interval = 50 * time.Millisecond
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return HandoffEvidence{}, fmt.Errorf("%w: evidence did not arrive before deadline (expected %q): %v",
+				ErrEvidenceMissing, meta.ExpectedIdentity, err)
+		}
+		ev, err := VerifyHandoffIdentity(meta, now())
+		if err == nil {
+			return ev, nil
+		}
+		if !errors.Is(err, ErrEvidenceMissing) {
+			// Mismatch or malformed: present-but-wrong evidence is terminal; waiting
+			// longer cannot turn a wrong identity into the right one.
+			return ev, err
+		}
+		timer := time.NewTimer(interval)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return ev, fmt.Errorf("%w: evidence did not arrive before deadline (expected %q): %v",
+				ErrEvidenceMissing, meta.ExpectedIdentity, ctx.Err())
+		case <-timer.C:
+		}
 	}
 }
 

@@ -100,9 +100,9 @@ Short live run:
 KUBECONFIG=$HOME/.kube/config \
 MACVZ_INTEGRATION=1 \
 MACVZ_NODE=macvz-b-cri \
-MACVZ_CRI_OUT_DIR=/tmp/cri-inloop-20260623031334 \
-MACVZ_INLOOP_SOAK_ITERATIONS=3 \
-MACVZ_INLOOP_SOAK_INTERVAL=2 \
+MACVZ_CRI_OUT_DIR=/tmp/cri-inloop-20260623032551 \
+MACVZ_INLOOP_SOAK_ITERATIONS=30 \
+MACVZ_INLOOP_SOAK_INTERVAL=10 \
 MACVZ_HOST_AUDIT_CMD="ssh test@192.168.1.122 '/opt/homebrew/bin/container list --all'" \
 MACVZ_ADAPTER_RSS_CMD="ssh test@192.168.1.122 \"ps -axo rss,command | awk '/[m]acvz-cri --listen unix:\\/\\/\\/Users\\/test\\/macvz-cri-i5-test\\/service-default\\/macvz-cri.sock/ {print \\$1; exit}'\"" \
 MACVZ_RESTART_CRI_CMD="ssh test@192.168.1.122 'launchctl kickstart -k gui/501/io.macvz.cri.default'" \
@@ -113,7 +113,7 @@ Result:
 
 ```text
 PASS CRI-P9 in-loop suite: checks passed with 2 skipped hook-dependent phase(s)
-diagnostics: /tmp/cri-inloop-20260623031334
+diagnostics: /tmp/cri-inloop-20260623032551
 ```
 
 ### Build under test
@@ -153,9 +153,9 @@ diagnostics: /tmp/cri-inloop-20260623031334
 
 | Metric | Value |
 | --- | --- |
-| Duration / samples | short smoke / 3 samples |
-| First / last adapter RSS | `22688 KB` / `24608 KB` |
-| RSS growth (bound 64 MiB) | `1920 KB` |
+| Duration / samples | 30 samples at 10s interval |
+| First / last adapter RSS | `22720 KB` / `26752 KB` |
+| RSS growth (bound 64 MiB) | `4032 KB` |
 | Pod restartCount over soak | `0` |
 | Residual host workloads at end | `0` |
 

@@ -21,13 +21,15 @@ final class HelperRuntime: @unchecked Sendable {
     let image: String
     let workRoot: URL
     let logger: Logger
+    private var network: VmnetNetwork?
 
-    private init(vmm: VZVirtualMachineManager, imageStore: ImageStore, image: String, workRoot: URL, logger: Logger) {
+    private init(vmm: VZVirtualMachineManager, imageStore: ImageStore, image: String, workRoot: URL, logger: Logger, network: VmnetNetwork?) {
         self.vmm = vmm
         self.imageStore = imageStore
         self.image = image
         self.workRoot = workRoot
         self.logger = logger
+        self.network = network
     }
 
     static func bootstrap(
@@ -37,6 +39,7 @@ final class HelperRuntime: @unchecked Sendable {
         image: String,
         workDir: String,
         rosetta: Bool,
+        enableVmnet: Bool,
         logger: Logger
     ) async throws -> HelperRuntime {
         let fm = FileManager.default
@@ -61,7 +64,8 @@ final class HelperRuntime: @unchecked Sendable {
             rosetta: rosetta,
             logger: logger
         )
-        return HelperRuntime(vmm: vmm, imageStore: imageStore, image: image, workRoot: workRoot, logger: logger)
+        let network = enableVmnet ? try VmnetNetwork() : nil
+        return HelperRuntime(vmm: vmm, imageStore: imageStore, image: image, workRoot: workRoot, logger: logger, network: network)
     }
 
     private static func prepareInitfs(
@@ -86,6 +90,14 @@ final class HelperRuntime: @unchecked Sendable {
         let baseImage = try await imageStore.get(reference: image, pull: true)
         let unpacker = EXT4Unpacker(blockSizeInBytes: 2 * 1024 * 1024 * 1024)
         return try await unpacker.unpack(baseImage, for: .current, at: url)
+    }
+
+    func createPodInterface(_ id: String) throws -> Interface? {
+        try network?.createInterface(id)
+    }
+
+    func releasePodInterface(_ id: String) {
+        try? network?.releaseInterface(id)
     }
 }
 

@@ -83,14 +83,17 @@ final class ContainerState {
 final class PodState {
     let id: String
     let pod: LinuxPod
+    let interfaceID: String?
     let holderName = "holder"
     var phase = "Running"
     var sandboxNamespace: String
-    var sandboxAddress = ""
+    var sandboxAddress: String
     var containers: [String: ContainerState] = [:]
-    init(id: String, pod: LinuxPod) {
+    init(id: String, pod: LinuxPod, sandboxAddress: String, interfaceID: String?) {
         self.id = id
         self.pod = pod
+        self.sandboxAddress = sandboxAddress
+        self.interfaceID = interfaceID
         // Placeholder until a container reports the VM's real net namespace inode;
         // stable and non-empty so CreatePod can return it immediately.
         self.sandboxNamespace = "linuxpod-ns-\(id)"
@@ -203,11 +206,23 @@ actor LinuxPodBackend {
         let podDir = runtime.workRoot.appendingPathComponent(id)
         try FileManager.default.createDirectory(at: podDir, withIntermediateDirectories: true)
         let holderRootfs = try await runtime.unpackRootfs(at: podDir.appendingPathComponent("holder.ext4"))
+        let podInterface = try runtime.createPodInterface(id)
+        let sandboxAddress = podInterface?.ipv4Address.address.description ?? ""
+        let interfaceID = podInterface == nil ? nil : id
+        var releaseInterfaceOnFailure = interfaceID != nil
+        defer {
+            if releaseInterfaceOnFailure {
+                runtime.releasePodInterface(id)
+            }
+        }
 
         let pod = try LinuxPod(id, vmm: runtime.vmm, logger: logger) { config in
             config.cpus = cpus
             config.memoryInBytes = memoryBytes
             config.hostname = hostname
+            if let podInterface {
+                config.interfaces = [podInterface]
+            }
             config.bootLog = .file(path: podDir.appendingPathComponent("boot.log"))
         }
         // A long-lived holder keeps the VM (and its shared namespace) up so late
@@ -233,8 +248,9 @@ actor LinuxPodBackend {
             throw BackendError(code: "Internal", message: "create pod \(id): \(error)")
         }
 
-        let state = PodState(id: id, pod: pod)
+        let state = PodState(id: id, pod: pod, sandboxAddress: sandboxAddress, interfaceID: interfaceID)
         pods[id] = state
+        releaseInterfaceOnFailure = false
         return [
             "id": id, "phase": state.phase,
             "sandboxNamespace": state.sandboxNamespace, "sandboxAddress": state.sandboxAddress,
@@ -556,6 +572,9 @@ actor LinuxPodBackend {
         }
         try? await pod.pod.stopContainer("holder")
         try? await pod.pod.stop()
+        if let interfaceID = pod.interfaceID {
+            runtime.releasePodInterface(interfaceID)
+        }
         try? FileManager.default.removeItem(at: runtime.workRoot.appendingPathComponent(podID))
         pods.removeValue(forKey: podID)
         return ["podID": podID, "removedContainers": removedContainers,

@@ -23,9 +23,9 @@ late-rootfs identity primitive (`Ping` reports `simulated:false`).
   - `Server.swift` — async unix-socket NDJSON server (one JSON request/response per
     line) that bridges blocking accept/read/write to async and routes each line to
     the actor.
-  - `Primitives.swift` — ported R9 transport: VM/image-store bootstrap, the vminitd
-    `Copy(COPY_IN/COPY_OUT)` host↔guest primitive, vsock capture, and a CRI-format
-    log writer.
+  - `Primitives.swift` — ported R9 transport: VM/image-store bootstrap, optional
+    `VmnetNetwork` Pod interface allocation, the vminitd `Copy(COPY_IN/COPY_OUT)`
+    host↔guest primitive, vsock capture, and a CRI-format log writer.
   - `Backend.swift` — the `LinuxPodBackend` actor implementing all 13 protocol ops
     over a real `LinuxPod` + the late-rootfs primitive, with identity-gated Running.
 - **Stub retained** (`test/e2e/cri-linuxpod-helper`, `LinuxPodHelperStub`) for
@@ -46,8 +46,8 @@ handoff evidence channel (CRI-R16), never by the guest trusting itself.
 | Op | Real implementation |
 |----|---------------------|
 | `Ping` | `{name: linuxpod-helper, protocolVersion: 3, simulated: false, capabilities:{logs/exec/stats:false}}` |
-| `CreatePod` | unpack a holder rootfs; `LinuxPod(...).create()`; `startContainer(holder)` so the VM + its shared namespace stay up |
-| `PodStatus` | report the Pod VM phase + shared namespace (+ `sandboxAddress` reserved for CRI-L3) |
+| `CreatePod` | unpack a holder rootfs; optionally allocate a vmnet interface when started with `--vmnet`; `LinuxPod(...).create()`; `startContainer(holder)` so the VM + its shared namespace stay up |
+| `PodStatus` | report the Pod VM phase + shared namespace (+ `sandboxAddress` when `--vmnet` allocated a Pod interface) |
 | `PrepareContainerRootfs` | stage a minimal busybox rootfs into the running VM (copy busybox/lib out of the holder, stage `/etc/macvz-container-identity` = ExpectedIdentity, Copy the prepared rootfs + a writable evidence dir into the guest) — the R9 late-rootfs primitive |
 | `CreateContainer` | `vminitd.createProcess` bound to the staged rootfs; `createdAfterPodRunning` is true when another app/sidecar is already Running (the late-sidecar case) — does **not** start |
 | `StartContainer` | `vminitd.startProcess`; bounded-wait reads the identity evidence the process wrote to the handoff channel back to the host and compares to ExpectedIdentity. Match → Running + `identityVerified`; mismatch/timeout → delete the process, return `ErrIdentityUnverified`, never Running |
@@ -93,7 +93,9 @@ evidence), `Unsupported` (kubelet surfaces, #129), `Internal` (VM/transport faul
   CreatePod → app prepare/create/start → **late** sidecar prepare/create (after the
   app is running) /start → assert shared namespace + localhost + identity verified →
   Cleanup leaves no residual (and is idempotent). It also asserts the kubelet
-  surfaces return `ErrUnsupported`.
+  surfaces return `ErrUnsupported`. With `MACVZ_LINUXPOD_REAL_HELPER_VMNET=1`, the
+  same test starts the helper with `--vmnet` and requires CreatePod to report a
+  non-empty `sandboxAddress`.
 
 ## Build / run
 
@@ -164,7 +166,8 @@ cached in the default store → busted before the passing run.
 ## Non-goals (honored)
 
 - No kubelet CRI serving wiring (CRI-L2).
-- No Pod IP routing/Services (CRI-L3; `SandboxAddress` is reserved but unset here).
+- No Pod IP routing/Services (CRI-L3 owns host route/pf/IPAM attach; this helper
+  only reports the Pod VM address when explicitly started with `--vmnet`).
 - No change to the shipped Virtual Kubelet or apple/container CLI path.
 - Kubelet log/exec/stats surfaces left to CRI-L4 (#129); advertised false, honest
   `Unsupported`.

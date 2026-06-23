@@ -18,7 +18,9 @@ import (
 // starts a sidecar *after* the app is already running, gating each on rootfs
 // identity verification through the handoff evidence channel (CRI-R16). It asserts
 // the app and sidecar share one Pod sandbox namespace, both reach localhost, the
-// late identity handoff verifies, and Cleanup leaves no residual state.
+// late identity handoff verifies, and Cleanup leaves no residual state. When
+// MACVZ_LINUXPOD_REAL_HELPER_VMNET=1 is also set, it starts the helper with
+// --vmnet and requires CreatePod to report a sandboxAddress for CRI pod networking.
 //
 // Gated behind MACVZ_LINUXPOD_REAL_HELPER=1 because it boots real VMs and needs the
 // operator-provided Apple Containerization checkout (test/e2e/cri-linuxpod/
@@ -47,6 +49,10 @@ func TestRealLinuxPodHelperLifecycle(t *testing.T) {
 	args := []string{"--socket", socket, "--kernel", kernel, "--work-dir", workDir}
 	if root := os.Getenv("MACVZ_CONTAINERIZATION_ROOT"); root != "" {
 		args = append(args, "--containerization-root", root)
+	}
+	requireVmnet := os.Getenv("MACVZ_LINUXPOD_REAL_HELPER_VMNET") == "1"
+	if requireVmnet {
+		args = append(args, "--vmnet")
 	}
 	cmd := exec.CommandContext(procCtx, bin, args...)
 	cmd.Stderr = os.Stderr
@@ -89,6 +95,9 @@ func TestRealLinuxPodHelperLifecycle(t *testing.T) {
 	}
 	if pod.Phase != "Running" || pod.SandboxNamespace == "" {
 		t.Fatalf("pod not running with a namespace: %+v", pod)
+	}
+	if requireVmnet && pod.SandboxAddress == "" {
+		t.Fatalf("vmnet helper did not report sandboxAddress: %+v", pod)
 	}
 	defer func() {
 		ctx, cancel := call(3 * time.Minute)

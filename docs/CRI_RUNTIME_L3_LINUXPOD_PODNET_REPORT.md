@@ -60,6 +60,13 @@ Two things are new; everything else is reused:
   bumped 2 → 3; the Swift helper stub
   ([main.swift](../test/e2e/cri-linuxpod-helper/Sources/LinuxPodHelperStub/main.swift))
   mirrors the op and field.
+- The real Swift `linuxpod-helper`
+  ([test/e2e/cri-linuxpod/Sources/LinuxPodHelper](../test/e2e/cri-linuxpod/Sources/LinuxPodHelper))
+  now supports an explicit `--vmnet` flag. When enabled, `CreatePod` allocates one
+  `VmnetNetwork` interface for the Pod, attaches it to the `LinuxPod`
+  configuration, reports the interface IPv4 as `sandboxAddress`, and releases the
+  interface during `Cleanup` or create failure. The default remains off so ordinary
+  helper runs do not allocate vmnet interfaces.
 
 ### 2. Integration: LinuxPod Pod networking ([linuxpod_network.go](../pkg/criserver/linuxpod_network.go))
 
@@ -126,6 +133,10 @@ keeps #128 open until captured):
   state) require a real LinuxPod helper + the local `192.168.1.122` or two-host
   topology. The hermetic suite proves the control flow, IPAM lifecycle, status
   reporting, and default-route safety; live reachability is the remaining gate.
+- For live `SandboxAddress` validation without changing the default helper mode:
+  `MACVZ_LINUXPOD_REAL_HELPER=1 MACVZ_LINUXPOD_REAL_HELPER_VMNET=1 go test ./pkg/runtime/linuxpod -run TestRealLinuxPodHelperLifecycle -count=1`.
+  The test starts `linuxpod-helper --vmnet` and fails if `CreatePod` reports an
+  empty `sandboxAddress`.
 
 ## Non-goals honored
 

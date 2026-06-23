@@ -56,6 +56,9 @@ struct LinuxPodHelper: AsyncParsableCommand {
     @Flag(help: "Enable Rosetta for linux/amd64 images.")
     var rosetta = false
 
+    @Flag(help: "Attach a vmnet interface to each Pod and report its IPv4 as sandboxAddress.")
+    var vmnet = false
+
     func run() async throws {
         LoggingSystem.bootstrap(StreamLogHandler.standardError)
         let logger = Logger(label: "macvz.linuxpod-helper")
@@ -67,6 +70,7 @@ struct LinuxPodHelper: AsyncParsableCommand {
             image: image,
             workDir: workDir,
             rosetta: rosetta,
+            enableVmnet: vmnet,
             logger: logger
         )
         let backend = LinuxPodBackend(runtime: runtime, logger: logger)

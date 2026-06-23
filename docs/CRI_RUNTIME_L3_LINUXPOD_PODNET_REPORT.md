@@ -141,6 +141,16 @@ keeps #128 open until captured):
   helper with `MACVZ_CONTAINERIZATION_ROOT` pointed at the checked-in
   `containerization/bin/initfs.ext4` fallback; `sandboxAddress` was `192.168.66.2`
   and route audit before/after stayed on global default `192.168.1.1` via `en0`.
+- Captured on `test@192.168.1.122`: `TestLiveLinuxPodServingThroughHelper` passed
+  with `MACVZ_LINUXPOD_PODNET=1`,
+  `MACVZ_LINUXPOD_POD_CIDR=10.244.102.0/24`,
+  `MACVZ_LINUXPOD_PODNET_IFACE=bridge100`,
+  `MACVZ_LINUXPOD_PODNET_HELPER_SOCKET=/var/run/macvz-netd.sock`,
+  ingress `en0`, and forwarding enabled. The live CRI path reported
+  `NetworkReady=true`, assigned Pod IP `10.244.102.2`, attached
+  `pod=default/pod podIP=10.244.102.2 vmIP=192.168.66.2 interface=bridge101`,
+  detached on cleanup, stopped the `macvz/pods` anchor, and preserved the global
+  default route (`192.168.1.1` via `en0`).
 
 ## Non-goals honored
 

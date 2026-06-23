@@ -72,12 +72,14 @@ func TestLiveLinuxPodServingThroughHelper(t *testing.T) {
 	}
 	sandboxes, _, _ := store.New("")
 	containers, _, _ := store.NewContainerStore("")
+	pn := liveLinuxPodPodNetConfig(t)
 	serveErr := make(chan error, 1)
 	go func() {
-		// Pod networking off (podNetConfig{}): this smoke proves the lifecycle
-		// serving chain, not #128 networking, so sandboxes run without a Pod IP.
+		// Pod networking is off by default: this smoke proves the lifecycle serving
+		// chain without touching pf/route. Set MACVZ_LINUXPOD_PODNET=1 to include
+		// the #128 podnet attach path in a live, operator-controlled environment.
 		serveErr <- serveLinuxPod(ctx, lis, criSock, sandboxes, containers,
-			podNetConfig{}, linuxpodConfig{enabled: true, helperSocket: helperSock})
+			pn, linuxpodConfig{enabled: true, helperSocket: helperSock})
 	}()
 	waitForFile(t, criSock)
 
@@ -98,6 +100,30 @@ func TestLiveLinuxPodServingThroughHelper(t *testing.T) {
 		t.Fatalf("RunPodSandbox: %v", err)
 	}
 	sandboxID := sb.GetPodSandboxId()
+	if pn.enabled() {
+		st, err := rt.Status(ctx, &runtimeapi.StatusRequest{Verbose: true})
+		if err != nil {
+			t.Fatalf("Status: %v", err)
+		}
+		var networkReady bool
+		for _, cond := range st.GetStatus().GetConditions() {
+			if cond.GetType() == "NetworkReady" {
+				networkReady = cond.GetStatus()
+			}
+		}
+		if !networkReady {
+			t.Fatalf("NetworkReady=false with podnet enabled: %+v", st.GetStatus().GetConditions())
+		}
+		sbStatus, err := rt.PodSandboxStatus(ctx, &runtimeapi.PodSandboxStatusRequest{PodSandboxId: sandboxID, Verbose: true})
+		if err != nil {
+			t.Fatalf("PodSandboxStatus: %v", err)
+		}
+		if ip := sbStatus.GetStatus().GetNetwork().GetIp(); ip == "" {
+			t.Fatalf("podnet enabled but PodSandboxStatus has empty IP: %+v", sbStatus.GetStatus())
+		} else {
+			t.Logf("LIVE EVIDENCE: podnet assigned Pod IP %s to sandbox %s", ip, sandboxID)
+		}
+	}
 
 	start := func(name string) string {
 		c, err := rt.CreateContainer(ctx, &runtimeapi.CreateContainerRequest{
@@ -151,6 +177,29 @@ func TestLiveLinuxPodServingThroughHelper(t *testing.T) {
 	case <-serveErr:
 	case <-time.After(5 * time.Second):
 	}
+}
+
+func liveLinuxPodPodNetConfig(t *testing.T) podNetConfig {
+	t.Helper()
+	if os.Getenv("MACVZ_LINUXPOD_PODNET") != "1" {
+		return podNetConfig{}
+	}
+	pn := podNetConfig{
+		podCIDR:          os.Getenv("MACVZ_LINUXPOD_POD_CIDR"),
+		iface:            os.Getenv("MACVZ_LINUXPOD_PODNET_IFACE"),
+		meshInterface:    os.Getenv("MACVZ_LINUXPOD_PODNET_MESH_IFACE"),
+		helperSocket:     os.Getenv("MACVZ_LINUXPOD_PODNET_HELPER_SOCKET"),
+		enableForwarding: os.Getenv("MACVZ_LINUXPOD_PODNET_ENABLE_FORWARDING") == "1",
+	}
+	for _, iface := range strings.Fields(os.Getenv("MACVZ_LINUXPOD_PODNET_INGRESS_IFACES")) {
+		pn.ingressInterfaces = append(pn.ingressInterfaces, iface)
+	}
+	if pn.podCIDR == "" || pn.iface == "" {
+		t.Fatalf("MACVZ_LINUXPOD_PODNET=1 requires MACVZ_LINUXPOD_POD_CIDR and MACVZ_LINUXPOD_PODNET_IFACE")
+	}
+	t.Logf("LIVE EVIDENCE: podnet enabled cidr=%s iface=%s helper=%s ingress=%v forwarding=%v",
+		pn.podCIDR, pn.iface, pn.helperSocket, []string(pn.ingressInterfaces), pn.enableForwarding)
+	return pn
 }
 
 func buildSwiftHelperForServing(t *testing.T) string {

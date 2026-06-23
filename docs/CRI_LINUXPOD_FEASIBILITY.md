@@ -604,6 +604,42 @@ Decision: no new probe is needed before implementation. The next work can split
 into runtime handoff lifecycle implementation, OCI bind mount injection, and
 gated R15-derived integration coverage.
 
+### R17: LinuxPod Late-Rootfs Runtime Backend Prototype (#124)
+
+R17 completed on 2026-06-23. The report is
+[CRI_RUNTIME_R17_LINUXPOD_BACKEND_REPORT.md](CRI_RUNTIME_R17_LINUXPOD_BACKEND_REPORT.md).
+
+Result: the LinuxPod sandbox primitive (C1/C2/C4) and the R15/R16 late-rootfs
+handoff identity primitive are now expressed as the **smallest callable backend
+contract** for Go `macvz-cri`, realizing the prototype scope of **C5** (Swift
+helper daemon) and **C6** (experimental backend gate) below:
+
+- **Contract** (`pkg/runtime/linuxpod.Backend`): `Ping`, `CreatePod`,
+  `PrepareContainerRootfs` (the late-rootfs primitive), `CreateContainer`,
+  `StartContainer` (identity-gated), `StopContainer`, `RemoveContainer`,
+  `Status`, `Cleanup` — a MacVz-owned, narrow NDJSON protocol; the kubelet-facing
+  boundary stays Go, no CRI server in Swift (C5 constraints honored).
+- **Swift helper stub** (`test/e2e/cri-linuxpod-helper`): serves the protocol over
+  a unix socket with an in-memory model mirroring the Go `FakeBackend`; boots no
+  VM (`simulated=true`). The seam a real Apple Containerization LinuxPod helper
+  grows from.
+- **Gate** (`macvz-cri --experimental-linuxpod-backend --linuxpod-helper-socket`):
+  off by default, loud startup handshake, apple/container serving path untouched
+  (C6 constraints honored).
+
+The required kubelet ordering is proven hermetically and across the Go↔Swift
+boundary: `CreatePod → app create/start → late sidecar create/start (after the app
+is running) → shared sandbox namespace → localhost reachable → sidecar
+identityVerified → stop/remove both orderings → cleanup leaves no stale state`. The
+C2 ordering limitation (containers known before `pod.create()` for shared-namespace
+on the upstream API) is represented honestly in the contract via the explicit
+`PrepareContainerRootfs` late-rootfs step rather than assumed away.
+
+The observed outcome is `linuxpodBackendContractPrototyped`. Still **not**
+production-ready: no k3s in-loop (**C7** remains future work), no Service/DNS/Pod-IP
+or `Attach`/`PortForward`, and the real LinuxPod-backed helper still has to replace
+the stub's in-memory model.
+
 ### C5: Swift Helper Daemon Prototype
 
 Only if R0 later selects a LinuxPod-based bridge as a valid runtime building

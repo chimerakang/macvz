@@ -21,6 +21,7 @@ go.work.sum
 /test/e2e/two-node/generated/
 /test/e2e/cri-linuxpod/.build/
 /test/e2e/cri-linuxpod/containerization/
+/test/e2e/cri-linuxpod-helper/.build/
 
 # Env & secrets
 .env

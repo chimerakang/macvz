@@ -109,6 +109,8 @@ func main() {
 		multiContainer  bool
 		handoff         bool
 		handoffRoot     string
+		linuxpodBackend bool
+		linuxpodSocket  string
 		pn              podNetConfig
 	)
 	flag.StringVar(&listen, "listen", defaultListen,
@@ -145,6 +147,10 @@ func main() {
 		"opt into the experimental LinuxPod runtime handoff path (CRI-I, #109..#120): CreateContainer prepares a runtime-private per-container rootfs/handoff subtree and StartContainer gates Running on handoff identity verification; off by default, experimental (not production-ready), and unrelated to the shipped Virtual Kubelet runtime (docs/CRI_EXPERIMENTAL_HANDOFF_OPERATOR.md)")
 	flag.StringVar(&handoffRoot, "handoff-root", "",
 		"root directory for the experimental handoff subtree when --experimental-handoff is set (empty uses the production /run/macvz/containers, which is not writable on macOS; point this at a writable per-user dir to exercise the path locally)")
+	flag.BoolVar(&linuxpodBackend, "experimental-linuxpod-backend", false,
+		"opt into the experimental LinuxPod late-rootfs runtime backend prototype (CRI-R17, #124): connect to a LinuxPod helper over --linuxpod-helper-socket and verify the backend contract at startup; off by default, experimental (not production-ready), and does not replace the shipped apple/container CRI serving path (docs/CRI_RUNTIME_R17_LINUXPOD_BACKEND_REPORT.md)")
+	flag.StringVar(&linuxpodSocket, "linuxpod-helper-socket", "",
+		"unix socket of the LinuxPod helper that speaks the pkg/runtime/linuxpod NDJSON contract (required with --experimental-linuxpod-backend)")
 	flag.BoolVar(&showVersion, "version", false, "print version and exit")
 
 	klog.InitFlags(nil)
@@ -176,6 +182,20 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	// Experimental LinuxPod backend gate (CRI-R17): when enabled, handshake with the
+	// helper before serving so an unreachable/misconfigured helper fails loudly here
+	// rather than mid-Pod. The shipped apple/container serving path is unchanged.
+	lc := linuxpodConfig{enabled: linuxpodBackend, helperSocket: linuxpodSocket}
+	if info, ok, err := lc.handshake(ctx); err != nil {
+		klog.ErrorS(err, "macvz-cri exited with error")
+		klog.Flush()
+		os.Exit(1)
+	} else if ok {
+		klog.InfoS("experimental LinuxPod backend handshake succeeded (prototype; CRI serving stays on apple/container)",
+			"helper", info.Name, "protocolVersion", info.ProtocolVersion, "simulated", info.Simulated,
+			"socket", linuxpodSocket)
+	}
 
 	if err := run(ctx, listen, stateDir, runtimeBinary, rosetta, streamingAddr, pn, mc, multiContainer, hc); err != nil {
 		klog.ErrorS(err, "macvz-cri exited with error")

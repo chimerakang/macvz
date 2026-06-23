@@ -81,6 +81,12 @@ type Container struct {
 	// WorkloadID via runtime.HandoffManager, so nothing host-specific is persisted.
 	// False for the default apple/container path, which prepares no handoff.
 	HandoffPrepared bool           `json:"handoffPrepared,omitempty"`
+	// LinuxPod carries the experimental LinuxPod-backed CRI mapping (CRI-L2, #127):
+	// how this CRI container maps onto a container inside a LinuxPod sandbox VM. It
+	// is nil for the default apple/container path. Persisted so a restarted adapter
+	// can reconcile and report the same backend container, rootfs, and identity
+	// without trusting stale identity evidence.
+	LinuxPod *LinuxPodContainer `json:"linuxPod,omitempty"`
 	State            ContainerState `json:"state"`
 	CreatedAt        int64          `json:"createdAt"`            // unix nanoseconds
 	StartedAt        int64          `json:"startedAt,omitempty"`  // unix nanoseconds
@@ -88,6 +94,25 @@ type Container struct {
 	ExitCode         int32          `json:"exitCode,omitempty"`
 	Reason           string         `json:"reason,omitempty"`
 	Message          string         `json:"message,omitempty"`
+}
+
+// LinuxPodContainer is the experimental LinuxPod-backed CRI mapping for one
+// container (CRI-L2, #127). It records how a CRI container maps onto a container
+// inside a LinuxPod sandbox VM: the backend's container id, the prepared-rootfs
+// token, the expected/observed rootfs identity, and whether identity verified at
+// start. The backend pod id is the owning CRI sandbox id, so it is not duplicated
+// here. Nil on the default apple/container path.
+type LinuxPodContainer struct {
+	// BackendContainerID is the id the LinuxPod backend assigned this container.
+	BackendContainerID string `json:"backendContainerID"`
+	// RootfsToken is the PrepareContainerRootfs handle the container was bound to.
+	RootfsToken string `json:"rootfsToken,omitempty"`
+	// ExpectedIdentity is the rootfs identity staged at prepare time and required at
+	// start. ObservedIdentity is what the late process reported; IdentityVerified is
+	// true only when they matched exactly (CRI-R16).
+	ExpectedIdentity string `json:"expectedIdentity,omitempty"`
+	ObservedIdentity string `json:"observedIdentity,omitempty"`
+	IdentityVerified bool   `json:"identityVerified,omitempty"`
 }
 
 // Mount is a persisted filesystem mount realized for a container (CRI-P7, #79).
@@ -283,6 +308,10 @@ func cloneContainer(c *Container) Container {
 	cp.Annotations = cloneStringMap(c.Annotations)
 	if c.Mounts != nil {
 		cp.Mounts = append([]Mount(nil), c.Mounts...)
+	}
+	if c.LinuxPod != nil {
+		lp := *c.LinuxPod
+		cp.LinuxPod = &lp
 	}
 	return cp
 }

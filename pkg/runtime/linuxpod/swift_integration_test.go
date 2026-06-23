@@ -2,10 +2,12 @@ package linuxpod
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
@@ -57,6 +59,36 @@ func TestSwiftHelperStubContract(t *testing.T) {
 	app, sidecar, cleanup := orderingProbe(t, client)
 	defer cleanup()
 	assertSharedNamespaceAndIdentity(t, app, sidecar)
+
+	// Prove the Swift stub implements the CRI-L4 kubelet surfaces (#129) over the
+	// same socket: capabilities in Ping, exec on a running container, and stats
+	// flagged simulated. The ordering probe creates containers without a log path,
+	// so ContainerLogPath is expected to be an honest ErrInvalid here; the log-file
+	// path itself is covered hermetically by the Go fake tests.
+	info, err := client.Ping(ctx)
+	if err != nil {
+		t.Fatalf("Ping: %v", err)
+	}
+	if !info.Capabilities.Logs || !info.Capabilities.Exec || !info.Capabilities.Stats {
+		t.Errorf("swift stub should advertise all surfaces, got %+v", info.Capabilities)
+	}
+	res, err := client.ExecSync(ctx, ExecRequest{PodID: app.PodID, ContainerID: app.ID, Command: []string{"echo", "ok"}})
+	if err != nil {
+		t.Fatalf("ExecSync over swift stub: %v", err)
+	}
+	if res.ExitCode != 0 || !strings.Contains(string(res.Stdout), "echo ok") {
+		t.Errorf("swift exec stdout did not round-trip: %+v", res)
+	}
+	stats, err := client.ContainerStats(ctx, Ref{PodID: app.PodID, ContainerID: app.ID})
+	if err != nil {
+		t.Fatalf("ContainerStats over swift stub: %v", err)
+	}
+	if !stats.Simulated {
+		t.Errorf("swift stub stats must be flagged simulated: %+v", stats)
+	}
+	if _, err := client.ContainerLogPath(ctx, Ref{PodID: app.PodID, ContainerID: app.ID}); !errors.Is(err, ErrInvalid) {
+		t.Errorf("ContainerLogPath without a log path = %v, want ErrInvalid", err)
+	}
 }
 
 // buildSwiftHelper builds the stub and returns its binary path.

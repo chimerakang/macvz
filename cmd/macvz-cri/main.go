@@ -192,12 +192,13 @@ func main() {
 		klog.Flush()
 		os.Exit(1)
 	} else if ok {
-		klog.InfoS("experimental LinuxPod backend handshake succeeded (prototype; CRI serving stays on apple/container)",
+		klog.InfoS("experimental LinuxPod backend handshake succeeded; CRI serving will use LinuxPod backend",
 			"helper", info.Name, "protocolVersion", info.ProtocolVersion, "simulated", info.Simulated,
+			"capLogs", info.Capabilities.Logs, "capExec", info.Capabilities.Exec, "capStats", info.Capabilities.Stats,
 			"socket", linuxpodSocket)
 	}
 
-	if err := run(ctx, listen, stateDir, runtimeBinary, rosetta, streamingAddr, pn, mc, multiContainer, hc); err != nil {
+	if err := run(ctx, listen, stateDir, runtimeBinary, rosetta, streamingAddr, pn, mc, multiContainer, hc, lc); err != nil {
 		klog.ErrorS(err, "macvz-cri exited with error")
 		klog.Flush()
 		os.Exit(1)
@@ -205,7 +206,7 @@ func main() {
 	klog.Flush()
 }
 
-func run(ctx context.Context, listen, stateDir, runtimeBinary string, rosetta bool, streamingAddr string, pn podNetConfig, mc mountConfig, multiContainer bool, hc handoffConfig) error {
+func run(ctx context.Context, listen, stateDir, runtimeBinary string, rosetta bool, streamingAddr string, pn podNetConfig, mc mountConfig, multiContainer bool, hc handoffConfig, lc linuxpodConfig) error {
 	socketPath, err := socketPath(listen)
 	if err != nil {
 		return err
@@ -246,6 +247,14 @@ func run(ctx context.Context, listen, stateDir, runtimeBinary string, rosetta bo
 	}
 	// Best-effort cleanup so we do not leave a dangling socket behind.
 	defer func() { _ = os.Remove(socketPath) }()
+
+	// Experimental LinuxPod backend serving (CRI-L2, #127): when the gate is on,
+	// serve the CRI lifecycle through the LinuxPod helper instead of the default
+	// apple/container path. This is a SEPARATE service; the apple/container path
+	// below is untouched and unreachable in this mode.
+	if lc.enabled {
+		return serveLinuxPod(ctx, lis, socketPath, sandboxes, containers, pn, lc)
+	}
 
 	driver := container.New(container.Config{Binary: runtimeBinary, Rosetta: rosetta})
 

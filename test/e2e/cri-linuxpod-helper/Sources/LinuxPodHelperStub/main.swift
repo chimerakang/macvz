@@ -12,18 +12,29 @@ import Foundation
 //
 // Usage: linuxpod-helper-stub --socket /path/to/helper.sock
 
-let protocolVersion = 1
+let protocolVersion = 3
+
+// Capabilities advertised in Ping. The stub backs all three kubelet surfaces
+// (logs, exec, stats) in simulated form, matching the Go FakeBackend (CRI-L4, #129).
+// Held in an enum namespace (not top-level code) so it is a nonisolated Sendable
+// global: top-level `let` in main.swift is @MainActor-isolated under Swift 6,
+// which the nonisolated lifecycle methods below cannot reference.
+enum Capabilities {
+    static let all: [String: Bool] = ["logs": true, "exec": true, "stats": true]
+}
 
 // MARK: - In-memory lifecycle model (mirrors the Go FakeBackend)
 
 final class Pod {
     let id: String
     let namespace: String
+    let sandboxAddress: String
     var phase: String = "Running"
     var containers: [String: Container] = [:]
-    init(id: String) {
+    init(id: String, sandboxAddress: String) {
         self.id = id
         self.namespace = "linuxpod-ns-\(id)"
+        self.sandboxAddress = sandboxAddress
     }
 }
 
@@ -49,6 +60,7 @@ final class Container {
     let podID: String
     let rootfsToken: String
     let expectedIdentity: String
+    let logPath: String
     var phase: String = "Created"
     var exitCode = 0
     var message = ""
@@ -56,12 +68,13 @@ final class Container {
     var identityVerified = false
     let createdAfterPodRunning: Bool
     init(id: String, name: String, podID: String, rootfsToken: String,
-         expectedIdentity: String, createdAfterPodRunning: Bool) {
+         expectedIdentity: String, logPath: String, createdAfterPodRunning: Bool) {
         self.id = id
         self.name = name
         self.podID = podID
         self.rootfsToken = rootfsToken
         self.expectedIdentity = expectedIdentity
+        self.logPath = logPath
         self.createdAfterPodRunning = createdAfterPodRunning
     }
 }
@@ -83,7 +96,29 @@ final class Model {
     private func next() -> Int { seq += 1; return seq }
 
     func ping() -> [String: Any] {
-        ["name": "linuxpod-helper-stub", "protocolVersion": protocolVersion, "simulated": true]
+        ["name": "linuxpod-helper-stub", "protocolVersion": protocolVersion,
+         "simulated": true, "capabilities": Capabilities.all]
+    }
+
+    // appendCRILog writes one CRI-format log line ("<rfc3339nano> <stream> F <msg>")
+    // for a container that has a kubelet log path. Best-effort: a write failure is
+    // ignored so it cannot wedge a lifecycle op, matching the Go FakeBackend.
+    private func appendCRILog(_ c: Container, _ stream: String, _ msg: String) {
+        guard !c.logPath.isEmpty else { return }
+        let url = URL(fileURLWithPath: c.logPath)
+        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
+                                                  withIntermediateDirectories: true)
+        let fmt = ISO8601DateFormatter()
+        fmt.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let line = "\(fmt.string(from: Date())) \(stream) F \(msg)\n"
+        guard let data = line.data(using: .utf8) else { return }
+        if let handle = try? FileHandle(forWritingTo: url) {
+            handle.seekToEndOfFile()
+            handle.write(data)
+            try? handle.close()
+        } else {
+            try? data.write(to: url)
+        }
     }
 
     func createPod(_ p: [String: Any]) throws -> [String: Any] {
@@ -93,9 +128,25 @@ final class Model {
         if pods[id] != nil {
             throw BackendError(code: "Invalid", message: "pod \(id) already exists")
         }
-        let pod = Pod(id: id)
+        // Deterministic, plausible host-only address so a client reading it sees an
+        // IP-shaped value (CRI-L3, #128). A production helper returns the VM's actual
+        // vmnet address once acquired. The stub has it ready immediately.
+        let pod = Pod(id: id, sandboxAddress: "192.168.66.\((next() % 253) + 2)")
         pods[id] = pod
-        return ["id": id, "phase": pod.phase, "sandboxNamespace": pod.namespace]
+        return podStatus(pod)
+    }
+
+    func podStatusOf(_ p: [String: Any]) throws -> [String: Any] {
+        let podID = (p["podID"] as? String) ?? ""
+        guard let pod = pods[podID] else {
+            throw BackendError(code: "PodNotFound", message: podID)
+        }
+        return podStatus(pod)
+    }
+
+    private func podStatus(_ pod: Pod) -> [String: Any] {
+        ["id": pod.id, "phase": pod.phase, "sandboxNamespace": pod.namespace,
+         "sandboxAddress": pod.sandboxAddress]
     }
 
     func prepareRootfs(_ p: [String: Any]) throws -> [String: Any] {
@@ -137,11 +188,13 @@ final class Model {
             throw BackendError(code: "Invalid", message: "container \(name) already exists in pod \(podID)")
         }
         rf.bound = true
+        let logPath = (p["logPath"] as? String) ?? ""
         let podHasRunning = pod.containers.values.contains { $0.phase == "Running" }
         let c = Container(id: "\(podID)/\(name)-\(next())", name: name, podID: podID,
                           rootfsToken: token, expectedIdentity: rf.expectedIdentity,
-                          createdAfterPodRunning: podHasRunning)
+                          logPath: logPath, createdAfterPodRunning: podHasRunning)
         pod.containers[c.id] = c
+        appendCRILog(c, "stdout", "container created (simulated LinuxPod backend; no real stdout)")
         return status(pod, c)
     }
 
@@ -165,7 +218,53 @@ final class Model {
         c.phase = "Running"
         c.identityVerified = true
         c.message = ""
+        appendCRILog(c, "stdout", "container started (identity verified)")
         return status(pod, c)
+    }
+
+    func containerLogPath(_ p: [String: Any]) throws -> [String: Any] {
+        guard Capabilities.all["logs"] == true else {
+            throw BackendError(code: "Unsupported", message: "logs")
+        }
+        let (_, c) = try lookup(p)
+        if c.logPath.isEmpty {
+            throw BackendError(code: "Invalid", message: "container \(c.id) was created without a log path")
+        }
+        return ["podID": c.podID, "containerID": c.id, "path": c.logPath, "format": "cri"]
+    }
+
+    func execSync(_ p: [String: Any]) throws -> [String: Any] {
+        guard Capabilities.all["exec"] == true else {
+            throw BackendError(code: "Unsupported", message: "exec")
+        }
+        let (_, c) = try lookup(p)
+        let command = (p["command"] as? [String]) ?? []
+        if command.isEmpty {
+            throw BackendError(code: "Invalid", message: "exec command is required")
+        }
+        if c.phase != "Running" {
+            throw BackendError(code: "Invalid", message: "container \(c.id) is \(c.phase), exec requires Running")
+        }
+        // Simulated exec: echo the command back, base64-encoded to match the Go
+        // []byte JSON encoding the client decodes.
+        let stdout = Data((command.joined(separator: " ") + "\n").utf8).base64EncodedString()
+        let stderr = Data("linuxpod: simulated exec (no real Pod VM)\n".utf8).base64EncodedString()
+        return ["stdout": stdout, "stderr": stderr, "exitCode": 0]
+    }
+
+    func containerStats(_ p: [String: Any]) throws -> [String: Any] {
+        guard Capabilities.all["stats"] == true else {
+            throw BackendError(code: "Unsupported", message: "stats")
+        }
+        let (_, c) = try lookup(p)
+        return [
+            "podID": c.podID,
+            "containerID": c.id,
+            "timestampNanos": Int(Date().timeIntervalSince1970 * 1_000_000_000),
+            "cpuUsageNanoCores": 0,
+            "memoryWorkingSetBytes": 0,
+            "simulated": true,
+        ]
     }
 
     func stopContainer(_ p: [String: Any]) throws -> [String: Any] {
@@ -255,6 +354,8 @@ func dispatch(_ model: Model, _ line: Data) -> [String: Any] {
             return ok(model.ping())
         case "CreatePod":
             return ok(try model.createPod(payload))
+        case "PodStatus":
+            return ok(try model.podStatusOf(payload))
         case "PrepareContainerRootfs":
             return ok(try model.prepareRootfs(payload))
         case "CreateContainer":
@@ -270,6 +371,12 @@ func dispatch(_ model: Model, _ line: Data) -> [String: Any] {
             return ok(try model.statusOf(payload))
         case "Cleanup":
             return ok(model.cleanup(payload))
+        case "ContainerLogPath":
+            return ok(try model.containerLogPath(payload))
+        case "ExecSync":
+            return ok(try model.execSync(payload))
+        case "ContainerStats":
+            return ok(try model.containerStats(payload))
         default:
             return ["ok": false, "code": "Invalid", "error": "unknown op \(op)"]
         }

@@ -22,6 +22,7 @@ type Op string
 const (
 	opPing            Op = "Ping"
 	opCreatePod       Op = "CreatePod"
+	opPodStatus       Op = "PodStatus"
 	opPrepareRootfs   Op = "PrepareContainerRootfs"
 	opCreateContainer Op = "CreateContainer"
 	opStartContainer  Op = "StartContainer"
@@ -29,6 +30,9 @@ const (
 	opRemoveContainer Op = "RemoveContainer"
 	opStatus          Op = "Status"
 	opCleanup         Op = "Cleanup"
+	opContainerLog    Op = "ContainerLogPath"
+	opExecSync        Op = "ExecSync"
+	opContainerStats  Op = "ContainerStats"
 )
 
 // wireRequest is the envelope for one call. Payload is the op-specific request
@@ -59,6 +63,7 @@ const (
 	codeRootfsNotFound     errCode = "RootfsNotFound"
 	codeInvalid            errCode = "Invalid"
 	codeIdentityUnverified errCode = "IdentityUnverified"
+	codeUnsupported        errCode = "Unsupported"
 	codeInternal           errCode = "Internal"
 )
 
@@ -78,6 +83,8 @@ func codeForError(err error) errCode {
 		return codeInvalid
 	case errors.Is(err, ErrIdentityUnverified):
 		return codeIdentityUnverified
+	case errors.Is(err, ErrUnsupported):
+		return codeUnsupported
 	default:
 		return codeInternal
 	}
@@ -101,6 +108,8 @@ func errorForCode(code errCode, msg string) error {
 		return fmt.Errorf("%w: %s", ErrInvalid, msg)
 	case codeIdentityUnverified:
 		return fmt.Errorf("%w: %s", ErrIdentityUnverified, msg)
+	case codeUnsupported:
+		return fmt.Errorf("%w: %s", ErrUnsupported, msg)
 	default:
 		return errors.New(msg)
 	}

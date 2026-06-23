@@ -103,6 +103,14 @@ func (c *HelperClient) CreatePod(ctx context.Context, spec PodSpec) (PodStatus, 
 	return st, err
 }
 
+func (c *HelperClient) PodStatus(ctx context.Context, podID string) (PodStatus, error) {
+	var st PodStatus
+	err := c.call(ctx, opPodStatus, struct {
+		PodID string `json:"podID"`
+	}{PodID: podID}, &st)
+	return st, err
+}
+
 func (c *HelperClient) PrepareContainerRootfs(ctx context.Context, req RootfsRequest) (RootfsHandle, error) {
 	var h RootfsHandle
 	err := c.call(ctx, opPrepareRootfs, req, &h)
@@ -134,6 +142,24 @@ func (c *HelperClient) RemoveContainer(ctx context.Context, ref Ref) error {
 func (c *HelperClient) Status(ctx context.Context, ref Ref) (ContainerStatus, error) {
 	var st ContainerStatus
 	err := c.call(ctx, opStatus, ref, &st)
+	return st, err
+}
+
+func (c *HelperClient) ContainerLogPath(ctx context.Context, ref Ref) (LogInfo, error) {
+	var info LogInfo
+	err := c.call(ctx, opContainerLog, ref, &info)
+	return info, err
+}
+
+func (c *HelperClient) ExecSync(ctx context.Context, req ExecRequest) (ExecResult, error) {
+	var res ExecResult
+	err := c.call(ctx, opExecSync, req, &res)
+	return res, err
+}
+
+func (c *HelperClient) ContainerStats(ctx context.Context, ref Ref) (ContainerStats, error) {
+	var st ContainerStats
+	err := c.call(ctx, opContainerStats, ref, &st)
 	return st, err
 }
 

@@ -21,6 +21,22 @@ release.
 - `fixtures/workload.yaml` — the #85 single-container fixture: selects the #84
   runtime label and tolerates the host-namespace taint, with projected
   ConfigMap/Secret, an HTTP probe, and a ClusterIP Service.
+- `linuxpod-inloop.sh` — gated **LinuxPod-backed** in-loop suite (CRI-L5 #130),
+  the sibling of `k3s-inloop.sh` for a node running `macvz-cri
+  --experimental-linuxpod-backend --linuxpod-helper-socket=<sock>`. Schedules
+  `fixtures/linuxpod-workload.yaml` (an app + a *late* sidecar sharing one Pod
+  sandbox) and proves the LinuxPod surface — shared namespace, sidecar localhost,
+  rootfs identity, Pod IP, logs/exec/port-forward/Service, adapter + helper
+  restart recovery, and a residual LinuxPod VM/container/rootfs/handoff/network
+  audit. It includes a **honesty gate**: it refuses to pass any LinuxPod-specific
+  acceptance unless `MACVZ_LINUXPOD_BACKEND_EVIDENCE_CMD` proves the Pod is served
+  by a genuine, non-simulated LinuxPod backend (a `simulated=true` handshake is
+  skipped loudly, never passed). `make cri-linuxpod-inloop`. Gated by
+  `MACVZ_INTEGRATION=1` + `KUBECONFIG`. Report:
+  `docs/CRI_LINUXPOD_L5_INLOOP_VALIDATION_REPORT.md`.
+- `fixtures/linuxpod-workload.yaml` — the #130 two-container fixture (app + late
+  sidecar) for the LinuxPod backend; the multi-container shared-namespace shape
+  the default apple/container path excludes (#82/#86).
 
 `run.sh`/`soak.sh` are gated by `MACVZ_INTEGRATION=1`; `k3s-inloop.sh`
 additionally needs a reachable `KUBECONFIG`. Without their gates each prints its
@@ -185,6 +201,54 @@ bundled containerd.
 
 Uninstall removes the LaunchAgent, binary, and socket; `--purge` also deletes the
 state dir. The suite asserts no stale socket, workload, or sandbox remains.
+
+## LinuxPod backend (CRI-L, #125)
+
+To point the node at the experimental **LinuxPod-backed** CRI path instead of the
+default apple/container path, run a LinuxPod helper and start the adapter with
+`--experimental-linuxpod-backend`. `linuxpod-inloop.sh` then drives a two-container
+**app + late-sidecar** Pod (`fixtures/linuxpod-workload.yaml`) through k3s.
+
+1. Build and start a LinuxPod helper on a unix socket. Until the real
+   Apple Containerization helper (#126) lands, this is the simulated Swift stub
+   (`Ping`→`simulated=true`), which proves the contract and serving chain but does
+   **not** boot a real Pod VM:
+
+   ```sh
+   swift build --package-path test/e2e/cri-linuxpod-helper -c release
+   ./test/e2e/cri-linuxpod-helper/.build/release/LinuxPodHelperStub \
+     --socket "$HOME/.macvz/cri/linuxpod-helper.sock" &
+   ```
+
+2. Install the adapter with the LinuxPod backend selected (via `MACVZ_CRI_EXTRA`):
+
+   ```sh
+   make cri
+   MACVZ_CRI_EXTRA="--experimental-linuxpod-backend \
+     --linuxpod-helper-socket $HOME/.macvz/cri/linuxpod-helper.sock" \
+     ./scripts/macvz-cri-install.sh install --from ./bin \
+       --socket "$HOME/.macvz/cri/macvz-cri.sock" \
+       --state-dir "$HOME/.macvz/cri/state"
+   ```
+
+   Point k3s at the endpoint exactly as in "Pointing k3s at macvz-cri" above.
+
+3. Run the LinuxPod in-loop suite (gated; plan-only and exit 0 without the gates):
+
+   ```sh
+   MACVZ_INTEGRATION=1 KUBECONFIG=/path/to/k3s.yaml \
+     MACVZ_RESTART_CRI_CMD="…" MACVZ_RESTART_HELPER_CMD="…" \
+     MACVZ_ADAPTER_RSS_CMD="…" MACVZ_LINUXPOD_AUDIT_CMD="…" MACVZ_ROUTE_AUDIT_CMD="…" \
+     ./test/e2e/cri-k3s/linuxpod-inloop.sh
+   ```
+
+   **Honesty gate:** the suite asserts shared sandbox namespace, sidecar localhost,
+   rootfs identity verification, Pod IP readiness, logs, exec, stop/remove, restart
+   recovery, and a residual-state audit *only when the Pod is genuinely
+   LinuxPod-backed*. Against the simulated stub those assertions **skip loudly**
+   with the #126/#127/#128/#129 blocker rather than passing falsely, so the report
+   never claims live evidence the runtime did not produce. See the script header
+   for the full env contract and `docs/CRI_RUNTIME_R17_LINUXPOD_BACKEND_REPORT.md`.
 
 ## Known limitations
 

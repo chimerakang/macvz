@@ -1,0 +1,169 @@
+# CRI-L5 (#130) LinuxPod-backed in-loop fixture.
+#
+# A two-container Pod — an app and a *late* sidecar sharing one Pod sandbox —
+# scheduled by a real Linux k3s/kubelet control plane onto a macOS MacVz CRI node
+# that runs `macvz-cri --experimental-linuxpod-backend` (CRI-L, #125..#129). It
+# is the multi-container shape the LinuxPod backend models: CreatePod, then app
+# create/start, then a *late* sidecar create/start after the Pod is running, both
+# sharing the sandbox namespace and reaching each other on localhost
+# (pkg/runtime/linuxpod FakeBackend / #88 C1 shared-namespace behavior).
+#
+# Unlike fixtures/workload.yaml (single container, the apple/container supported
+# class), this fixture deliberately uses TWO containers in one Pod. On the
+# default apple/container path multi-container Pods are excluded (#82/#86); this
+# fixture is meaningful ONLY on a node whose adapter serves Pods onto the
+# LinuxPod backend. linuxpod-inloop.sh refuses to pass the shared-namespace,
+# localhost, and identity acceptances unless a backend-evidence hook proves the
+# Pod is genuinely LinuxPod-backed (not the simulated handshake) — see #127/#128.
+#
+#   - app:     httpd serving the projected ConfigMap marker on :8080.
+#   - sidecar: starts second, curls the app on 127.0.0.1:8080 (proving shared
+#              network namespace + localhost), records the marker to a file the
+#              exec phase reads, then idles. A native sidecar (restartPolicy
+#              Always init container) keeps the Pod's Ready gate tied to both.
+#
+# #84 scheduling-exclusion opt-in is unchanged: select the MacVz runtime label
+# and tolerate the host-namespace taint. Keys mirror pkg/criserver/nodescheme.go.
+#
+# Image: an arm64 busybox providing sh + httpd + wget. linuxpod-inloop.sh
+# substitutes MACVZ_CRI_IMAGE at apply time.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: macvz-cri-linuxpod-e2e
+  labels:
+    app.kubernetes.io/part-of: macvz-cri-linuxpod-inloop
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+  namespace: macvz-cri-linuxpod-e2e
+data:
+  index.html: |
+    macvz-cri-l5-inloop-ok
+  app.conf: |
+    role=linuxpod-inloop-fixture
+    marker=macvz-cri-l5-inloop-ok
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: app-secret
+  namespace: macvz-cri-linuxpod-e2e
+type: Opaque
+stringData:
+  token: macvz-cri-l5-secret-ok
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: linuxpod-inloop
+  namespace: macvz-cri-linuxpod-e2e
+  labels:
+    app: linuxpod-inloop
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: linuxpod-inloop
+  template:
+    metadata:
+      labels:
+        app: linuxpod-inloop
+    spec:
+      nodeSelector:
+        node.macvz.io/runtime: apple-container
+      tolerations:
+        - key: node.macvz.io/host-namespace-unsupported
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      # The sidecar is declared as a native sidecar (an init container with
+      # restartPolicy: Always). The kubelet starts it and keeps it running for
+      # the Pod's lifetime, and the app container starts after it — but at the
+      # CRI/LinuxPod-backend layer the *app* sandbox owner is created first and
+      # the sidecar joins the already-running Pod namespace late (the ordering
+      # the LinuxPod FakeBackend asserts via CreatedAfterPodRunning). The sidecar
+      # proves shared-namespace localhost reachability against the app.
+      initContainers:
+        - name: sidecar
+          image: busybox:1.36.1
+          restartPolicy: Always
+          # Wait for the app's localhost listener, then record proof that this
+          # container shares the Pod network namespace and reached the app over
+          # 127.0.0.1. The marker file is read back by the exec phase. Idle after.
+          command:
+            - sh
+            - -c
+            - >-
+              for i in $(seq 1 60); do
+                if wget -T 2 -qO- http://127.0.0.1:8080/index.html | grep -q macvz-cri-l5-inloop-ok; then
+                  echo macvz-cri-l5-sidecar-localhost-ok > /shared/sidecar-localhost;
+                  echo macvz-cri-l5-sidecar-boot;
+                  break;
+                fi;
+                sleep 1;
+              done;
+              tail -f /dev/null
+          volumeMounts:
+            - name: shared
+              mountPath: /shared
+      containers:
+        - name: app
+          image: busybox:1.36.1
+          command:
+            - sh
+            - -c
+            - >-
+              echo macvz-cri-l5-app-boot;
+              httpd -f -p 8080 -h /www
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /index.html
+              port: 8080
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            failureThreshold: 12
+          livenessProbe:
+            httpGet:
+              path: /index.html
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          volumeMounts:
+            - name: web
+              mountPath: /www
+              readOnly: true
+            - name: secret
+              mountPath: /etc/app-secret
+              readOnly: true
+            - name: shared
+              mountPath: /shared
+      volumes:
+        - name: web
+          configMap:
+            name: app-config
+        - name: secret
+          secret:
+            secretName: app-secret
+        - name: shared
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: linuxpod-inloop
+  namespace: macvz-cri-linuxpod-e2e
+spec:
+  type: ClusterIP
+  selector:
+    app: linuxpod-inloop
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080

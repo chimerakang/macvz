@@ -89,4 +89,9 @@ func TestLinuxPodHandshakeAgainstRealSocket(t *testing.T) {
 	if !info.Simulated {
 		t.Errorf("fake backend should report Simulated=true, got %+v", info)
 	}
+	// The handshake must surface the kubelet-surface capabilities (CRI-L4, #129) so
+	// the operator log can report what the helper backs.
+	if !info.Capabilities.Logs || !info.Capabilities.Exec || !info.Capabilities.Stats {
+		t.Errorf("fake backend should advertise logs/exec/stats capabilities, got %+v", info.Capabilities)
+	}
 }

@@ -3,6 +3,9 @@ package linuxpod
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -33,13 +36,31 @@ type FakeBackend struct {
 	// identity (verification passes). Tests set a wrong value to exercise the
 	// identity-mismatch path. Read under mu.
 	ObservedIdentityFor map[string]string
+
+	// Capabilities advertises which kubelet surfaces this fake backs. NewFakeBackend
+	// turns them all on; a test sets a field false to exercise the ErrUnsupported
+	// path for that surface. Read under mu.
+	Capabilities Capabilities
+
+	// SandboxAddressFor overrides the host-reachable address a pod's VM reports,
+	// keyed by pod id (CRI-L3, #128). Absent pods get a deterministic default. Read
+	// under mu.
+	SandboxAddressFor map[string]string
+
+	// SandboxAddressReadyAfter withholds a pod's SandboxAddress until this many
+	// PodStatus calls have been made for it, modeling the real Pod VM acquiring its
+	// address a few polls after boot. 0 (the default) makes the address available
+	// immediately. Read under mu.
+	SandboxAddressReadyAfter map[string]int
 }
 
 type fakePod struct {
-	spec       PodSpec
-	namespace  string
-	phase      runtime.Phase
-	containers map[string]*fakeContainer // keyed by container id
+	spec        PodSpec
+	namespace   string
+	phase       runtime.Phase
+	sandboxAddr string                    // host-reachable Pod VM address (CRI-L3, #128)
+	statusCalls int                       // PodStatus calls, for SandboxAddressReadyAfter latency
+	containers  map[string]*fakeContainer // keyed by container id
 }
 
 type fakeRootfs struct {
@@ -57,6 +78,7 @@ type fakeContainer struct {
 	name                   string
 	podID                  string
 	rootfsToken            string
+	logPath                string
 	phase                  runtime.Phase
 	exitCode               int
 	message                string
@@ -69,10 +91,13 @@ type fakeContainer struct {
 // NewFakeBackend returns an empty fake. now defaults to time.Now when nil.
 func NewFakeBackend() *FakeBackend {
 	return &FakeBackend{
-		now:                 time.Now,
-		pods:                map[string]*fakePod{},
-		rootfs:              map[string]*fakeRootfs{},
-		ObservedIdentityFor: map[string]string{},
+		now:                      time.Now,
+		pods:                     map[string]*fakePod{},
+		rootfs:                   map[string]*fakeRootfs{},
+		ObservedIdentityFor:      map[string]string{},
+		Capabilities:             Capabilities{Logs: true, Exec: true, Stats: true},
+		SandboxAddressFor:        map[string]string{},
+		SandboxAddressReadyAfter: map[string]int{},
 	}
 }
 
@@ -84,7 +109,15 @@ func (f *FakeBackend) nextSeq() int {
 }
 
 func (f *FakeBackend) Ping(context.Context) (HelperInfo, error) {
-	return HelperInfo{Name: "linuxpod-fake-backend", ProtocolVersion: ProtocolVersion, Simulated: true}, nil
+	f.mu.Lock()
+	caps := f.Capabilities
+	f.mu.Unlock()
+	return HelperInfo{
+		Name:            "linuxpod-fake-backend",
+		ProtocolVersion: ProtocolVersion,
+		Simulated:       true,
+		Capabilities:    caps,
+	}, nil
 }
 
 func (f *FakeBackend) CreatePod(_ context.Context, spec PodSpec) (PodStatus, error) {
@@ -96,14 +129,45 @@ func (f *FakeBackend) CreatePod(_ context.Context, spec PodSpec) (PodStatus, err
 	if _, ok := f.pods[spec.ID]; ok {
 		return PodStatus{}, fmt.Errorf("%w: pod %q already exists", ErrInvalid, spec.ID)
 	}
+	addr := f.SandboxAddressFor[spec.ID]
+	if addr == "" {
+		// Deterministic, plausible host-only address so a test reading it sees an
+		// IP-shaped value. A real helper returns the VM's actual vmnet address.
+		addr = fmt.Sprintf("192.168.66.%d", (f.nextSeq()%253)+2)
+	}
 	p := &fakePod{
-		spec:       spec,
-		namespace:  "linuxpod-ns-" + spec.ID,
-		phase:      runtime.PhaseRunning,
-		containers: map[string]*fakeContainer{},
+		spec:        spec,
+		namespace:   "linuxpod-ns-" + spec.ID,
+		phase:       runtime.PhaseRunning,
+		sandboxAddr: addr,
+		containers:  map[string]*fakeContainer{},
 	}
 	f.pods[spec.ID] = p
-	return PodStatus{ID: spec.ID, Phase: p.phase, SandboxNamespace: p.namespace}, nil
+	return f.podStatusLocked(p), nil
+}
+
+// PodStatus returns a pod's current status, withholding SandboxAddress until
+// SandboxAddressReadyAfter[podID] PodStatus calls have been made for it so tests
+// can exercise the "address not discovered yet" path (CRI-L3, #128).
+func (f *FakeBackend) PodStatus(_ context.Context, podID string) (PodStatus, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	p, ok := f.pods[podID]
+	if !ok {
+		return PodStatus{}, fmt.Errorf("%w: %s", ErrPodNotFound, podID)
+	}
+	p.statusCalls++
+	return f.podStatusLocked(p), nil
+}
+
+// podStatusLocked renders a pod's public status, applying the address-discovery
+// latency model. Caller holds mu.
+func (f *FakeBackend) podStatusLocked(p *fakePod) PodStatus {
+	st := PodStatus{ID: p.spec.ID, Phase: p.phase, SandboxNamespace: p.namespace}
+	if p.statusCalls >= f.SandboxAddressReadyAfter[p.spec.ID] {
+		st.SandboxAddress = p.sandboxAddr
+	}
+	return st
 }
 
 func (f *FakeBackend) PrepareContainerRootfs(_ context.Context, req RootfsRequest) (RootfsHandle, error) {
@@ -159,12 +223,38 @@ func (f *FakeBackend) CreateContainer(_ context.Context, req CreateRequest) (Con
 		name:                   req.Name,
 		podID:                  req.PodID,
 		rootfsToken:            req.RootfsToken,
+		logPath:                req.LogPath,
 		phase:                  runtime.PhaseCreated,
 		expectedIdentity:       rf.expectedIdentity,
 		createdAfterPodRunning: f.podHasRunningLocked(p),
 	}
 	p.containers[c.id] = c
+	// Best-effort: stamp the CRI log file at creation. A log-write failure must not
+	// wedge CreateContainer (#129), so the error is intentionally ignored here.
+	f.appendCRILog(c, "stdout", "container created (simulated LinuxPod backend; no real stdout)")
 	return f.statusLocked(p, c), nil
+}
+
+// appendCRILog writes one CRI-format log line for a container when the Logs
+// capability is on and the container has a kubelet log path. CRI log format is one
+// "<rfc3339nano> <stream> F <message>" line per entry. It is best-effort: it
+// returns any I/O error for callers that care, but lifecycle paths ignore it so a
+// log failure never wedges a Pod. Caller holds mu.
+func (f *FakeBackend) appendCRILog(c *fakeContainer, stream, msg string) error {
+	if !f.Capabilities.Logs || c.logPath == "" {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(c.logPath), 0o755); err != nil {
+		return err
+	}
+	file, err := os.OpenFile(c.logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	line := fmt.Sprintf("%s %s F %s\n", f.now().UTC().Format(time.RFC3339Nano), stream, msg)
+	_, err = file.WriteString(line)
+	return err
 }
 
 func (f *FakeBackend) StartContainer(_ context.Context, ref Ref) (ContainerStatus, error) {
@@ -201,6 +291,8 @@ func (f *FakeBackend) StartContainer(_ context.Context, ref Ref) (ContainerStatu
 	c.phase = runtime.PhaseRunning
 	c.identityVerified = true
 	c.message = ""
+	// Best-effort lifecycle log line (ignored on error so it cannot wedge start).
+	f.appendCRILog(c, "stdout", "container started (identity verified)")
 	return f.statusLocked(p, c), nil
 }
 
@@ -260,6 +352,69 @@ func (f *FakeBackend) Cleanup(_ context.Context, podID string) (CleanupReport, e
 	}
 	delete(f.pods, podID)
 	return rep, nil
+}
+
+func (f *FakeBackend) ContainerLogPath(_ context.Context, ref Ref) (LogInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.Capabilities.Logs {
+		return LogInfo{}, fmt.Errorf("%w: logs", ErrUnsupported)
+	}
+	_, c, err := f.lookupLocked(ref)
+	if err != nil {
+		return LogInfo{}, err
+	}
+	if c.logPath == "" {
+		return LogInfo{}, fmt.Errorf("%w: container %q was created without a log path", ErrInvalid, ref.ContainerID)
+	}
+	return LogInfo{PodID: c.podID, ContainerID: c.id, Path: c.logPath, Format: "cri"}, nil
+}
+
+func (f *FakeBackend) ExecSync(_ context.Context, req ExecRequest) (ExecResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.Capabilities.Exec {
+		return ExecResult{}, fmt.Errorf("%w: exec", ErrUnsupported)
+	}
+	_, c, err := f.lookupLocked(Ref{PodID: req.PodID, ContainerID: req.ContainerID})
+	if err != nil {
+		return ExecResult{}, err
+	}
+	if len(req.Command) == 0 {
+		return ExecResult{}, fmt.Errorf("%w: exec command is required", ErrInvalid)
+	}
+	if c.phase != runtime.PhaseRunning {
+		return ExecResult{}, fmt.Errorf("%w: container %q is %s, exec requires Running", ErrInvalid, req.ContainerID, c.phase)
+	}
+	// Simulated exec: echo the command back so the path is provable without a real
+	// VM. A real backend runs the command in the Pod VM through the helper.
+	return ExecResult{
+		Stdout:   []byte(strings.Join(req.Command, " ") + "\n"),
+		Stderr:   []byte("linuxpod: simulated exec (no real Pod VM)\n"),
+		ExitCode: 0,
+	}, nil
+}
+
+func (f *FakeBackend) ContainerStats(_ context.Context, ref Ref) (ContainerStats, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.Capabilities.Stats {
+		return ContainerStats{}, fmt.Errorf("%w: stats", ErrUnsupported)
+	}
+	_, c, err := f.lookupLocked(ref)
+	if err != nil {
+		return ContainerStats{}, err
+	}
+	// Simulated sample: a real Pod VM measures cgroup usage. Zeroed-but-timestamped
+	// and flagged Simulated so the adapter never reports modeled numbers as real.
+	return ContainerStats{
+		PodID:                 c.podID,
+		ContainerID:           c.id,
+		TimestampNanos:        f.now().UnixNano(),
+		CPUUsageNanoCores:     0,
+		MemoryWorkingSetBytes: 0,
+		Simulated:             true,
+	}, nil
 }
 
 // lookupLocked resolves a ref to its pod and container. Caller holds mu.

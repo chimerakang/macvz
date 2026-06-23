@@ -44,6 +44,10 @@ cri-soak: cri ## Run the CRI-P8 bounded soak (set MACVZ_INTEGRATION=1 to run liv
 cri-k3s-inloop: ## Run the CRI-P9 real kubelet/k3s in-loop suite (set MACVZ_INTEGRATION=1 + KUBECONFIG to run live)
 	./test/e2e/cri-k3s/k3s-inloop.sh
 
+.PHONY: cri-linuxpod-inloop
+cri-linuxpod-inloop: ## Run the CRI-L5 LinuxPod-backed kubelet/k3s in-loop suite (set MACVZ_INTEGRATION=1 + KUBECONFIG to run live)
+	./test/e2e/cri-k3s/linuxpod-inloop.sh
+
 .PHONY: cri-handoff
 cri-handoff: cri ## Run the CRI-I4-1 handoff-lifecycle crictl fixture (set MACVZ_INTEGRATION=1 to run live)
 	./test/e2e/cri-handoff/run.sh
@@ -87,6 +91,10 @@ cri-linuxpod-r7: ## Run the #99 vminitd-visible rootfs launch probe (set MACVZ_L
 .PHONY: cri-linuxpod-r9
 cri-linuxpod-r9: ## Run the #101 vminitd rootfs primitive launch probe (set MACVZ_LINUXPOD_POC=1 to run live)
 	MACVZ_LINUXPOD_PROBE=r9 ./test/e2e/cri-linuxpod/run.sh
+
+.PHONY: cri-linuxpod-helper-real
+cri-linuxpod-helper-real: ## Run the CRI-L1 real LinuxPod helper lifecycle test (#126; needs apple/containerization checkout + kernel + vminit image)
+	MACVZ_LINUXPOD_REAL_HELPER=1 go test -count=1 -v -timeout 30m -run TestRealLinuxPodHelperLifecycle ./pkg/runtime/linuxpod/
 
 .PHONY: bench
 bench: ## Build the density/RAM benchmark harness into bin/mvz-bench

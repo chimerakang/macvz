@@ -58,6 +58,14 @@ func dispatch(ctx context.Context, backend Backend, line []byte) wireResponse {
 			return errResponse(err)
 		}
 		return result(backend.CreatePod(ctx, spec))
+	case opPodStatus:
+		var p struct {
+			PodID string `json:"podID"`
+		}
+		if err := decode(req.Payload, &p); err != nil {
+			return errResponse(err)
+		}
+		return result(backend.PodStatus(ctx, p.PodID))
 	case opPrepareRootfs:
 		var r RootfsRequest
 		if err := decode(req.Payload, &r); err != nil {
@@ -105,6 +113,24 @@ func dispatch(ctx context.Context, backend Backend, line []byte) wireResponse {
 			return errResponse(err)
 		}
 		return result(backend.Cleanup(ctx, p.PodID))
+	case opContainerLog:
+		var ref Ref
+		if err := decode(req.Payload, &ref); err != nil {
+			return errResponse(err)
+		}
+		return result(backend.ContainerLogPath(ctx, ref))
+	case opExecSync:
+		var r ExecRequest
+		if err := decode(req.Payload, &r); err != nil {
+			return errResponse(err)
+		}
+		return result(backend.ExecSync(ctx, r))
+	case opContainerStats:
+		var ref Ref
+		if err := decode(req.Payload, &ref); err != nil {
+			return errResponse(err)
+		}
+		return result(backend.ContainerStats(ctx, ref))
 	default:
 		return errResponse(ErrInvalid)
 	}

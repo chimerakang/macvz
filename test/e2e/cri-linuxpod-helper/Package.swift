@@ -14,7 +14,8 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "LinuxPodHelperStub",
-            path: "Sources/LinuxPodHelperStub"
+            path: "Sources/LinuxPodHelperStub",
+            exclude: ["CLAUDE.md"]
         )
     ]
 )

@@ -343,3 +343,35 @@ func TestStopFlushesAnchor(t *testing.T) {
 		t.Errorf("endpoints remain after Stop: %v", eps)
 	}
 }
+
+// TestAttachDetachPreservesGlobalDefaultRoute explicitly verifies the Mac host
+// default route is never touched across a full attach/detach cycle (CRI-L3, #128,
+// acceptance criterion 6). The Router only ever removes apple/container's scoped
+// (-ifscope) vmnet default route; an unscoped `route ... delete -inet default`
+// (which would drop the host's global default and sever kubelet's API connection)
+// and the broad `-interface` form must never appear.
+func TestAttachDetachPreservesGlobalDefaultRoute(t *testing.T) {
+	fr := newFakeRunner()
+	rt := newTestRouter(fr)
+	ctx := context.Background()
+	if err := rt.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	// A LinuxPod-style endpoint (Pod VM address resolved to a vmnet bridge).
+	ep := Endpoint{PodKey: "default/linuxpod", PodIP: "10.244.1.7", VMIP: "192.168.64.9"}
+	if err := rt.Attach(ctx, ep); err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	if err := rt.Detach(ctx, ep.PodKey); err != nil {
+		t.Fatalf("Detach: %v", err)
+	}
+	for _, cmd := range fr.strings() {
+		// Every legitimate default-route deletion is scoped with -ifscope <iface>.
+		if cmd == "route -q -n delete -inet default" {
+			t.Errorf("Router issued an UNSCOPED global default-route delete: %q\nall: %v", cmd, fr.strings())
+		}
+		if strings.Contains(cmd, "delete -inet default -interface") {
+			t.Errorf("Router used the unsafe -interface default-route form: %q", cmd)
+		}
+	}
+}

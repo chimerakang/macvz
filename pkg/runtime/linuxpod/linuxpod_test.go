@@ -233,6 +233,44 @@ func TestBackendErrorsRoundTripOverWire(t *testing.T) {
 	}
 }
 
+// TestPodStatusAddressDiscoveryOverWire proves the CRI-L3 (#128) PodStatus op
+// round-trips, withholds the sandbox address until it is ready, then reveals it —
+// the address-discovery contract the Pod networking integration polls on.
+func TestPodStatusAddressDiscoveryOverWire(t *testing.T) {
+	b := NewFakeBackend()
+	b.SandboxAddressFor["p"] = "192.168.66.42"
+	b.SandboxAddressReadyAfter["p"] = 2 // ready on the 2nd PodStatus call
+	client := newPipeClient(t, b)
+	ctx := context.Background()
+
+	created, err := client.CreatePod(ctx, PodSpec{ID: "p"})
+	if err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+	// CreatePod is the 0th status render: address still withheld.
+	if created.SandboxAddress != "" {
+		t.Errorf("CreatePod SandboxAddress = %q, want withheld", created.SandboxAddress)
+	}
+	// First PodStatus: still not ready.
+	if st, err := client.PodStatus(ctx, "p"); err != nil {
+		t.Fatalf("PodStatus #1: %v", err)
+	} else if st.SandboxAddress != "" {
+		t.Errorf("PodStatus #1 SandboxAddress = %q, want withheld", st.SandboxAddress)
+	}
+	// Second PodStatus: address is revealed.
+	st, err := client.PodStatus(ctx, "p")
+	if err != nil {
+		t.Fatalf("PodStatus #2: %v", err)
+	}
+	if st.SandboxAddress != "192.168.66.42" {
+		t.Errorf("PodStatus #2 SandboxAddress = %q, want 192.168.66.42", st.SandboxAddress)
+	}
+	// Unknown pod errors with the classified sentinel over the wire.
+	if _, err := client.PodStatus(ctx, "missing"); !errors.Is(err, ErrPodNotFound) {
+		t.Errorf("PodStatus(missing) = %v, want ErrPodNotFound", err)
+	}
+}
+
 // newPipeClient wires a HelperClient to Serve(backend) over net.Pipe, one fresh
 // pipe per call (matching the client's connection-per-call model). Each accepted
 // connection is served until the client closes it.

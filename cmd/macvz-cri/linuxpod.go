@@ -3,9 +3,15 @@ package main
 import (
 	"context"
 	"fmt"
+	"net"
 	"time"
 
+	"github.com/chimerakang/macvz/internal/version"
+	"github.com/chimerakang/macvz/pkg/criserver"
+	"github.com/chimerakang/macvz/pkg/criserver/store"
 	"github.com/chimerakang/macvz/pkg/runtime/linuxpod"
+	"google.golang.org/grpc"
+	"k8s.io/klog/v2"
 )
 
 // linuxpod.go wires the experimental LinuxPod backend gate (CRI-R17, #124). The
@@ -62,4 +68,58 @@ func (lc linuxpodConfig) handshake(ctx context.Context) (info linuxpod.HelperInf
 			lc.helperSocket, err)
 	}
 	return info, true, nil
+}
+
+// serveLinuxPod serves the CRI lifecycle through the LinuxPod backend on lis
+// (CRI-L2, #127). It connects to the helper socket, builds the LinuxPodService
+// over the persisted stores, reconciles recovered records against the live
+// backend, and serves until the context is cancelled. The default apple/container
+// path is not constructed in this mode.
+func serveLinuxPod(ctx context.Context, lis net.Listener, socketPath string, sandboxes *store.Store, containers *store.ContainerStore, pn podNetConfig, lc linuxpodConfig) error {
+	backend := linuxpod.NewSocketClient(lc.helperSocket)
+
+	// Wire the Pod network path (CRI-L3, #128) only when explicitly configured. The
+	// returned cleanup flushes host pf state on shutdown; it is a no-op when off, in
+	// which case LinuxPod sandboxes run without a Pod IP and report NetworkReady=false.
+	podNet, ipam, netCleanup, err := setupPodNetwork(ctx, pn)
+	if err != nil {
+		return err
+	}
+	defer netCleanup()
+
+	svc, err := criserver.NewLinuxPodService(criserver.LinuxPodOptions{
+		Backend:        backend,
+		Sandboxes:      sandboxes,
+		Containers:     containers,
+		RuntimeVersion: version.Version,
+		PodNetwork:     podNet,
+		IPAM:           ipam,
+	})
+	if err != nil {
+		return fmt.Errorf("build LinuxPod CRI service: %w", err)
+	}
+
+	grpcServer := grpc.NewServer()
+	svc.Register(grpcServer)
+	// Rebuild Pod IP reservations and re-attach surviving sandboxes so a restart
+	// neither leaks addresses nor wipes other Pods' host rules. No-op when off.
+	svc.RecoverNetwork(ctx)
+	// Reconcile persisted records against the live backend after a restart without
+	// trusting stale identity evidence (identity is a start invariant).
+	svc.RecoverContainers(ctx)
+
+	klog.InfoS("serving experimental LinuxPod-backed CRI (prototype; not the shipped Virtual Kubelet runtime)",
+		"socket", socketPath, "helper", lc.helperSocket,
+		"note", "lifecycle served through pkg/runtime/linuxpod backend; logs/exec/stats per helper capabilities (CRI-L2/#127)")
+
+	go func() {
+		<-ctx.Done()
+		klog.InfoS("shutdown requested; stopping LinuxPod CRI server")
+		grpcServer.GracefulStop()
+	}()
+	if err := grpcServer.Serve(lis); err != nil {
+		return fmt.Errorf("serve LinuxPod CRI gRPC: %w", err)
+	}
+	klog.InfoS("macvz-cri (LinuxPod backend) stopped cleanly")
+	return nil
 }

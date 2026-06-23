@@ -69,6 +69,11 @@ type Sandbox struct {
 		Interface string `json:"interface,omitempty"`
 		Attached  bool   `json:"attached,omitempty"`
 	} `json:"network,omitempty"`
+	// LinuxPodNamespace is the shared network namespace of the LinuxPod sandbox VM
+	// backing this sandbox on the experimental LinuxPod CRI path (CRI-L2, #127). It
+	// is empty for the default apple/container path, which owns no Pod VM. Persisted
+	// so a restarted adapter can report the same shared-namespace evidence.
+	LinuxPodNamespace string `json:"linuxPodNamespace,omitempty"`
 }
 
 const sandboxIDBytes = 32

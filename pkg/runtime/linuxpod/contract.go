@@ -51,6 +51,13 @@ var (
 	// identity it reported did not match the expected identity staged at prepare
 	// time. The container is left non-Running, mirroring CRI-R16 StartContainer.
 	ErrIdentityUnverified = errors.New("linuxpod: rootfs identity not verified")
+	// ErrUnsupported means the backend does not implement the requested kubelet
+	// surface (logs, exec, or stats). The adapter branches on it to return an honest
+	// CRI unsupported response rather than a generic failure, and it must never
+	// wedge a lifecycle operation (CRI-L4, #129). A surface that is unsupported is
+	// advertised up-front in HelperInfo.Capabilities so the adapter can skip the call
+	// entirely; ErrUnsupported is the defense for a call made anyway.
+	ErrUnsupported = errors.New("linuxpod: capability not supported")
 )
 
 // Backend is the minimal experimental LinuxPod lifecycle a Go CRI adapter calls.
@@ -68,6 +75,15 @@ type Backend interface {
 	// CreatePod boots the LinuxPod sandbox VM (the RunPodSandbox analog) and returns
 	// its status, including the SandboxNamespace every container in the pod shares.
 	CreatePod(ctx context.Context, spec PodSpec) (PodStatus, error)
+
+	// PodStatus returns the Pod VM's current observed status, including its
+	// SandboxAddress once the VM has acquired its host-reachable address (CRI-L3,
+	// #128). It is the pod-level analog of Status: the adapter polls it after
+	// CreatePod to discover the address the Pod network path attaches to, and
+	// re-queries it on restart recovery. SandboxAddress is "" while the address is
+	// not yet known, which the caller treats as a transient not-ready condition, not
+	// a failure. Returns ErrPodNotFound for an unknown pod id.
+	PodStatus(ctx context.Context, podID string) (PodStatus, error)
 
 	// PrepareContainerRootfs stages a prepared rootfs and its expected identity into
 	// an already-running Pod VM (the late-rootfs primitive). It returns a handle
@@ -102,6 +118,27 @@ type Backend interface {
 	// Cleanup tears down the Pod VM and every container/rootfs/handoff artifact it
 	// owns, returning a report. It is idempotent and must leave no stale state.
 	Cleanup(ctx context.Context, podID string) (CleanupReport, error)
+
+	// ContainerLogPath returns the CRI-format container log file the backend created
+	// for a container, so the adapter can tail it for kubelet log requests. Returns
+	// ErrUnsupported when Capabilities.Logs is false, ErrInvalid when the container
+	// was created without a log path, and ErrContainerNotFound for an unknown ref. It
+	// never mutates lifecycle state, so a log failure cannot wedge a Pod.
+	ContainerLogPath(ctx context.Context, ref Ref) (LogInfo, error)
+
+	// ExecSync runs a command to completion inside a running container and returns
+	// its combined result (stdout, stderr, exit code) — the primitive kubelet uses
+	// for exec liveness/readiness probes and non-interactive `kubectl exec`. Returns
+	// ErrUnsupported when Capabilities.Exec is false. Interactive/streaming Exec
+	// (#132), Attach, and PortForward (#131) are deliberately out of scope here
+	// (#129 non-goals) and tracked as follow-ups.
+	ExecSync(ctx context.Context, req ExecRequest) (ExecResult, error)
+
+	// ContainerStats returns a point-in-time resource sample for one container for
+	// kubelet summary stats. Returns ErrUnsupported when Capabilities.Stats is false.
+	// A simulated backend marks the sample Simulated so the adapter never reports
+	// modeled numbers as measured.
+	ContainerStats(ctx context.Context, ref Ref) (ContainerStats, error)
 }
 
 // HelperInfo is the handshake result: which helper answered and what it supports.
@@ -113,6 +150,27 @@ type HelperInfo struct {
 	// Simulated is true for a stub/fake that does not boot a real Pod VM, so the
 	// adapter can log honestly that it is not driving real workloads.
 	Simulated bool `json:"simulated"`
+	// Capabilities advertises which kubelet-facing runtime surfaces this helper
+	// backs. The adapter reads it once at the startup handshake and only calls a
+	// surface the helper advertises (CRI-L4, #129).
+	Capabilities Capabilities `json:"capabilities"`
+}
+
+// Capabilities reports which kubelet-facing runtime surfaces a helper backs.
+// Calling a surface that is false returns ErrUnsupported rather than wedging the
+// Pod lifecycle. A surface being false is honest, not a bug — the LinuxPod backend
+// is a prototype and these surfaces are added incrementally.
+type Capabilities struct {
+	// Logs is true when the backend creates CRI-format container log files and can
+	// report their path through ContainerLogPath.
+	Logs bool `json:"logs"`
+	// Exec is true when the backend runs a synchronous command in a container
+	// (ExecSync) — enough for kubelet exec liveness/readiness probes. It does not
+	// imply interactive/streaming Exec, Attach, or PortForward.
+	Exec bool `json:"exec"`
+	// Stats is true when the backend reports per-container resource samples
+	// (ContainerStats) for kubelet summaries.
+	Stats bool `json:"stats"`
 }
 
 // PodSpec describes a LinuxPod sandbox VM to create.
@@ -131,7 +189,14 @@ type PodStatus struct {
 	// container created in this pod reports the same value, which is how callers
 	// prove app and sidecar share localhost.
 	SandboxNamespace string `json:"sandboxNamespace"`
-	Message          string `json:"message,omitempty"`
+	// SandboxAddress is the Pod VM's host-reachable address — its host-only/vmnet
+	// guest address — once the VM has acquired it (CRI-L3, #128). The CRI Pod
+	// networking integration attaches the host pf/route path to this address (as the
+	// binat target's source VMIP). It is "" while the address is not yet known (the
+	// VM is still booting or acquiring DHCP), which the caller treats as a transient
+	// "address not discovered yet" condition rather than a failure.
+	SandboxAddress string `json:"sandboxAddress,omitempty"`
+	Message        string `json:"message,omitempty"`
 }
 
 // RootfsRequest asks the backend to stage a prepared rootfs into a running pod.
@@ -161,6 +226,11 @@ type CreateRequest struct {
 	Command     []string          `json:"command,omitempty"`
 	Args        []string          `json:"args,omitempty"`
 	Env         map[string]string `json:"env,omitempty"`
+	// LogPath is the kubelet-assigned CRI container log path. When set (and the
+	// backend advertises Capabilities.Logs) the backend creates the file and writes
+	// container lifecycle output to it in CRI log format. Empty means the container
+	// has no kubelet log file, and ContainerLogPath then returns ErrInvalid.
+	LogPath string `json:"logPath,omitempty"`
 }
 
 // StopRequest stops a container with a grace timeout.
@@ -203,6 +273,49 @@ type ContainerStatus struct {
 	IdentityVerified bool   `json:"identityVerified"`
 }
 
+// LogInfo locates a container's CRI-format log file.
+type LogInfo struct {
+	PodID       string `json:"podID"`
+	ContainerID string `json:"containerID"`
+	// Path is the absolute CRI log file path the kubelet can tail.
+	Path string `json:"path"`
+	// Format names the on-disk format; always "cri": one
+	// "<rfc3339nano> <stdout|stderr> <P|F> <message>" line per entry.
+	Format string `json:"format"`
+}
+
+// ExecRequest runs one command to completion in a running container.
+type ExecRequest struct {
+	PodID       string   `json:"podID"`
+	ContainerID string   `json:"containerID"`
+	Command     []string `json:"command"`
+	// TimeoutSeconds bounds the exec; 0 means the backend default.
+	TimeoutSeconds int `json:"timeoutSeconds,omitempty"`
+}
+
+// ExecResult is the outcome of an ExecSync.
+type ExecResult struct {
+	Stdout   []byte `json:"stdout,omitempty"`
+	Stderr   []byte `json:"stderr,omitempty"`
+	ExitCode int    `json:"exitCode"`
+}
+
+// ContainerStats is a point-in-time resource sample for one container, the
+// minimum a kubelet summary needs.
+type ContainerStats struct {
+	PodID       string `json:"podID"`
+	ContainerID string `json:"containerID"`
+	// TimestampNanos is when the sample was taken (unix nanoseconds).
+	TimestampNanos        int64  `json:"timestampNanos"`
+	CPUUsageNanoCores     uint64 `json:"cpuUsageNanoCores"`
+	MemoryWorkingSetBytes uint64 `json:"memoryWorkingSetBytes"`
+	// Simulated is true when the numbers are modeled by a stub/fake rather than
+	// measured from a real Pod VM, so the adapter never presents them as real
+	// metrics (the #129 non-goal against claiming metrics parity). Real cgroup-backed
+	// stats that set this false are tracked in #133.
+	Simulated bool `json:"simulated"`
+}
+
 // CleanupReport summarizes a Cleanup so the caller can assert no leaks.
 type CleanupReport struct {
 	PodID             string `json:"podID"`
@@ -215,5 +328,8 @@ type CleanupReport struct {
 }
 
 // ProtocolVersion is the wire-protocol version HelperClient and the helper agree
-// on. Bump it on any breaking change to the request/response shapes.
-const ProtocolVersion = 1
+// on. Bump it on any breaking change to the request/response shapes. v2 added the
+// kubelet surfaces (capabilities in Ping, ContainerLogPath/ExecSync/ContainerStats
+// ops, CreateRequest.LogPath) for CRI-L4 (#129). v3 added the PodStatus op and
+// PodStatus.SandboxAddress for Pod networking address discovery, CRI-L3 (#128).
+const ProtocolVersion = 3

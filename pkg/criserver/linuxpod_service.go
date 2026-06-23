@@ -566,6 +566,20 @@ func (s *LinuxPodService) PodSandboxStatus(_ context.Context, req *runtimeapi.Po
 	resp := &runtimeapi.PodSandboxStatusResponse{Status: toCRIStatus(&sb)}
 	if req.GetVerbose() {
 		resp.Info = map[string]string{"model": "linuxpod-backed", "sandboxNamespace": sb.LinuxPodNamespace}
+		if sb.Network.Attached {
+			resp.Info["networkAttached"] = "true"
+		} else {
+			resp.Info["networkAttached"] = "false"
+		}
+		if sb.Network.PodIP != "" {
+			resp.Info["podIP"] = sb.Network.PodIP
+		}
+		if sb.Network.VMIP != "" {
+			resp.Info["vmIP"] = sb.Network.VMIP
+		}
+		if sb.Network.Interface != "" {
+			resp.Info["interface"] = sb.Network.Interface
+		}
 	}
 	return resp, nil
 }

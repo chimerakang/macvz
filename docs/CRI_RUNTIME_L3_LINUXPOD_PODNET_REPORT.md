@@ -2,9 +2,10 @@
 
 Date: 2026-06-23
 
-Outcome: `linuxpodPodNetworkingIntegratedHermetic` — code path and hermetic
-coverage are complete; live host-to-Pod/Pod-to-host reachability remains
-operator-pending.
+Outcome: `linuxpodPodNetworkingLiveReachable` — code path, hermetic coverage,
+real-helper vmnet address discovery, live CRI podnet attach, and external
+host-to-Pod Pod IP reachability are complete. Pod-to-host callback remains a
+separate optional diagnostic, not a #128 readiness gate.
 
 Parent: [#125](https://github.com/chimerakang/macvz/issues/125) ·
 Depends on: [#127](https://github.com/chimerakang/macvz/issues/127) (LinuxPod
@@ -126,13 +127,8 @@ Hermetic (no pf, no route, no Pod VM):
 Commands: `go test ./pkg/criserver ./pkg/network/... ./pkg/runtime/...`,
 `go test ./...`, `go vet ./...`, `make build` — all green.
 
-Gated/live (operator-pending, same topology as the rest of the LinuxPod track;
-keeps #128 open until captured):
+Gated/live (same topology as the rest of the LinuxPod track):
 
-- Host-to-Pod / Pod-to-host smoke and the cleanup audit (routes/pf/IPAM/helper
-  state) require a real LinuxPod helper + the local `192.168.1.122` or two-host
-  topology. The hermetic suite proves the control flow, IPAM lifecycle, status
-  reporting, and default-route safety; live reachability is the remaining gate.
 - For live `SandboxAddress` validation without changing the default helper mode:
   `MACVZ_LINUXPOD_REAL_HELPER=1 MACVZ_LINUXPOD_REAL_HELPER_VMNET=1 go test ./pkg/runtime/linuxpod -run TestRealLinuxPodHelperLifecycle -count=1`.
   The test starts `linuxpod-helper --vmnet` and fails if `CreatePod` reports an
@@ -151,6 +147,24 @@ keeps #128 open until captured):
   `pod=default/pod podIP=10.244.102.2 vmIP=192.168.66.2 interface=bridge101`,
   detached on cleanup, stopped the `macvz/pods` anchor, and preserved the global
   default route (`192.168.1.1` via `en0`).
+- Captured on `test@192.168.1.122` after adding live packet probes:
+  `TestLiveLinuxPodServingThroughHelper` with
+  `MACVZ_LINUXPOD_PODNET_REACHABILITY=1`,
+  `MACVZ_LINUXPOD_PODNET_HOST_TO_POD_ADDR=vmIP`, and
+  `MACVZ_LINUXPOD_PODNET_HOLD_SECONDS=45` started a real busybox `httpd` inside
+  the LinuxPod sandbox. The CRI verbose status exposed `podIP=10.244.102.2`,
+  `vmIP=192.168.67.2`, `interface=bridge101`, and the in-test host-to-VM HTTP
+  probe reached `http://192.168.67.2:8080/`. While the sandbox was held, the
+  local Mac's route to `10.244.102.0/24` via `192.168.1.122` was verified and
+  `curl --max-time 10 http://10.244.102.2:8080/` returned HTTP 200 with body
+  `macvz-linuxpod-podnet-ok`, proving external host-to-Pod Pod IP reachability
+  through the programmed pf/vmnet path. The remote cleanup detached the pod path,
+  stopped the anchor, and preserved the global default route before/after
+  (`192.168.1.1` via `en0`).
+- Pod-to-host callback is available as a separate diagnostic with
+  `MACVZ_LINUXPOD_PODNET_POD_TO_HOST=1`; it is intentionally split from the main
+  #128 gate because it depends on host inbound policy/firewall behavior rather
+  than kubelet-visible Pod IP assignment or host-to-Pod ingress.
 
 ## Non-goals honored
 

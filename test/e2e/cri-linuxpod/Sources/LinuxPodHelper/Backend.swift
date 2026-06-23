@@ -340,7 +340,7 @@ actor LinuxPodBackend {
         try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: binDir.appendingPathComponent("busybox").path)
         try fm.copyItem(at: binDir.appendingPathComponent("busybox"), to: binDir.appendingPathComponent("sh"))
         try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: binDir.appendingPathComponent("sh").path)
-        for applet in ["cat", "grep", "ls", "mkdir", "readlink", "sleep", "sync", "tr", "wget"] {
+        for applet in ["cat", "grep", "httpd", "ls", "mkdir", "readlink", "sleep", "sync", "tr", "wget"] {
             let appletPath = binDir.appendingPathComponent(applet)
             try? fm.removeItem(at: appletPath)
             try fm.createSymbolicLink(atPath: appletPath.path, withDestinationPath: "busybox")

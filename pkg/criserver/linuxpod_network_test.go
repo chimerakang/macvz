@@ -102,12 +102,24 @@ func TestLinuxPodNetworkAttachOnRunPodSandbox(t *testing.T) {
 	}
 
 	// PodSandboxStatus reports the Pod IP only after the attach is recorded.
-	sbStatus, err := svc.PodSandboxStatus(ctx, &runtimeapi.PodSandboxStatusRequest{PodSandboxId: sandboxID})
+	sbStatus, err := svc.PodSandboxStatus(ctx, &runtimeapi.PodSandboxStatusRequest{PodSandboxId: sandboxID, Verbose: true})
 	if err != nil {
 		t.Fatalf("PodSandboxStatus: %v", err)
 	}
 	if got := sbStatus.GetStatus().GetNetwork().GetIp(); got != podIP {
 		t.Errorf("PodSandboxStatus IP = %q, want %q", got, podIP)
+	}
+	if got := sbStatus.GetInfo()["networkAttached"]; got != "true" {
+		t.Errorf("verbose networkAttached = %q, want true", got)
+	}
+	if got := sbStatus.GetInfo()["podIP"]; got != podIP {
+		t.Errorf("verbose podIP = %q, want %q", got, podIP)
+	}
+	if got := sbStatus.GetInfo()["vmIP"]; got != ep.VMIP {
+		t.Errorf("verbose vmIP = %q, want %q", got, ep.VMIP)
+	}
+	if got := sbStatus.GetInfo()["interface"]; got != ep.Interface {
+		t.Errorf("verbose interface = %q, want %q", got, ep.Interface)
 	}
 }
 

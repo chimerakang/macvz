@@ -4,9 +4,10 @@ Date: 2026-06-23
 Parent: #125 · Depends on: #127 (serving), #128 (Pod networking), #129 (logs/exec/stats)
 Outcome: **`linuxpodKubeletInLoopBlocked`** — every layer proven on real hardware
 up to a kubelet-*observed* Running Pod; CRI-L3 (#128) now has live CRI podnet
-attach evidence, and the remaining gate is applying that same podnet wiring to
-the kubelet/k3s node so it reaches Ready. Honest, precise blocker — not a silent
-pass, and not a CRI-path or backend defect.
+attach plus external host-to-Pod Pod IP reachability evidence, and the remaining
+gate is applying that same podnet wiring to the kubelet/k3s node so it reaches
+Ready. Honest, precise blocker — not a silent pass, and not a CRI-path or backend
+defect.
 
 ## Summary
 
@@ -17,7 +18,8 @@ Containerization LinuxPod helper runs an app + *late* sidecar to **Running** in 
 shared namespace with verified identity; (2) `macvz-cri`'s CRI serving drives that
 real backend to `CONTAINER_RUNNING` via `crictl` (the exact CRI API a kubelet
 uses); (3) CRI-L3 live podnet attach now reports `NetworkReady=true`, assigns a
-Pod IP, and preserves the host default route on `test@192.168.1.122`; (4) a
+Pod IP, preserves the host default route on `test@192.168.1.122`, and serves HTTP
+over the Pod IP from an external Mac route; (4) a
 **real in-cluster kubelet** was temporarily repointed at the
 LinuxPod backend and **drove it in-loop** (its log carries this backend's Status
 RPC), then cleanly restored. The one remaining gate to a kubelet-observed
@@ -194,8 +196,13 @@ kubelet was in-loop against the LinuxPod backend. That first node run stayed
 #128 podnet with `10.244.102.0/24`, `bridge100`, `/var/run/macvz-netd.sock`,
 ingress `en0`, and forwarding; it reported `NetworkReady=true`, assigned Pod IP
 `10.244.102.2`, attached `vmIP=192.168.66.2`, detached cleanly, and preserved the
-global default route. The remaining step is to run the kubelet node with that
-same podnet wiring and collect the kubelet-observed `Running` evidence.
+global default route. A follow-up reachability run held the same live sandbox with
+busybox `httpd`; CRI verbose status exposed `podIP=10.244.102.2`,
+`vmIP=192.168.67.2`, and `interface=bridge101`, local routing to
+`10.244.102.0/24` via `192.168.1.122` was verified, and
+`curl --max-time 10 http://10.244.102.2:8080/` returned HTTP 200 with
+`macvz-linuxpod-podnet-ok`. The remaining step is to run the kubelet node with
+that same podnet wiring and collect the kubelet-observed `Running` evidence.
 
 So the literal kubelet smoke is blocked at the **final** step — applying the
 now-live-proven pod-network settings to the kubelet node — not by the CRI serving
@@ -207,20 +214,21 @@ collector once that node is launched with #128 networking enabled.
 
 1. **Live kubelet/k3s smoke reaches Running for a LinuxPod-backed app+sidecar
    Pod.** ◑ **Everything up to a kubelet-observed Running is proven; final gate is
-   #128 live pod networking.** Three layers proven on real hardware: (a) real
+   applying #128 live pod networking to the kubelet node.** Three layers proven on real hardware: (a) real
    helper test PASS (app + late sidecar Running on a real VM, shared namespace,
    identity verified); (b) `macvz-cri` CRI serving → real helper, crictl-driven,
    both containers `CONTAINER_RUNNING` (FAILED=0); (c) a **real in-cluster kubelet
    driving this LinuxPod backend** (its log carries this backend's Status RPC). The
    one remaining gap to a kubelet-observed `Running` Pod: the node stays NotReady
-   because the kubelet requires `NetworkReady=true`, i.e. CRI-L3 (#128) live pod
-   networking wired — operator/shared-infra, not set up here. Not a CRI-path or
-   backend defect.
+   until it is launched with the now-proven CRI-L3 (#128) live pod networking
+   flags — operator/shared-infra, not a CRI-path or backend defect.
 2. **Evidence of shared namespace, sidecar localhost, identity, Pod IP.** ◑
-   **Proven live at the backend; Pod IP pending.** The real-helper run shows the
+   **Proven live at backend + CRI podnet layers; kubelet-observed Pod IP pending.**
+   The real-helper run shows the
    app and late sidecar share one sandbox namespace (`net:[4026531840]`), both
    `localhostReachable=true`, both `identityVerified=true` (observed==expected).
-   Pod IP on a LinuxPod sandbox is CRI-L3 (#128), not yet validated live.
+   CRI-L3 now validates LinuxPod Pod IP assignment and external host-to-Pod
+   reachability (`10.244.102.2:8080`) live.
 3. **Stop/delete removes containers/sandbox/rootfs/handoff/network state.** ◐
    **Modeled + audited by harness.** The contract's `Cleanup` leaves no stale
    state; the harness `cleanup` phase asserts zero residual LinuxPod
@@ -248,11 +256,13 @@ collector once that node is launched with #128 networking enabled.
   serving test. Bring a LinuxPod node up with `--pod-cidr`/
   `--pod-network-interface`/`--pod-network-helper-socket` live, then
   `linuxpod-inloop.sh` collects the kubelet `Running` evidence.
-- ~~**CRI-L3 Pod networking (#128) live CRI attach.**~~ **RESOLVED for CRI-level
-  attach:** `TestLiveLinuxPodServingThroughHelper` passed on `test@192.168.1.122`
-  with `NetworkReady=true`, Pod IP `10.244.102.2`, `vmIP=192.168.66.2`, clean
-  detach, and unchanged global default route. Remaining #128 evidence is packet
-  reachability and cleanup audit.
+- ~~**CRI-L3 Pod networking (#128) live CRI attach/reachability.**~~ **RESOLVED
+  for CRI-level attach and external host-to-Pod Pod IP:** `TestLiveLinuxPodServingThroughHelper`
+  passed on `test@192.168.1.122` with `NetworkReady=true`, Pod IP
+  `10.244.102.2`, `vmIP=192.168.66.2`/`192.168.67.2`, clean detach, unchanged
+  global default route, and local `curl http://10.244.102.2:8080/` over the
+  `10.244.102.0/24 -> 192.168.1.122` route returning HTTP 200. Pod-to-host
+  callback remains an optional diagnostic, not a #128 blocker.
 - **CRI-L4 logs/exec/stats (#129).** Helper advertises `capLogs/capExec/capStats`;
   end-to-end kubelet logs/exec/stats against a real LinuxPod VM remain to be
   validated.

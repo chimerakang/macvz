@@ -23,9 +23,10 @@ import (
 // the only missing piece today is the runtime primitive itself.
 type sharedNetnsFakeRuntime struct {
 	*fakeRuntime
-	supported bool
-	reason    string
-	joined    []joinedContainer
+	supported    bool
+	reason       string
+	joinReturnID string
+	joined       []joinedContainer
 }
 
 type joinedContainer struct {
@@ -43,9 +44,13 @@ func (f *sharedNetnsFakeRuntime) CreateInPodSandbox(_ context.Context, sandboxWo
 	if f.createErr != nil {
 		return "", f.createErr
 	}
+	id := spec.Name
+	if f.joinReturnID != "" {
+		id = f.joinReturnID
+	}
 	f.joined = append(f.joined, joinedContainer{sandboxWorkloadID: sandboxWorkloadID, spec: spec})
-	f.statuses[spec.Name] = runtime.Status{ID: spec.Name, Phase: runtime.PhaseCreated}
-	return spec.Name, nil
+	f.statuses[id] = runtime.Status{ID: id, Phase: runtime.PhaseCreated}
+	return id, nil
 }
 
 // newMultiContainerServer builds a server with the experimental #82 probe enabled
@@ -141,6 +146,48 @@ func TestMultiContainerProbeCreatesSecondContainerInsideSandbox(t *testing.T) {
 	}
 	if got := rt.joined[0].spec.Name; got == rt.joined[0].sandboxWorkloadID {
 		t.Errorf("joined container reused sandbox workload id %q", got)
+	}
+}
+
+// The runtime capability may return an addressable workload ID that differs from
+// the requested spec.Name. Persist and use that runtime-owned ID for later
+// Start/Stop/Destroy calls; otherwise the adapter-side #86 path would be ready
+// only for helpers that happen to mirror the adapter's desired name.
+func TestMultiContainerProbeUsesRuntimeReturnedJoinedWorkloadID(t *testing.T) {
+	rt := &sharedNetnsFakeRuntime{
+		fakeRuntime:  newFakeRuntime(),
+		supported:    true,
+		joinReturnID: "linuxpod-joined-sidecar-1",
+	}
+	s, sandboxID := newMultiContainerServer(t, rt)
+	ctx := context.Background()
+
+	if _, err := s.CreateContainer(ctx, createReq(sandboxID, "app")); err != nil {
+		t.Fatalf("first CreateContainer: %v", err)
+	}
+	sidecar, err := s.CreateContainer(ctx, createReq(sandboxID, "sidecar"))
+	if err != nil {
+		t.Fatalf("sidecar CreateContainer: %v", err)
+	}
+	rec, ok := s.containers.Get(sidecar.GetContainerId())
+	if !ok {
+		t.Fatalf("sidecar record not persisted")
+	}
+	if rec.WorkloadID != rt.joinReturnID {
+		t.Fatalf("joined workloadID = %q, want runtime return %q", rec.WorkloadID, rt.joinReturnID)
+	}
+
+	if _, err := s.StartContainer(ctx, &runtimeapi.StartContainerRequest{ContainerId: sidecar.GetContainerId()}); err != nil {
+		t.Fatalf("StartContainer(sidecar): %v", err)
+	}
+	if got := rt.started[len(rt.started)-1]; got != rt.joinReturnID {
+		t.Errorf("StartContainer used workload %q, want runtime return %q", got, rt.joinReturnID)
+	}
+	if _, err := s.RemoveContainer(ctx, &runtimeapi.RemoveContainerRequest{ContainerId: sidecar.GetContainerId()}); err != nil {
+		t.Fatalf("RemoveContainer(sidecar): %v", err)
+	}
+	if got := rt.destroyed[len(rt.destroyed)-1]; got != rt.joinReturnID {
+		t.Errorf("RemoveContainer destroyed workload %q, want runtime return %q", got, rt.joinReturnID)
 	}
 }
 

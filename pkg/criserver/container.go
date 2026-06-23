@@ -216,7 +216,11 @@ func (s *Server) CreateContainer(ctx context.Context, req *runtimeapi.CreateCont
 
 	var createErr error
 	if joinRuntime != nil {
-		_, createErr = joinRuntime.CreateInPodSandbox(ctx, joinSandboxWorkloadID, spec)
+		createdWorkloadID, err := joinRuntime.CreateInPodSandbox(ctx, joinSandboxWorkloadID, spec)
+		createErr = err
+		if createdWorkloadID != "" {
+			c.WorkloadID = createdWorkloadID
+		}
 	} else {
 		_, createErr = s.containerRuntime.Create(ctx, spec)
 	}
@@ -231,9 +235,9 @@ func (s *Server) CreateContainer(ctx context.Context, req *runtimeapi.CreateCont
 	// workload and any prepared handoff so the create leaves neither an orphan
 	// record nor an orphan VM nor an orphan handoff subtree.
 	if err := s.containers.Put(c); err != nil {
-		if derr := s.containerRuntime.Destroy(context.WithoutCancel(ctx), workloadID); derr != nil {
+		if derr := s.containerRuntime.Destroy(context.WithoutCancel(ctx), c.WorkloadID); derr != nil {
 			klog.ErrorS(derr, "CreateContainer: failed to reclaim workload after persist error",
-				"containerID", id, "workloadID", workloadID)
+				"containerID", id, "workloadID", c.WorkloadID)
 		}
 		if handoffCleanup != nil {
 			handoffCleanup()

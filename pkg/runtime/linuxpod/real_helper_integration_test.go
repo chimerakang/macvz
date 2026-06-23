@@ -128,7 +128,7 @@ func TestRealLinuxPodHelperLifecycle(t *testing.T) {
 		"macvz-rootfs-id=sidecar", []string{"/bin/sh", "-c", "exec sleep 600"}, true)
 
 	assertSharedNamespaceAndIdentity(t, app, sidecar)
-	t.Logf("LIVE EVIDENCE: pod=%s sandboxNamespace=%q (shared by app+sidecar)", podID, app.SandboxNamespace)
+	t.Logf("LIVE EVIDENCE: pod=%s sandboxNamespace=%q sandboxAddress=%q (shared by app+sidecar)", podID, app.SandboxNamespace, pod.SandboxAddress)
 	t.Logf("LIVE EVIDENCE: app   id=%s phase=%s identityVerified=%v observed=%q createdAfterPodRunning=%v localhostReachable=%v",
 		app.ID, app.Phase, app.IdentityVerified, app.ObservedIdentity, app.CreatedAfterPodRunning, app.LocalhostReachable)
 	t.Logf("LIVE EVIDENCE: sidecar id=%s phase=%s identityVerified=%v observed=%q createdAfterPodRunning=%v localhostReachable=%v",

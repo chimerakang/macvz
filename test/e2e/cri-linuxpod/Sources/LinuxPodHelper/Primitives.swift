@@ -72,8 +72,8 @@ final class HelperRuntime: @unchecked Sendable {
         imageStore: ImageStore, stateRoot: URL, reference: String, fm: FileManager
     ) async throws -> Containerization.Mount {
         let initPath = stateRoot.appendingPathComponent("initfs.ext4")
-        let initImage = try await imageStore.getInitImage(reference: reference)
         do {
+            let initImage = try await imageStore.getInitImage(reference: reference)
             return try await initImage.initBlock(at: initPath, for: .linuxArm)
         } catch {
             if fm.fileExists(atPath: initPath.path) {

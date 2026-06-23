@@ -137,6 +137,10 @@ keeps #128 open until captured):
   `MACVZ_LINUXPOD_REAL_HELPER=1 MACVZ_LINUXPOD_REAL_HELPER_VMNET=1 go test ./pkg/runtime/linuxpod -run TestRealLinuxPodHelperLifecycle -count=1`.
   The test starts `linuxpod-helper --vmnet` and fails if `CreatePod` reports an
   empty `sandboxAddress`.
+- Captured on `test@192.168.1.122`: the same gated test passed against the real
+  helper with `MACVZ_CONTAINERIZATION_ROOT` pointed at the checked-in
+  `containerization/bin/initfs.ext4` fallback; `sandboxAddress` was `192.168.66.2`
+  and route audit before/after stayed on global default `192.168.1.1` via `en0`.
 
 ## Non-goals honored
 

@@ -24,8 +24,10 @@ late-rootfs identity primitive (`Ping` reports `simulated:false`).
     line) that bridges blocking accept/read/write to async and routes each line to
     the actor.
   - `Primitives.swift` — ported R9 transport: VM/image-store bootstrap, optional
-    `VmnetNetwork` Pod interface allocation, the vminitd `Copy(COPY_IN/COPY_OUT)`
-    host↔guest primitive, vsock capture, and a CRI-format log writer.
+    `VmnetNetwork` Pod interface allocation, initfs fallback to an existing
+    `stateRoot/initfs.ext4` when the init-image reference cannot be resolved, the
+    vminitd `Copy(COPY_IN/COPY_OUT)` host↔guest primitive, vsock capture, and a
+    CRI-format log writer.
   - `Backend.swift` — the `LinuxPodBackend` actor implementing all 13 protocol ops
     over a real `LinuxPod` + the late-rootfs primitive, with identity-gated Running.
 - **Stub retained** (`test/e2e/cri-linuxpod-helper`, `LinuxPodHelperStub`) for
@@ -127,6 +129,11 @@ cd ../../.. && make cri-linuxpod-helper-real
   kernel before serving.
 - Kernel fetched (`bin/vmlinux-arm64`).
 - **Live VM run (`TestRealLinuxPodHelperLifecycle`): PASS** on real micro-VMs — see "Live evidence" below.
+- **Live vmnet run on 192.168.1.122:** PASS with
+  `MACVZ_LINUXPOD_REAL_HELPER_VMNET=1` and
+  `MACVZ_CONTAINERIZATION_ROOT=.../containerization/bin`; `CreatePod` reported a
+  non-empty `sandboxAddress` (`192.168.66.2`) and the host default route stayed
+  `192.168.1.1`/`en0` before and after.
 
 ## Live evidence
 

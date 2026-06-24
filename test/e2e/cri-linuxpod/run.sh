@@ -6,6 +6,7 @@ POC_DIR="${ROOT_DIR}/test/e2e/cri-linuxpod"
 CONTAINERIZATION_DIR="${MACVZ_CONTAINERIZATION_DIR:-${POC_DIR}/containerization}"
 SWIFTPM_CONTAINERIZATION_DIR="${POC_DIR}/containerization"
 ENTITLEMENTS_PATH="${POC_DIR}/linuxpod-shared-namespace-poc.entitlements"
+HELPER_ENTITLEMENTS_PATH="${POC_DIR}/linuxpod-helper.entitlements"
 HOST_ARCH="$(uname -m)"
 if [[ "${HOST_ARCH}" == "arm64" || "${HOST_ARCH}" == "aarch64" ]]; then
   DEFAULT_KERNEL="${CONTAINERIZATION_DIR}/bin/vmlinux-arm64"
@@ -240,7 +241,9 @@ pushd "${POC_DIR}" >/dev/null
 swift build --cache-path "${POC_DIR}/.build/swiftpm-cache"
 bin_dir="$(swift build --show-bin-path --cache-path "${POC_DIR}/.build/swiftpm-cache")"
 poc_bin="${bin_dir}/linuxpod-shared-namespace-poc"
+helper_bin="${bin_dir}/linuxpod-helper"
 codesign --force --sign - --timestamp=none --entitlements "${ENTITLEMENTS_PATH}" "${poc_bin}"
+codesign --force --sign - --timestamp=none --entitlements "${HELPER_ENTITLEMENTS_PATH}" "${helper_bin}"
 
 summary_json="$(
   "${poc_bin}" \

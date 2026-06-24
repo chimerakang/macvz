@@ -2,12 +2,13 @@
 
 Date: 2026-06-23; updated 2026-06-24
 Parent: #125 · Depends on: #127 (serving), #128 (Pod networking), #129 (logs/exec/stats)
-Outcome: **`linuxpodKubeletInLoopPartiallyValidated`** — a real kubelet/kind
-node now drives the genuine (`simulated=false`) LinuxPod backend to a Deployment
-`Available` rollout with Pod IP, ClusterIP Service reachability, bounded short
-soak, cleanup, and default-route-preservation evidence. Remaining failures are
-the explicit unimplemented LinuxPod helper/kubelet surfaces: logs, exec,
-port-forward, and the harness's sidecar shared-proof collection path.
+Outcome: **`linuxpodKubeletInLoopValidated`** — a real kubelet/kind node now
+drives the genuine (`simulated=false`) LinuxPod backend through the CRI-L5
+in-loop suite: Deployment `Available`, shared localhost proof, Pod IP,
+`kubectl logs`, `kubectl exec`, `kubectl port-forward`, ClusterIP Service
+reachability, bounded short soak, cleanup audit, and default-route preservation
+all pass on `test@192.168.1.122`. Restart/RSS/identity subchecks remain explicit
+operator-hook skips, not hidden passes.
 
 ## Summary
 
@@ -22,9 +23,10 @@ Pod IP, preserves the host default route on `test@192.168.1.122`, and serves HTT
 over the Pod IP from an external Mac route; (4) a
 **real in-cluster kubelet** was repointed at the LinuxPod backend with #128
 podnet enabled and drove the LinuxPod fixture to `rollout status` success,
-Pod IP `10.244.102.2`, ClusterIP reachability from a Linux-node probe, short soak
-pass, cleanup pass, and unchanged default route. The harness still **refuses to
-pass** LinuxPod acceptances on a
+Pod IP `10.244.102.2`, `kubectl logs`, `kubectl exec`, `kubectl port-forward`,
+ClusterIP reachability from a Linux-node probe, short soak pass, cleanup pass,
+and unchanged default route. The harness still **refuses to pass** LinuxPod
+acceptances on a
 `simulated=true` handshake (honesty gate below); discipline mirrors #119
 `kubeletHandoffSmokeBlocked`.
 
@@ -369,11 +371,13 @@ linuxpod-helper`, `go test ./...`, `go vet ./...`, and `git diff --check`.
   global default route, and local `curl http://10.244.102.2:8080/` over the
   `10.244.102.0/24 -> 192.168.1.122` route returning HTTP 200. Pod-to-host
   callback remains an optional diagnostic, not a #128 blocker.
-- **CRI-L4 logs/exec/stats/streaming retest.** PortForward is now live-proven
-  through kubelet (`kubectl port-forward` PASS). Logs/non-interactive exec still
-  need a protocol-v5 real helper in the same vmnet-enabled in-loop topology; the
-  current freshly built v5 helper fails vmnet creation with status `1002`, while
-  the restored vmnet-working v4 helper advertises `capLogs=false capExec=false`.
+- **CRI-L4 logs/exec/stats/streaming retest.** RESOLVED for the in-loop surface:
+  the protocol-v5 real helper was signed with `linuxpod-helper.entitlements`,
+  started with `--vmnet`, and live-proved `kubectl logs`, non-interactive
+  `kubectl exec`, `kubectl port-forward`, and ClusterIP Service reachability.
+  Helper stdout over the current vminitd path is merged into the reliable stderr
+  log stream for CRI log capture; the kubelet-facing log file contains the app
+  and sidecar boot markers.
 - **k3s topology.** Same operator-pending topology as #85/#119: a Linux k3s
   control plane plus a macOS node running `macvz-cri --experimental-linuxpod-backend`.
 

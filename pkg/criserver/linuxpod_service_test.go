@@ -173,6 +173,44 @@ func TestLinuxPodServiceStopRemoveCleanupNoStaleState(t *testing.T) {
 	}
 }
 
+func TestLinuxPodServiceStopPodSandboxCleansBackendState(t *testing.T) {
+	backend := linuxpod.NewFakeBackend()
+	svc := newLinuxPodTestService(t, backend)
+	ctx := context.Background()
+
+	sandboxID := lpRunSandbox(t, svc)
+	appID := lpCreateStart(t, svc, sandboxID, "app")
+	sidecarID := lpCreateStart(t, svc, sandboxID, "sidecar")
+
+	if _, err := svc.StopPodSandbox(ctx, &runtimeapi.StopPodSandboxRequest{PodSandboxId: sandboxID}); err != nil {
+		t.Fatalf("StopPodSandbox: %v", err)
+	}
+
+	rep, err := backend.Cleanup(ctx, sandboxID)
+	if err != nil {
+		t.Fatalf("backend.Cleanup: %v", err)
+	}
+	if rep.PodRemoved || rep.RemovedContainers != 0 || rep.RemovedRootfs != 0 {
+		t.Errorf("backend left stale state after StopPodSandbox: %+v", rep)
+	}
+	sb, ok := svc.sandboxes.Get(sandboxID)
+	if !ok {
+		t.Fatalf("sandbox record should remain until RemovePodSandbox")
+	}
+	if sb.State != store.StateNotReady {
+		t.Errorf("sandbox state = %q, want %q", sb.State, store.StateNotReady)
+	}
+	for _, id := range []string{appID, sidecarID} {
+		c, ok := svc.containers.Get(id)
+		if !ok {
+			t.Fatalf("container %s should remain until RemovePodSandbox", id)
+		}
+		if c.State != store.ContainerExited {
+			t.Errorf("container %s state = %q, want %q", id, c.State, store.ContainerExited)
+		}
+	}
+}
+
 func TestLinuxPodServiceIdentityMismatchNotRunning(t *testing.T) {
 	backend := linuxpod.NewFakeBackend()
 	backend.ObservedIdentityFor["app"] = "macvz-rootfs-id=WRONG"

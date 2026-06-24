@@ -371,7 +371,7 @@ actor LinuxPodBackend {
         try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: binDir.appendingPathComponent("busybox").path)
         try fm.copyItem(at: binDir.appendingPathComponent("busybox"), to: binDir.appendingPathComponent("sh"))
         try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: binDir.appendingPathComponent("sh").path)
-        for applet in ["cat", "grep", "httpd", "ls", "mkdir", "readlink", "sleep", "sync", "tr", "wget"] {
+        for applet in ["cat", "grep", "httpd", "ls", "mkdir", "readlink", "seq", "sleep", "sync", "tail", "tr", "wget"] {
             let appletPath = binDir.appendingPathComponent(applet)
             try? fm.removeItem(at: appletPath)
             try fm.createSymbolicLink(atPath: appletPath.path, withDestinationPath: "busybox")
@@ -440,7 +440,8 @@ actor LinuxPodBackend {
 
         let spec = stagedContainerSpec(
             podID: podID, processID: processID, rootfsPath: rf.guestRootfsPath,
-            evidenceGuestPath: rf.guestEvidencePath, realCommand: realCommand, extraMounts: mounts)
+            evidenceGuestPath: rf.guestEvidencePath, realCommand: realCommand, extraMounts: mounts,
+            redirectStdoutToStderr: !((p["logPath"] as? String) ?? "").isEmpty)
 
         // Hoist the staging paths into Sendable locals (URL/String) so the
         // @Sendable withVirtualMachineInstance closure does not capture the
@@ -609,7 +610,7 @@ actor LinuxPodBackend {
                 return mount
             }
             let names = try FileManager.default.contentsOfDirectory(atPath: mount.source)
-            if !names.contains(where: { !$0.hasPrefix(".") }) {
+            if mount.readOnly && !names.contains(where: { !$0.hasPrefix(".") }) {
                 return mount
             }
             let materialized = runtime.workRoot
@@ -628,12 +629,29 @@ actor LinuxPodBackend {
                 let data = try Data(contentsOf: src)
                 try data.write(to: dst, options: .atomic)
             }
+            if !mount.readOnly {
+                try makeWritableVolumeTree(materialized)
+            }
             return GuestMount(
                 source: materialized.path,
                 guestSource: mount.guestSource,
                 target: mount.target,
                 readOnly: mount.readOnly,
                 tmpfs: mount.tmpfs)
+        }
+    }
+
+    private func makeWritableVolumeTree(_ root: URL) throws {
+        let fm = FileManager.default
+        try fm.setAttributes([.posixPermissions: 0o777], ofItemAtPath: root.path)
+        guard let enumerator = fm.enumerator(at: root, includingPropertiesForKeys: [.isDirectoryKey]) else {
+            return
+        }
+        for case let url as URL in enumerator {
+            let values = try url.resourceValues(forKeys: [.isDirectoryKey])
+            try fm.setAttributes(
+                [.posixPermissions: values.isDirectory == true ? 0o777 : 0o666],
+                ofItemAtPath: url.path)
         }
     }
 
@@ -943,12 +961,22 @@ actor LinuxPodBackend {
     // staged rootfs identity and its net namespace into the bind-mounted handoff
     // evidence channel, syncs, then execs the real workload. It shares the Pod VM's
     // network (no net namespace) so containers reach each other over localhost.
-    private func stagedContainerSpec(podID: String, processID: String, rootfsPath: String, evidenceGuestPath: String, realCommand: [String], extraMounts: [GuestMount]) -> ContainerizationOCI.Spec {
+    private func stagedContainerSpec(
+        podID: String,
+        processID: String,
+        rootfsPath: String,
+        evidenceGuestPath: String,
+        realCommand: [String],
+        extraMounts: [GuestMount],
+        redirectStdoutToStderr: Bool
+    ) -> ContainerizationOCI.Spec {
         let exec: String
         if realCommand.isEmpty {
             exec = "exec sleep 2147483647"
         } else {
-            exec = "exec " + realCommand.map { "'" + $0.replacingOccurrences(of: "'", with: "'\"'\"'") + "'" }.joined(separator: " ")
+            let command = realCommand.map { "'" + $0.replacingOccurrences(of: "'", with: "'\"'\"'") + "'" }.joined(separator: " ")
+            let stdoutRedirect = redirectStdoutToStderr ? " 1>&2" : ""
+            exec = "exec " + command + stdoutRedirect
         }
         let script = """
         set -eu

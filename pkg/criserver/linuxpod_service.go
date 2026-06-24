@@ -538,6 +538,17 @@ func (s *LinuxPodService) StopPodSandbox(ctx context.Context, req *runtimeapi.St
 	if err := s.detachSandboxNetwork(ctx, sandboxID); err != nil {
 		return nil, err
 	}
+	// StopPodSandbox is the point where the CRI sandbox must no longer be
+	// running. Kubelet may defer RemovePodSandbox, so tear down the LinuxPod VM
+	// and helper-side rootfs/work state here while retaining CRI metadata until
+	// RemovePodSandbox deletes it.
+	rep, err := s.backend.Cleanup(ctx, sandboxID)
+	if err != nil {
+		return nil, linuxpodToCRIError("StopPodSandbox", err)
+	}
+	if rep.StaleState {
+		klog.ErrorS(errors.New("backend reported stale state"), "StopPodSandbox: cleanup left residual state", "sandbox", sandboxID)
+	}
 	if _, err := s.sandboxes.SetState(sandboxID, store.StateNotReady); err != nil {
 		return nil, status.Errorf(codes.Internal, "StopPodSandbox: %v", err)
 	}

@@ -564,6 +564,14 @@ phase_restart_helper() {
 	done
 	[ "$ok" = 1 ] && pass "Pod recovered to Running after helper restart" \
 		|| fail "Pod not Running after helper restart (record the failure handling as the next blocker; see $OUT_DIR/restart-helper.log)"
+	local out
+	out="$(kn exec "$pod" -c app -- sh -c 'cat /www/index.html; echo; cat /shared/sidecar-localhost 2>/dev/null' 2>"$OUT_DIR/restart-helper-exec.err" || true)"
+	echo "$out" >"$OUT_DIR/restart-helper-exec.out"
+	if printf '%s' "$out" | grep -q "$MARKER" && printf '%s' "$out" | grep -q "$SIDECAR_LOCALHOST_MARKER"; then
+		pass "exec still works after helper restart"
+	else
+		fail "exec failed after helper restart (helper lost live backend state; see $OUT_DIR/restart-helper-exec.err)"
+	fi
 }
 
 phase_soak() {

@@ -211,6 +211,42 @@ func TestLinuxPodServiceStopPodSandboxCleansBackendState(t *testing.T) {
 	}
 }
 
+func TestLinuxPodServiceTeardownToleratesMissingBackendPod(t *testing.T) {
+	backend := linuxpod.NewFakeBackend()
+	svc := newLinuxPodTestService(t, backend)
+	ctx := context.Background()
+
+	sandboxID := lpRunSandbox(t, svc)
+	appID := lpCreateStart(t, svc, sandboxID, "app")
+	sidecarID := lpCreateStart(t, svc, sandboxID, "sidecar")
+
+	if _, err := backend.Cleanup(ctx, sandboxID); err != nil {
+		t.Fatalf("backend.Cleanup precondition: %v", err)
+	}
+
+	if _, err := svc.StopContainer(ctx, &runtimeapi.StopContainerRequest{ContainerId: appID}); err != nil {
+		t.Fatalf("StopContainer with missing backend pod: %v", err)
+	}
+	if c, _ := svc.containers.Get(appID); c.State != store.ContainerExited {
+		t.Errorf("container state after missing-backend StopContainer = %q, want %q", c.State, store.ContainerExited)
+	}
+	if _, err := svc.RemoveContainer(ctx, &runtimeapi.RemoveContainerRequest{ContainerId: sidecarID}); err != nil {
+		t.Fatalf("RemoveContainer with missing backend pod: %v", err)
+	}
+	if _, ok := svc.containers.Get(sidecarID); ok {
+		t.Errorf("sidecar should be removed from CRI store despite missing backend pod")
+	}
+	if _, err := svc.StopPodSandbox(ctx, &runtimeapi.StopPodSandboxRequest{PodSandboxId: sandboxID}); err != nil {
+		t.Fatalf("StopPodSandbox with missing backend pod: %v", err)
+	}
+	if _, err := svc.RemovePodSandbox(ctx, &runtimeapi.RemovePodSandboxRequest{PodSandboxId: sandboxID}); err != nil {
+		t.Fatalf("RemovePodSandbox with missing backend pod: %v", err)
+	}
+	if _, err := svc.PodSandboxStatus(ctx, &runtimeapi.PodSandboxStatusRequest{PodSandboxId: sandboxID}); status.Code(err) != codes.NotFound {
+		t.Errorf("PodSandboxStatus after missing-backend remove = %v, want NotFound", err)
+	}
+}
+
 func TestLinuxPodServiceIdentityMismatchNotRunning(t *testing.T) {
 	backend := linuxpod.NewFakeBackend()
 	backend.ObservedIdentityFor["app"] = "macvz-rootfs-id=WRONG"

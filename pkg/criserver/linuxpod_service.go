@@ -422,7 +422,9 @@ func (s *LinuxPodService) StopContainer(ctx context.Context, req *runtimeapi.Sto
 	if _, err := s.backend.StopContainer(ctx, linuxpod.StopRequest{
 		PodID: c.SandboxID, ContainerID: c.LinuxPod.BackendContainerID, TimeoutSeconds: int(req.GetTimeout()),
 	}); err != nil {
-		return nil, linuxpodToCRIError("StopContainer", err)
+		if !linuxpodBackendMissing(err) {
+			return nil, linuxpodToCRIError("StopContainer", err)
+		}
 	}
 	c.State = store.ContainerExited
 	c.FinishedAt = s.now().UnixNano()
@@ -448,7 +450,9 @@ func (s *LinuxPodService) RemoveContainer(ctx context.Context, req *runtimeapi.R
 	}
 	if c.LinuxPod != nil {
 		if err := s.backend.RemoveContainer(ctx, linuxpod.Ref{PodID: c.SandboxID, ContainerID: c.LinuxPod.BackendContainerID}); err != nil {
-			return nil, linuxpodToCRIError("RemoveContainer", err)
+			if !linuxpodBackendMissing(err) {
+				return nil, linuxpodToCRIError("RemoveContainer", err)
+			}
 		}
 	}
 	if err := s.containers.Delete(id); err != nil {
@@ -524,7 +528,9 @@ func (s *LinuxPodService) StopPodSandbox(ctx context.Context, req *runtimeapi.St
 			continue
 		}
 		if _, err := s.backend.StopContainer(ctx, linuxpod.StopRequest{PodID: sandboxID, ContainerID: c.LinuxPod.BackendContainerID}); err != nil {
-			return nil, linuxpodToCRIError("StopPodSandbox", err)
+			if !linuxpodBackendMissing(err) {
+				return nil, linuxpodToCRIError("StopPodSandbox", err)
+			}
 		}
 		c.State = store.ContainerExited
 		c.FinishedAt = s.now().UnixNano()
@@ -544,7 +550,10 @@ func (s *LinuxPodService) StopPodSandbox(ctx context.Context, req *runtimeapi.St
 	// RemovePodSandbox deletes it.
 	rep, err := s.backend.Cleanup(ctx, sandboxID)
 	if err != nil {
-		return nil, linuxpodToCRIError("StopPodSandbox", err)
+		if !linuxpodBackendMissing(err) {
+			return nil, linuxpodToCRIError("StopPodSandbox", err)
+		}
+		rep = linuxpod.CleanupReport{PodID: sandboxID}
 	}
 	if rep.StaleState {
 		klog.ErrorS(errors.New("backend reported stale state"), "StopPodSandbox: cleanup left residual state", "sandbox", sandboxID)
@@ -583,7 +592,10 @@ func (s *LinuxPodService) RemovePodSandbox(ctx context.Context, req *runtimeapi.
 	// Cleanup tears down the Pod VM and all its container/rootfs state; idempotent.
 	rep, err := s.backend.Cleanup(ctx, sandboxID)
 	if err != nil {
-		return nil, linuxpodToCRIError("RemovePodSandbox", err)
+		if !linuxpodBackendMissing(err) {
+			return nil, linuxpodToCRIError("RemovePodSandbox", err)
+		}
+		rep = linuxpod.CleanupReport{PodID: sandboxID}
 	}
 	if rep.StaleState {
 		klog.ErrorS(errors.New("backend reported stale state"), "RemovePodSandbox: cleanup left residual state", "sandbox", sandboxID)
@@ -777,6 +789,10 @@ func (s *LinuxPodService) RecoverContainers(ctx context.Context) {
 // stay consistent.
 func linuxpodExpectedIdentity(containerID string) string {
 	return "macvz-rootfs-id=" + containerID
+}
+
+func linuxpodBackendMissing(err error) bool {
+	return errors.Is(err, linuxpod.ErrPodNotFound) || errors.Is(err, linuxpod.ErrContainerNotFound)
 }
 
 // linuxpodToCRIError maps a backend error to a CRI status error, preserving the

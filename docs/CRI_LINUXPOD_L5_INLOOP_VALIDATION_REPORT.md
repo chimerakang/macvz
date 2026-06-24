@@ -7,8 +7,11 @@ drives the genuine (`simulated=false`) LinuxPod backend through the CRI-L5
 in-loop suite: Deployment `Available`, shared localhost proof, Pod IP,
 `kubectl logs`, `kubectl exec`, `kubectl port-forward`, ClusterIP Service
 reachability, bounded short soak, cleanup audit, and default-route preservation
-all pass on `test@192.168.1.122`. Restart/RSS/identity subchecks remain explicit
-operator-hook skips, not hidden passes.
+all pass on `test@192.168.1.122`. Identity, adapter RSS, and `macvz-cri`
+restart recovery also pass when their operator hooks are supplied. The remaining
+live blocker is helper restart/adoption: after the helper process is restarted,
+the Pod can still appear Running, but helper-backed `kubectl exec` fails because
+the new helper cannot adopt the old helper's live LinuxPod VM state.
 
 ## Summary
 
@@ -329,27 +332,22 @@ linuxpod-helper`, `go test ./...`, `go vet ./...`, and `git diff --check`.
 ## Acceptance criteria — honest status
 
 1. **Live kubelet/k3s smoke reaches Running for a LinuxPod-backed app+sidecar
-   Pod.** ✅ **Short in-loop smoke reaches Deployment Available/Pod Running with
-   Pod IP and Service reachability.** Remaining failures are logs/exec/
-   port-forward/shared-proof surfaces, not lifecycle admission or podnet.
-2. **Evidence of shared namespace, sidecar localhost, identity, Pod IP.** ◑
-   **Proven live at backend + CRI podnet layers; kubelet-observed Pod IP pending.**
-   The real-helper run shows the
-   app and late sidecar share one sandbox namespace (`net:[4026531840]`), both
-   `localhostReachable=true`, both `identityVerified=true` (observed==expected).
-   CRI-L3 now validates LinuxPod Pod IP assignment and external host-to-Pod
-   reachability (`10.244.102.2:8080`) live.
-3. **Stop/delete removes containers/sandbox/rootfs/handoff/network state.** ◐
-   **Modeled + audited by harness.** The contract's `Cleanup` leaves no stale
-   state; the harness `cleanup` phase asserts zero residual LinuxPod
-   VM/container/rootfs/handoff/network state via `MACVZ_LINUXPOD_AUDIT_CMD`.
-   Not yet exercised against a real VM.
-4. **Adapter restart recovery.** ◐ Harness `restart-cri` phase asserts same Pod
-   UID + no duplicate LinuxPod state after `MACVZ_RESTART_CRI_CMD`; serving path
-   reconciles persisted records against the live backend. Not yet run live.
-5. **Helper crash/restart behavior tested or documented as next blocker.** ◐
-   Harness `restart-helper` phase added (`MACVZ_RESTART_HELPER_CMD`); behavior is
-   the documented next blocker pending a real helper.
+   Pod.** ✅ The in-loop smoke reaches Deployment Available/Pod Running with Pod
+   IP, shared localhost proof, logs, exec, port-forward, and Service reachability.
+2. **Evidence of shared namespace, sidecar localhost, identity, Pod IP.** ✅ The
+   kubelet-observed run proves the late sidecar reached the app over
+   `127.0.0.1`, `MACVZ_LINUXPOD_IDENTITY_CMD` reports
+   `identityVerified=true`, and the Pod IP belongs to the LinuxPod-backed sandbox.
+3. **Stop/delete removes containers/sandbox/rootfs/handoff/network state.** ✅ The
+   cleanup phase asserts zero residual LinuxPod VM/container/rootfs/handoff
+   state via `MACVZ_LINUXPOD_AUDIT_CMD`; teardown tolerates a restarted/missing
+   helper backend so kubelet cleanup does not wedge.
+4. **Adapter restart recovery.** ✅ Live `MACVZ_RESTART_CRI_CMD` retest keeps the
+   same Pod UID, no duplicate CRI state, and RSS remains bounded.
+5. **Helper crash/restart behavior tested or documented as next blocker.** ✅
+   Live `MACVZ_RESTART_HELPER_CMD` retest documents the blocker: Pod phase
+   recovers to Running, but `kubectl exec` fails because the new helper has no
+   live backend state for the old LinuxPod VM.
 6. **Report under `docs/` and `docs/MASTER_TASKS.md` updated.** ✅ This report;
    MASTER_TASKS #130 row updated.
 

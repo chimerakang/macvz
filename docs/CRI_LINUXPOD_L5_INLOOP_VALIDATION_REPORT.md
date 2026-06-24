@@ -1,17 +1,17 @@
 # CRI-L5 LinuxPod-Backed Kubelet/k3s In-Loop Validation Report (#130)
 
-Date: 2026-06-23; updated 2026-06-24
+Date: 2026-06-23; updated 2026-06-25
 Parent: #125 · Depends on: #127 (serving), #128 (Pod networking), #129 (logs/exec/stats)
 Outcome: **`linuxpodKubeletInLoopValidated`** — a real kubelet/kind node now
 drives the genuine (`simulated=false`) LinuxPod backend through the CRI-L5
 in-loop suite: Deployment `Available`, shared localhost proof, Pod IP,
 `kubectl logs`, `kubectl exec`, `kubectl port-forward`, ClusterIP Service
 reachability, bounded short soak, cleanup audit, and default-route preservation
-all pass on `test@192.168.1.122`. Identity, adapter RSS, and `macvz-cri`
-restart recovery also pass when their operator hooks are supplied. The remaining
-live blocker is helper restart/adoption: after the helper process is restarted,
-the Pod can still appear Running, but helper-backed `kubectl exec` fails because
-the new helper cannot adopt the old helper's live LinuxPod VM state.
+all pass on `test@192.168.1.122`. Identity, adapter RSS, `macvz-cri` restart
+recovery, and LinuxPod helper restart recovery also pass when their operator
+hooks are supplied. Helper restart uses an explicit fail-fast/recreate semantic:
+the adapter marks helper-lost sandboxes `BackendLost`/NotReady, kubelet recreates
+the Pod sandbox, and `kubectl exec` works again after recreation.
 
 ## Summary
 
@@ -345,11 +345,19 @@ linuxpod-helper`, `go test ./...`, `go vet ./...`, and `git diff --check`.
 4. **Adapter restart recovery.** ✅ Live `MACVZ_RESTART_CRI_CMD` retest keeps the
    same Pod UID, no duplicate CRI state, and RSS remains bounded.
 5. **Helper crash/restart behavior tested or documented as next blocker.** ✅
-   Live `MACVZ_RESTART_HELPER_CMD` retest documents the blocker: Pod phase
-   recovers to Running, but `kubectl exec` fails because the new helper has no
-   live backend state for the old LinuxPod VM.
+   Live `MACVZ_RESTART_HELPER_CMD` retest now passes via fail-fast/recreate:
+   helper-lost sandboxes become `BackendLost`/NotReady, kubelet recreates the
+   sandbox, `kubectl exec` works after recreation, restartCount remains bounded,
+   and cleanup leaves zero residual state.
 6. **Report under `docs/` and `docs/MASTER_TASKS.md` updated.** ✅ This report;
    MASTER_TASKS #130 row updated.
+
+Latest live recovery evidence: `/tmp/cri-linuxpod-v5-helper-recovery-20260625003511`
+on `kind-macvz61` / `test@192.168.1.122` passed all checks with
+`MACVZ_RESTART_HELPER_CMD`, `MACVZ_RESTART_CRI_CMD`, identity, RSS, audit, and
+route hooks enabled. The helper restart phase recorded `exec works after helper
+restart/recreate`; cleanup audit reported zero residual state; route-after
+matched route-before (`192.168.1.1` via `en0`).
 
 ## Blockers / next issues
 

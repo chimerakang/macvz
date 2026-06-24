@@ -197,6 +197,12 @@ func (s *LinuxPodService) RunPodSandbox(ctx context.Context, req *runtimeapi.Run
 				}
 				return &runtimeapi.RunPodSandboxResponse{PodSandboxId: sb.ID}, nil
 			}
+			if sb.State == store.StateNotReady {
+				if err := s.discardNotReadySandboxForRecreate(ctx, &sb); err != nil {
+					return nil, err
+				}
+				continue
+			}
 			return nil, status.Errorf(codes.FailedPrecondition,
 				"RunPodSandbox: Pod %q already has sandbox %q", podKey, sb.ID)
 		}
@@ -463,12 +469,17 @@ func (s *LinuxPodService) RemoveContainer(ctx context.Context, req *runtimeapi.R
 
 // ContainerStatus reports a container's status, including LinuxPod identity and
 // shared-namespace evidence under verbose.
-func (s *LinuxPodService) ContainerStatus(_ context.Context, req *runtimeapi.ContainerStatusRequest) (*runtimeapi.ContainerStatusResponse, error) {
+func (s *LinuxPodService) ContainerStatus(ctx context.Context, req *runtimeapi.ContainerStatusRequest) (*runtimeapi.ContainerStatusResponse, error) {
 	id := req.GetContainerId()
 	if id == "" {
 		return nil, status.Error(codes.InvalidArgument, "ContainerStatus: container id is required")
 	}
 	c, ok := s.containers.Get(id)
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "ContainerStatus: container %q not found", id)
+	}
+	s.reconcileSandboxBackendState(ctx, c.SandboxID)
+	c, ok = s.containers.Get(id)
 	if !ok {
 		return nil, status.Errorf(codes.NotFound, "ContainerStatus: container %q not found", id)
 	}
@@ -493,7 +504,8 @@ func (s *LinuxPodService) ContainerStatus(_ context.Context, req *runtimeapi.Con
 }
 
 // ListContainers returns containers matching the filter.
-func (s *LinuxPodService) ListContainers(_ context.Context, req *runtimeapi.ListContainersRequest) (*runtimeapi.ListContainersResponse, error) {
+func (s *LinuxPodService) ListContainers(ctx context.Context, req *runtimeapi.ListContainersRequest) (*runtimeapi.ListContainersResponse, error) {
+	s.reconcileAllSandboxBackendState(ctx)
 	var items []*runtimeapi.Container
 	for _, c := range s.containers.List() {
 		c := c
@@ -609,10 +621,11 @@ func (s *LinuxPodService) RemovePodSandbox(ctx context.Context, req *runtimeapi.
 // PodSandboxStatus reports the sandbox, surfacing the shared namespace under
 // verbose. The Pod IP is reported by toCRIStatus only once the Pod network path is
 // actually attached (CRI-L3, #128) — never a reserved-but-unattached address.
-func (s *LinuxPodService) PodSandboxStatus(_ context.Context, req *runtimeapi.PodSandboxStatusRequest) (*runtimeapi.PodSandboxStatusResponse, error) {
+func (s *LinuxPodService) PodSandboxStatus(ctx context.Context, req *runtimeapi.PodSandboxStatusRequest) (*runtimeapi.PodSandboxStatusResponse, error) {
 	if req.GetPodSandboxId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "PodSandboxStatus: pod sandbox id is required")
 	}
+	s.reconcileSandboxBackendState(ctx, req.GetPodSandboxId())
 	sb, ok := s.sandboxes.Get(req.GetPodSandboxId())
 	if !ok {
 		return nil, status.Errorf(codes.NotFound, "PodSandboxStatus: sandbox %q not found", req.GetPodSandboxId())
@@ -639,7 +652,8 @@ func (s *LinuxPodService) PodSandboxStatus(_ context.Context, req *runtimeapi.Po
 }
 
 // ListPodSandbox returns sandboxes matching the filter.
-func (s *LinuxPodService) ListPodSandbox(_ context.Context, req *runtimeapi.ListPodSandboxRequest) (*runtimeapi.ListPodSandboxResponse, error) {
+func (s *LinuxPodService) ListPodSandbox(ctx context.Context, req *runtimeapi.ListPodSandboxRequest) (*runtimeapi.ListPodSandboxResponse, error) {
+	s.reconcileAllSandboxBackendState(ctx)
 	var items []*runtimeapi.PodSandbox
 	for _, sb := range s.sandboxes.List() {
 		sb := sb
@@ -780,6 +794,110 @@ func (s *LinuxPodService) RecoverContainers(ctx context.Context) {
 	if reconciled > 0 {
 		klog.InfoS("recovered LinuxPod CRI container state after restart", "reconciled", reconciled)
 	}
+}
+
+// StartBackendReconciler periodically probes Ready LinuxPod sandboxes against the
+// helper. A restarted helper currently cannot adopt the old helper's live VM
+// handles, so it answers ErrPodNotFound for those sandboxes. The reconciler turns
+// that into an honest CRI NotReady/Exited view, letting kubelet recreate the Pod
+// instead of leaving a stale Running status that only fails later on exec/logs.
+func (s *LinuxPodService) StartBackendReconciler(ctx context.Context, interval time.Duration) func() {
+	if interval <= 0 {
+		interval = 2 * time.Second
+	}
+	reconcileCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-reconcileCtx.Done():
+				return
+			case <-ticker.C:
+				s.reconcileAllSandboxBackendState(reconcileCtx)
+			}
+		}
+	}()
+	return func() {
+		cancel()
+		<-done
+	}
+}
+
+func (s *LinuxPodService) discardNotReadySandboxForRecreate(ctx context.Context, sb *store.Sandbox) error {
+	if sb == nil || sb.State != store.StateNotReady {
+		return nil
+	}
+	if err := s.detachSandboxNetwork(ctx, sb.ID); err != nil {
+		return err
+	}
+	for _, c := range s.containers.ListBySandbox(sb.ID) {
+		if err := s.containers.Delete(c.ID); err != nil {
+			return status.Errorf(codes.Internal, "RunPodSandbox: discard stale container %q: %v", c.ID, err)
+		}
+	}
+	if rep, err := s.backend.Cleanup(ctx, sb.ID); err != nil {
+		if !linuxpodBackendMissing(err) {
+			return linuxpodToCRIError("RunPodSandbox: discard stale sandbox", err)
+		}
+	} else if rep.StaleState {
+		klog.ErrorS(errors.New("backend reported stale state"), "RunPodSandbox: stale sandbox cleanup left residual state", "sandbox", sb.ID)
+	}
+	if err := s.sandboxes.Delete(sb.ID); err != nil {
+		return status.Errorf(codes.Internal, "RunPodSandbox: discard stale sandbox %q: %v", sb.ID, err)
+	}
+	klog.InfoS("discarded NotReady LinuxPod sandbox before recreation",
+		"sandbox", sb.ID, "namespace", sb.Metadata.Namespace, "name", sb.Metadata.Name)
+	return nil
+}
+
+func (s *LinuxPodService) reconcileAllSandboxBackendState(ctx context.Context) {
+	for _, sb := range s.sandboxes.List() {
+		s.reconcileSandboxBackendState(ctx, sb.ID)
+	}
+}
+
+func (s *LinuxPodService) reconcileSandboxBackendState(ctx context.Context, sandboxID string) {
+	sb, ok := s.sandboxes.Get(sandboxID)
+	if !ok || sb.State != store.StateReady {
+		return
+	}
+	if _, err := s.backend.PodStatus(ctx, sandboxID); err == nil {
+		return
+	} else if !linuxpodBackendMissing(err) {
+		klog.V(4).InfoS("LinuxPod backend status probe failed; retaining last known CRI state",
+			"sandbox", sandboxID, "err", err)
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sb, ok = s.sandboxes.Get(sandboxID)
+	if !ok || sb.State != store.StateReady {
+		return
+	}
+	if err := s.detachSandboxNetwork(ctx, sandboxID); err != nil {
+		klog.ErrorS(err, "failed to detach LinuxPod network after backend state loss", "sandbox", sandboxID)
+	}
+	for _, c := range s.containers.ListBySandbox(sandboxID) {
+		if c.State == store.ContainerExited {
+			continue
+		}
+		c.State = store.ContainerExited
+		c.FinishedAt = s.now().UnixNano()
+		c.Reason = "BackendLost"
+		c.Message = "LinuxPod helper no longer has live backend state for this sandbox"
+		if err := s.containers.Put(&c); err != nil {
+			klog.ErrorS(err, "failed to persist LinuxPod container backend-loss state", "containerID", c.ID, "sandbox", sandboxID)
+		}
+	}
+	if _, err := s.sandboxes.SetState(sandboxID, store.StateNotReady); err != nil {
+		klog.ErrorS(err, "failed to persist LinuxPod sandbox backend-loss state", "sandbox", sandboxID)
+		return
+	}
+	klog.InfoS("marked LinuxPod sandbox not ready after backend state loss", "sandbox", sandboxID)
 }
 
 // --- helpers ---

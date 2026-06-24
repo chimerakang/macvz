@@ -111,6 +111,8 @@ func serveLinuxPod(ctx context.Context, lis net.Listener, socketPath string, san
 	// Reconcile persisted records against the live backend after a restart without
 	// trusting stale identity evidence (identity is a start invariant).
 	svc.RecoverContainers(ctx)
+	stopReconciler := svc.StartBackendReconciler(ctx, time.Second)
+	defer stopReconciler()
 
 	// Wire the kubelet streaming URL server so LinuxPod-backed `kubectl exec`
 	// (non-interactive) and `kubectl port-forward` have the same CRI handoff path

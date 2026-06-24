@@ -557,20 +557,27 @@ phase_restart_helper() {
 	log "restarting/crashing the LinuxPod helper via operator hook"
 	run_hook "$MACVZ_RESTART_HELPER_CMD" >"$OUT_DIR/restart-helper.log" 2>&1 \
 		|| fail "MACVZ_RESTART_HELPER_CMD returned non-zero (see $OUT_DIR/restart-helper.log)"
-	local ok=0 _
+	local ok=0 exec_ok=0 out="" current_pod="" _
 	for _ in $(seq 1 60); do
-		[ "$(pod_phase "$pod")" = "Running" ] && { ok=1; break; }
+		current_pod="$(pod_name)"
+		if [ -n "$current_pod" ] && [ "$(pod_phase "$current_pod")" = "Running" ]; then
+			ok=1
+			out="$(kn exec "$current_pod" -c app -- sh -c 'cat /www/index.html; echo; cat /shared/sidecar-localhost 2>/dev/null' 2>"$OUT_DIR/restart-helper-exec.err" || true)"
+			echo "$out" >"$OUT_DIR/restart-helper-exec.out"
+			if printf '%s' "$out" | grep -q "$MARKER" && printf '%s' "$out" | grep -q "$SIDECAR_LOCALHOST_MARKER"; then
+				exec_ok=1
+				pod="$current_pod"
+				break
+			fi
+		fi
 		sleep 2
 	done
 	[ "$ok" = 1 ] && pass "Pod recovered to Running after helper restart" \
 		|| fail "Pod not Running after helper restart (record the failure handling as the next blocker; see $OUT_DIR/restart-helper.log)"
-	local out
-	out="$(kn exec "$pod" -c app -- sh -c 'cat /www/index.html; echo; cat /shared/sidecar-localhost 2>/dev/null' 2>"$OUT_DIR/restart-helper-exec.err" || true)"
-	echo "$out" >"$OUT_DIR/restart-helper-exec.out"
-	if printf '%s' "$out" | grep -q "$MARKER" && printf '%s' "$out" | grep -q "$SIDECAR_LOCALHOST_MARKER"; then
-		pass "exec still works after helper restart"
+	if [ "$exec_ok" = 1 ]; then
+		pass "exec works after helper restart/recreate"
 	else
-		fail "exec failed after helper restart (helper lost live backend state; see $OUT_DIR/restart-helper-exec.err)"
+		fail "exec did not recover after helper restart (helper lost live backend state and kubelet did not recreate in time; see $OUT_DIR/restart-helper-exec.err)"
 	fi
 }
 

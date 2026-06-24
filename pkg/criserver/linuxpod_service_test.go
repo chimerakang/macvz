@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/chimerakang/macvz/pkg/criserver/store"
 	"github.com/chimerakang/macvz/pkg/runtime/linuxpod"
@@ -244,6 +245,128 @@ func TestLinuxPodServiceTeardownToleratesMissingBackendPod(t *testing.T) {
 	}
 	if _, err := svc.PodSandboxStatus(ctx, &runtimeapi.PodSandboxStatusRequest{PodSandboxId: sandboxID}); status.Code(err) != codes.NotFound {
 		t.Errorf("PodSandboxStatus after missing-backend remove = %v, want NotFound", err)
+	}
+}
+
+func TestLinuxPodServiceStatusMarksBackendLostSandboxNotReady(t *testing.T) {
+	backend := linuxpod.NewFakeBackend()
+	svc := newLinuxPodTestService(t, backend)
+	ctx := context.Background()
+
+	sandboxID := lpRunSandbox(t, svc)
+	appID := lpCreateStart(t, svc, sandboxID, "app")
+	sidecarID := lpCreateStart(t, svc, sandboxID, "sidecar")
+
+	if _, err := backend.Cleanup(ctx, sandboxID); err != nil {
+		t.Fatalf("backend.Cleanup precondition: %v", err)
+	}
+
+	sbStatus, err := svc.PodSandboxStatus(ctx, &runtimeapi.PodSandboxStatusRequest{PodSandboxId: sandboxID})
+	if err != nil {
+		t.Fatalf("PodSandboxStatus after backend loss: %v", err)
+	}
+	if got := sbStatus.GetStatus().GetState(); got != runtimeapi.PodSandboxState_SANDBOX_NOTREADY {
+		t.Fatalf("sandbox state after backend loss = %s, want NOTREADY", got)
+	}
+	for _, id := range []string{appID, sidecarID} {
+		st, err := svc.ContainerStatus(ctx, &runtimeapi.ContainerStatusRequest{ContainerId: id})
+		if err != nil {
+			t.Fatalf("ContainerStatus(%s) after backend loss: %v", id, err)
+		}
+		if got := st.GetStatus().GetState(); got != runtimeapi.ContainerState_CONTAINER_EXITED {
+			t.Errorf("container %s state after backend loss = %s, want EXITED", id, got)
+		}
+		if got := st.GetStatus().GetReason(); got != "BackendLost" {
+			t.Errorf("container %s reason after backend loss = %q, want BackendLost", id, got)
+		}
+	}
+	list, err := svc.ListContainers(ctx, &runtimeapi.ListContainersRequest{
+		Filter: &runtimeapi.ContainerFilter{State: &runtimeapi.ContainerStateValue{State: runtimeapi.ContainerState_CONTAINER_RUNNING}},
+	})
+	if err != nil {
+		t.Fatalf("ListContainers running after backend loss: %v", err)
+	}
+	if len(list.GetContainers()) != 0 {
+		t.Fatalf("running containers after backend loss = %d, want 0", len(list.GetContainers()))
+	}
+	sandboxes, err := svc.ListPodSandbox(ctx, &runtimeapi.ListPodSandboxRequest{
+		Filter: &runtimeapi.PodSandboxFilter{State: &runtimeapi.PodSandboxStateValue{State: runtimeapi.PodSandboxState_SANDBOX_READY}},
+	})
+	if err != nil {
+		t.Fatalf("ListPodSandbox ready after backend loss: %v", err)
+	}
+	if len(sandboxes.GetItems()) != 0 {
+		t.Fatalf("ready sandboxes after backend loss = %d, want 0", len(sandboxes.GetItems()))
+	}
+}
+
+func TestLinuxPodServiceBackendReconcilerMarksBackendLostSandboxNotReady(t *testing.T) {
+	backend := linuxpod.NewFakeBackend()
+	svc := newLinuxPodTestService(t, backend)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sandboxID := lpRunSandbox(t, svc)
+	appID := lpCreateStart(t, svc, sandboxID, "app")
+
+	stop := svc.StartBackendReconciler(ctx, 10*time.Millisecond)
+	defer stop()
+	if _, err := backend.Cleanup(context.Background(), sandboxID); err != nil {
+		t.Fatalf("backend.Cleanup precondition: %v", err)
+	}
+
+	deadline := time.After(2 * time.Second)
+	for {
+		sb, _ := svc.sandboxes.Get(sandboxID)
+		c, _ := svc.containers.Get(appID)
+		if sb.State == store.StateNotReady && c.State == store.ContainerExited {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("backend reconciler did not mark sandbox/container lost: sandbox=%s container=%s", sb.State, c.State)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
+func TestLinuxPodServiceRunPodSandboxReplacesNotReadySandbox(t *testing.T) {
+	backend := linuxpod.NewFakeBackend()
+	svc := newLinuxPodTestService(t, backend)
+	ctx := context.Background()
+
+	cfg := &runtimeapi.PodSandboxConfig{
+		Metadata: &runtimeapi.PodSandboxMetadata{Name: "pod", Namespace: "default", Uid: "uid-1"},
+	}
+	first, err := svc.RunPodSandbox(ctx, &runtimeapi.RunPodSandboxRequest{Config: cfg})
+	if err != nil {
+		t.Fatalf("RunPodSandbox(first): %v", err)
+	}
+	firstID := first.GetPodSandboxId()
+	containerID := lpCreateStart(t, svc, firstID, "app")
+	if _, err := backend.Cleanup(ctx, firstID); err != nil {
+		t.Fatalf("backend.Cleanup precondition: %v", err)
+	}
+	if _, err := svc.PodSandboxStatus(ctx, &runtimeapi.PodSandboxStatusRequest{PodSandboxId: firstID}); err != nil {
+		t.Fatalf("PodSandboxStatus after backend loss: %v", err)
+	}
+
+	second, err := svc.RunPodSandbox(ctx, &runtimeapi.RunPodSandboxRequest{Config: cfg})
+	if err != nil {
+		t.Fatalf("RunPodSandbox(replacement): %v", err)
+	}
+	secondID := second.GetPodSandboxId()
+	if secondID == "" || secondID == firstID {
+		t.Fatalf("replacement sandbox ID = %q, first ID = %q", secondID, firstID)
+	}
+	if _, ok := svc.sandboxes.Get(firstID); ok {
+		t.Fatalf("first NotReady sandbox %s should be discarded before replacement", firstID)
+	}
+	if _, ok := svc.containers.Get(containerID); ok {
+		t.Fatalf("container from discarded sandbox %s should be removed", containerID)
+	}
+	if sb, ok := svc.sandboxes.Get(secondID); !ok || sb.State != store.StateReady {
+		t.Fatalf("replacement sandbox state = %q ok=%t, want Ready", sb.State, ok)
 	}
 }
 

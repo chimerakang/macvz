@@ -61,7 +61,8 @@ func TestPingAdvertisesCapabilities(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Ping: %v", err)
 			}
-			if !info.Capabilities.Logs || !info.Capabilities.Exec || !info.Capabilities.Stats {
+			if !info.Capabilities.Logs || !info.Capabilities.Exec || !info.Capabilities.Stats ||
+				!info.Capabilities.Attach || !info.Capabilities.PortForward {
 				t.Errorf("default fake should advertise all surfaces, got %+v", info.Capabilities)
 			}
 		})
@@ -246,6 +247,113 @@ func TestContainerStats(t *testing.T) {
 		client := newPipeClient(t, be)
 		if _, err := client.ContainerStats(ctx, ref); !errors.Is(err, ErrUnsupported) {
 			t.Errorf("ContainerStats = %v, want ErrUnsupported", err)
+		}
+	})
+}
+
+// TestAttachSupportedAndGated covers the CRI-L4 follow-up (#131) Attach surface:
+// the supported path negotiates streams for a running container (flagged Simulated),
+// rejects a non-running/unknown container, and reports ErrUnsupported — over the
+// wire too — when the capability is off.
+func TestAttachSupportedAndGated(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("supported", func(t *testing.T) {
+		b := NewFakeBackend()
+		ref := startedContainer(t, b, "p", "app", "")
+		res, err := b.Attach(ctx, AttachRequest{PodID: ref.PodID, ContainerID: ref.ContainerID, Stdin: true, Stdout: true, TTY: true})
+		if err != nil {
+			t.Fatalf("Attach: %v", err)
+		}
+		if !res.Simulated || !res.Stdin || !res.Stdout || !res.TTY {
+			t.Errorf("attach negotiation should echo requested streams and be Simulated: %+v", res)
+		}
+	})
+
+	t.Run("overPipe", func(t *testing.T) {
+		b := NewFakeBackend()
+		ref := startedContainer(t, b, "p", "app", "")
+		client := newPipeClient(t, b)
+		res, err := client.Attach(ctx, AttachRequest{PodID: ref.PodID, ContainerID: ref.ContainerID, Stderr: true})
+		if err != nil {
+			t.Fatalf("Attach over pipe: %v", err)
+		}
+		if !res.Stderr || !res.Simulated {
+			t.Errorf("attach negotiation did not round-trip: %+v", res)
+		}
+	})
+
+	t.Run("notRunning", func(t *testing.T) {
+		b := NewFakeBackend()
+		if _, err := b.CreatePod(ctx, PodSpec{ID: "p"}); err != nil {
+			t.Fatalf("CreatePod: %v", err)
+		}
+		rf, _ := b.PrepareContainerRootfs(ctx, RootfsRequest{PodID: "p", ContainerName: "c", ExpectedIdentity: "macvz-rootfs-id=c"})
+		created, _ := b.CreateContainer(ctx, CreateRequest{PodID: "p", Name: "c", RootfsToken: rf.Token})
+		if _, err := b.Attach(ctx, AttachRequest{PodID: "p", ContainerID: created.ID, Stdout: true}); !errors.Is(err, ErrInvalid) {
+			t.Errorf("Attach on Created container = %v, want ErrInvalid", err)
+		}
+	})
+
+	t.Run("unsupportedOverPipe", func(t *testing.T) {
+		be := NewFakeBackend()
+		be.Capabilities.Attach = false
+		ref := startedContainer(t, be, "p", "app", "")
+		client := newPipeClient(t, be)
+		if _, err := client.Attach(ctx, AttachRequest{PodID: ref.PodID, ContainerID: ref.ContainerID, Stdout: true}); !errors.Is(err, ErrUnsupported) {
+			t.Errorf("Attach = %v, want ErrUnsupported", err)
+		}
+	})
+}
+
+// TestPortForwardSupportedAndGated covers the #131 PortForward surface: the
+// supported path negotiates forwardable ports for a known pod (flagged Simulated),
+// rejects an unknown pod and an out-of-range port, and reports ErrUnsupported —
+// over the wire too — when the capability is off.
+func TestPortForwardSupportedAndGated(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("supportedOverPipe", func(t *testing.T) {
+		b := NewFakeBackend()
+		if _, err := b.CreatePod(ctx, PodSpec{ID: "p"}); err != nil {
+			t.Fatalf("CreatePod: %v", err)
+		}
+		client := newPipeClient(t, b)
+		res, err := client.PortForward(ctx, PortForwardRequest{PodID: "p", Ports: []int32{8080, 9090}})
+		if err != nil {
+			t.Fatalf("PortForward: %v", err)
+		}
+		if !res.Simulated || len(res.Ports) != 2 || res.Ports[0] != 8080 || res.Ports[1] != 9090 {
+			t.Errorf("port-forward negotiation did not round-trip: %+v", res)
+		}
+	})
+
+	t.Run("unknownPod", func(t *testing.T) {
+		b := NewFakeBackend()
+		if _, err := b.PortForward(ctx, PortForwardRequest{PodID: "missing", Ports: []int32{80}}); !errors.Is(err, ErrPodNotFound) {
+			t.Errorf("PortForward(unknown pod) = %v, want ErrPodNotFound", err)
+		}
+	})
+
+	t.Run("badPort", func(t *testing.T) {
+		b := NewFakeBackend()
+		if _, err := b.CreatePod(ctx, PodSpec{ID: "p"}); err != nil {
+			t.Fatalf("CreatePod: %v", err)
+		}
+		if _, err := b.PortForward(ctx, PortForwardRequest{PodID: "p", Ports: []int32{70000}}); !errors.Is(err, ErrInvalid) {
+			t.Errorf("PortForward(bad port) = %v, want ErrInvalid", err)
+		}
+	})
+
+	t.Run("unsupportedOverPipe", func(t *testing.T) {
+		be := NewFakeBackend()
+		be.Capabilities.PortForward = false
+		if _, err := be.CreatePod(ctx, PodSpec{ID: "p"}); err != nil {
+			t.Fatalf("CreatePod: %v", err)
+		}
+		client := newPipeClient(t, be)
+		if _, err := client.PortForward(ctx, PortForwardRequest{PodID: "p", Ports: []int32{80}}); !errors.Is(err, ErrUnsupported) {
+			t.Errorf("PortForward = %v, want ErrUnsupported", err)
 		}
 	})
 }

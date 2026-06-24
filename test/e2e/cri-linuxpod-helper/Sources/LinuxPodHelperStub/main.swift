@@ -12,15 +12,19 @@ import Foundation
 //
 // Usage: linuxpod-helper-stub --socket /path/to/helper.sock
 
-let protocolVersion = 3
+let protocolVersion = 5
 
-// Capabilities advertised in Ping. The stub backs all three kubelet surfaces
-// (logs, exec, stats) in simulated form, matching the Go FakeBackend (CRI-L4, #129).
-// Held in an enum namespace (not top-level code) so it is a nonisolated Sendable
-// global: top-level `let` in main.swift is @MainActor-isolated under Swift 6,
-// which the nonisolated lifecycle methods below cannot reference.
+// Capabilities advertised in Ping. The stub backs the kubelet surfaces — logs,
+// exec, stats (CRI-L4 #129), execStream (CRI-L4 follow-up #132), and attach,
+// portForward (CRI-L4 follow-up #131) — in simulated form, matching the Go
+// FakeBackend. Held in an enum namespace (not top-level code) so it is a
+// nonisolated Sendable global: top-level `let` in main.swift is @MainActor-isolated
+// under Swift 6, which the nonisolated lifecycle methods below cannot reference.
 enum Capabilities {
-    static let all: [String: Bool] = ["logs": true, "exec": true, "stats": true]
+    static let all: [String: Bool] = [
+        "logs": true, "exec": true, "execStream": true, "stats": true,
+        "attach": true, "portForward": true,
+    ]
 }
 
 // MARK: - In-memory lifecycle model (mirrors the Go FakeBackend)
@@ -267,6 +271,73 @@ final class Model {
         ]
     }
 
+    func attach(_ p: [String: Any]) throws -> [String: Any] {
+        guard Capabilities.all["attach"] == true else {
+            throw BackendError(code: "Unsupported", message: "attach")
+        }
+        let (_, c) = try lookup(p)
+        if c.phase != "Running" {
+            throw BackendError(code: "Invalid", message: "container \(c.id) is \(c.phase), attach requires Running")
+        }
+        // Simulated negotiation: echo the requested streams (real VM-internal stream
+        // plumbing is the #131 non-goal), matching the Go FakeBackend.
+        return [
+            "stdin": (p["stdin"] as? Bool) ?? false,
+            "stdout": (p["stdout"] as? Bool) ?? false,
+            "stderr": (p["stderr"] as? Bool) ?? false,
+            "tty": (p["tty"] as? Bool) ?? false,
+            "simulated": true,
+            "message": "simulated attach negotiation (no real VM-internal streams)",
+        ]
+    }
+
+    func execStream(_ p: [String: Any]) throws -> [String: Any] {
+        guard Capabilities.all["execStream"] == true else {
+            throw BackendError(code: "Unsupported", message: "execstream")
+        }
+        let (_, c) = try lookup(p)
+        let command = (p["command"] as? [String]) ?? []
+        if command.isEmpty {
+            throw BackendError(code: "Invalid", message: "exec command is required")
+        }
+        if c.phase != "Running" {
+            throw BackendError(code: "Invalid", message: "container \(c.id) is \(c.phase), exec requires Running")
+        }
+        // Simulated interactive negotiation: echo the requested streams; a TTY session
+        // folds stderr into stdout (CRI convention). Real VM-internal stream plumbing
+        // is the #132 non-goal, matching the Go FakeBackend.
+        let tty = (p["tty"] as? Bool) ?? false
+        return [
+            "stdin": (p["stdin"] as? Bool) ?? false,
+            "stdout": (p["stdout"] as? Bool) ?? false,
+            "stderr": ((p["stderr"] as? Bool) ?? false) && !tty,
+            "tty": tty,
+            "simulated": true,
+            "message": "simulated interactive exec negotiation (no real VM-internal streams)",
+        ]
+    }
+
+    func portForward(_ p: [String: Any]) throws -> [String: Any] {
+        guard Capabilities.all["portForward"] == true else {
+            throw BackendError(code: "Unsupported", message: "portforward")
+        }
+        let podID = (p["podID"] as? String) ?? ""
+        guard pods[podID] != nil else {
+            throw BackendError(code: "PodNotFound", message: podID)
+        }
+        let ports = (p["ports"] as? [Int]) ?? []
+        for port in ports where port <= 0 || port > 65535 {
+            throw BackendError(code: "Invalid", message: "port \(port) out of range")
+        }
+        // Simulated negotiation: report the requested ports forwardable (real byte
+        // streams are the #131 non-goal), matching the Go FakeBackend.
+        return [
+            "ports": ports,
+            "simulated": true,
+            "message": "simulated port-forward negotiation (no real byte streams)",
+        ]
+    }
+
     func stopContainer(_ p: [String: Any]) throws -> [String: Any] {
         let podID = (p["podID"] as? String) ?? ""
         let cid = (p["containerID"] as? String) ?? ""
@@ -377,6 +448,12 @@ func dispatch(_ model: Model, _ line: Data) -> [String: Any] {
             return ok(try model.execSync(payload))
         case "ContainerStats":
             return ok(try model.containerStats(payload))
+        case "ExecStream":
+            return ok(try model.execStream(payload))
+        case "Attach":
+            return ok(try model.attach(payload))
+        case "PortForward":
+            return ok(try model.portForward(payload))
         default:
             return ["ok": false, "code": "Invalid", "error": "unknown op \(op)"]
         }

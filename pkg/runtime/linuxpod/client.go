@@ -163,6 +163,18 @@ func (c *HelperClient) ContainerStats(ctx context.Context, ref Ref) (ContainerSt
 	return st, err
 }
 
+func (c *HelperClient) Attach(ctx context.Context, req AttachRequest) (AttachResponse, error) {
+	var res AttachResponse
+	err := c.call(ctx, opAttach, req, &res)
+	return res, err
+}
+
+func (c *HelperClient) PortForward(ctx context.Context, req PortForwardRequest) (PortForwardResponse, error) {
+	var res PortForwardResponse
+	err := c.call(ctx, opPortForward, req, &res)
+	return res, err
+}
+
 func (c *HelperClient) Cleanup(ctx context.Context, podID string) (CleanupReport, error) {
 	var rep CleanupReport
 	err := c.call(ctx, opCleanup, struct {

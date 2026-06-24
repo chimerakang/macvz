@@ -69,7 +69,8 @@ func TestSwiftHelperStubContract(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Ping: %v", err)
 	}
-	if !info.Capabilities.Logs || !info.Capabilities.Exec || !info.Capabilities.Stats {
+	if !info.Capabilities.Logs || !info.Capabilities.Exec || !info.Capabilities.Stats ||
+		!info.Capabilities.Attach || !info.Capabilities.PortForward {
 		t.Errorf("swift stub should advertise all surfaces, got %+v", info.Capabilities)
 	}
 	res, err := client.ExecSync(ctx, ExecRequest{PodID: app.PodID, ContainerID: app.ID, Command: []string{"echo", "ok"}})
@@ -88,6 +89,39 @@ func TestSwiftHelperStubContract(t *testing.T) {
 	}
 	if _, err := client.ContainerLogPath(ctx, Ref{PodID: app.PodID, ContainerID: app.ID}); !errors.Is(err, ErrInvalid) {
 		t.Errorf("ContainerLogPath without a log path = %v, want ErrInvalid", err)
+	}
+
+	// CRI-L4 follow-up #131: Attach and PortForward negotiate over the same socket,
+	// proving the Go client and Swift stub stay in lock-step on the new ops.
+	att, err := client.Attach(ctx, AttachRequest{PodID: app.PodID, ContainerID: app.ID, Stdin: true, Stdout: true, TTY: true})
+	if err != nil {
+		t.Fatalf("Attach over swift stub: %v", err)
+	}
+	if !att.Simulated || !att.Stdin || !att.Stdout || !att.TTY {
+		t.Errorf("swift attach negotiation did not round-trip: %+v", att)
+	}
+	pf, err := client.PortForward(ctx, PortForwardRequest{PodID: app.PodID, Ports: []int32{8080, 9090}})
+	if err != nil {
+		t.Fatalf("PortForward over swift stub: %v", err)
+	}
+	if !pf.Simulated || len(pf.Ports) != 2 || pf.Ports[0] != 8080 || pf.Ports[1] != 9090 {
+		t.Errorf("swift port-forward negotiation did not round-trip: %+v", pf)
+	}
+
+	// CRI-L4 follow-up #132: interactive exec negotiates over the same socket. The
+	// stub advertises ExecStream and a TTY session folds stderr into stdout.
+	if !info.Capabilities.ExecStream {
+		t.Errorf("swift stub should advertise ExecStream, got %+v", info.Capabilities)
+	}
+	es, err := client.ExecStream(ctx, ExecStreamRequest{
+		PodID: app.PodID, ContainerID: app.ID,
+		Command: []string{"/bin/sh"}, Stdin: true, Stdout: true, Stderr: true, TTY: true,
+	})
+	if err != nil {
+		t.Fatalf("ExecStream over swift stub: %v", err)
+	}
+	if !es.Simulated || !es.TTY || es.Stderr || !es.Stdin || !es.Stdout {
+		t.Errorf("swift ExecStream TTY negotiation unexpected: %+v", es)
 	}
 }
 

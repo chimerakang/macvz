@@ -125,12 +125,30 @@ func dispatch(ctx context.Context, backend Backend, line []byte) wireResponse {
 			return errResponse(err)
 		}
 		return result(backend.ExecSync(ctx, r))
+	case opExecStream:
+		var r ExecStreamRequest
+		if err := decode(req.Payload, &r); err != nil {
+			return errResponse(err)
+		}
+		return result(backend.ExecStream(ctx, r))
 	case opContainerStats:
 		var ref Ref
 		if err := decode(req.Payload, &ref); err != nil {
 			return errResponse(err)
 		}
 		return result(backend.ContainerStats(ctx, ref))
+	case opAttach:
+		var r AttachRequest
+		if err := decode(req.Payload, &r); err != nil {
+			return errResponse(err)
+		}
+		return result(backend.Attach(ctx, r))
+	case opPortForward:
+		var r PortForwardRequest
+		if err := decode(req.Payload, &r); err != nil {
+			return errResponse(err)
+		}
+		return result(backend.PortForward(ctx, r))
 	default:
 		return errResponse(ErrInvalid)
 	}

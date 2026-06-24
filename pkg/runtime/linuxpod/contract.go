@@ -134,11 +134,42 @@ type Backend interface {
 	// (#129 non-goals) and tracked as follow-ups.
 	ExecSync(ctx context.Context, req ExecRequest) (ExecResult, error)
 
+	// ExecStream negotiates an interactive/streaming exec session in a running
+	// container (`kubectl exec -it`) — the streaming counterpart to ExecSync that
+	// #129 scoped out (CRI-L4 follow-up #132). It is capability-gated: ErrUnsupported
+	// when Capabilities.ExecStream is false. When supported it validates the target
+	// (ErrContainerNotFound for an unknown ref, ErrInvalid when not Running or the
+	// command is empty) and returns an ExecStreamResponse describing the negotiated
+	// session (which streams attach, whether a TTY was granted). A simulated backend
+	// sets ExecStreamResponse.Simulated true: the feasibility/negotiation is modeled,
+	// the actual bidirectional VM-internal stream plumbing is the documented non-goal.
+	ExecStream(ctx context.Context, req ExecStreamRequest) (ExecStreamResponse, error)
+
 	// ContainerStats returns a point-in-time resource sample for one container for
 	// kubelet summary stats. Returns ErrUnsupported when Capabilities.Stats is false.
 	// A simulated backend marks the sample Simulated so the adapter never reports
 	// modeled numbers as measured.
 	ContainerStats(ctx context.Context, ref Ref) (ContainerStats, error)
+
+	// Attach negotiates attaching to a running container's stdio streams
+	// (`kubectl attach`), the interactive surface #129 deliberately scoped out
+	// (CRI-L4 follow-up #131). It is capability-gated: ErrUnsupported when
+	// Capabilities.Attach is false. When supported it validates the target
+	// (ErrContainerNotFound for an unknown ref, ErrInvalid when not Running) and
+	// returns an AttachResponse describing the negotiated streams. A simulated
+	// backend sets AttachResponse.Simulated true: the feasibility/negotiation is
+	// modeled, the actual VM-internal stream plumbing is the documented non-goal.
+	Attach(ctx context.Context, req AttachRequest) (AttachResponse, error)
+
+	// PortForward negotiates forwarding host ports to a Pod VM port
+	// (`kubectl port-forward`), the other interactive surface #129 scoped out
+	// (#131). It is capability-gated: ErrUnsupported when Capabilities.PortForward
+	// is false. When supported it validates the pod (ErrPodNotFound for an unknown
+	// pod) and the ports (ErrInvalid for an out-of-range port) and returns a
+	// PortForwardResponse listing the forwardable ports. A simulated backend sets
+	// PortForwardResponse.Simulated true; the actual byte-stream forwarding is the
+	// documented non-goal.
+	PortForward(ctx context.Context, req PortForwardRequest) (PortForwardResponse, error)
 }
 
 // HelperInfo is the handshake result: which helper answered and what it supports.
@@ -168,9 +199,28 @@ type Capabilities struct {
 	// (ExecSync) — enough for kubelet exec liveness/readiness probes. It does not
 	// imply interactive/streaming Exec, Attach, or PortForward.
 	Exec bool `json:"exec"`
+	// ExecStream is true when the backend negotiates an interactive/streaming exec
+	// session (ExecStream): stdin plus an optional TTY and terminal resize, for
+	// `kubectl exec -it`. Separate from Exec on purpose — a backend may back the
+	// synchronous ExecSync but not interactive streaming. The contract surface
+	// negotiates feasibility, TTY, and stdin; the actual bidirectional byte plumbing
+	// into the Pod VM is the documented non-goal (CRI-L4 follow-up #132). False →
+	// ExecStream returns ErrUnsupported.
+	ExecStream bool `json:"execStream"`
 	// Stats is true when the backend reports per-container resource samples
 	// (ContainerStats) for kubelet summaries.
 	Stats bool `json:"stats"`
+	// Attach is true when the backend can attach to a running container's stdio
+	// streams (`kubectl attach`). The contract surface (Attach) negotiates
+	// feasibility and TTY; the actual bidirectional stream plumbing into the Pod VM
+	// is a separate concern (CRI-L4 follow-up #131 non-goal). False → Attach returns
+	// ErrUnsupported.
+	Attach bool `json:"attach"`
+	// PortForward is true when the backend can forward host ports to a Pod VM port
+	// (`kubectl port-forward`). The contract surface (PortForward) negotiates which
+	// ports are forwardable; the actual byte-stream forwarding is out of scope (#131
+	// non-goal). False → PortForward returns ErrUnsupported.
+	PortForward bool `json:"portForward"`
 }
 
 // PodSpec describes a LinuxPod sandbox VM to create.
@@ -326,6 +376,46 @@ type ContainerStats struct {
 	Simulated bool `json:"simulated"`
 }
 
+// AttachRequest negotiates an attach to a running container's stdio (#131). The
+// stream-direction flags mirror the CRI AttachRequest; the backend reports which
+// it can honor in AttachResponse.
+type AttachRequest struct {
+	PodID       string `json:"podID"`
+	ContainerID string `json:"containerID"`
+	Stdin       bool   `json:"stdin,omitempty"`
+	Stdout      bool   `json:"stdout,omitempty"`
+	Stderr      bool   `json:"stderr,omitempty"`
+	TTY         bool   `json:"tty,omitempty"`
+}
+
+// AttachResponse reports the negotiated attach. Simulated marks a stub/fake that
+// modeled the negotiation without wiring real VM-internal streams (#131 non-goal).
+type AttachResponse struct {
+	// Stdin/Stdout/Stderr/TTY echo the streams the backend would actually attach,
+	// which may be a subset of those requested.
+	Stdin     bool   `json:"stdin"`
+	Stdout    bool   `json:"stdout"`
+	Stderr    bool   `json:"stderr"`
+	TTY       bool   `json:"tty"`
+	Simulated bool   `json:"simulated"`
+	Message   string `json:"message,omitempty"`
+}
+
+// PortForwardRequest negotiates forwarding the given Pod VM ports (#131).
+type PortForwardRequest struct {
+	PodID string  `json:"podID"`
+	Ports []int32 `json:"ports,omitempty"`
+}
+
+// PortForwardResponse lists the ports the backend can forward. Simulated marks a
+// stub/fake that modeled the negotiation without wiring real byte streams (#131
+// non-goal).
+type PortForwardResponse struct {
+	Ports     []int32 `json:"ports,omitempty"`
+	Simulated bool    `json:"simulated"`
+	Message   string  `json:"message,omitempty"`
+}
+
 // CleanupReport summarizes a Cleanup so the caller can assert no leaks.
 type CleanupReport struct {
 	PodID             string `json:"podID"`
@@ -343,5 +433,7 @@ type CleanupReport struct {
 // ops, CreateRequest.LogPath) for CRI-L4 (#129). v3 added the PodStatus op and
 // PodStatus.SandboxAddress for Pod networking address discovery, CRI-L3 (#128).
 // v4 added CreateRequest.Mounts so kubelet-managed ConfigMap/Secret/emptyDir
-// volumes reach the LinuxPod helper in the #130 in-loop path.
-const ProtocolVersion = 4
+// volumes reach the LinuxPod helper in the #130 in-loop path. v5 added the
+// interactive surface ops + capabilities: Attach and PortForward (CRI-L4
+// follow-up #131) and ExecStream (CRI-L4 follow-up #132).
+const ProtocolVersion = 5

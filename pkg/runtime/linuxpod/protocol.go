@@ -32,7 +32,10 @@ const (
 	opCleanup         Op = "Cleanup"
 	opContainerLog    Op = "ContainerLogPath"
 	opExecSync        Op = "ExecSync"
+	opExecStream      Op = "ExecStream"
 	opContainerStats  Op = "ContainerStats"
+	opAttach          Op = "Attach"
+	opPortForward     Op = "PortForward"
 )
 
 // wireRequest is the envelope for one call. Payload is the op-specific request

@@ -54,8 +54,16 @@ and ignored so they cannot wedge create/start (test:
 `ExecSync(ExecRequest) (ExecResult, error)` runs a command to completion — the
 primitive kubelet uses for exec liveness/readiness probes and non-interactive
 `kubectl exec`. The fake/stub echo the command (simulated, no real VM). Exec on a
-non-running container or with an empty command is `ErrInvalid`. Interactive /
-streaming exec is **out of scope** and tracked in **#132**.
+non-running container or with an empty command is `ErrInvalid`.
+
+Interactive/streaming exec (`kubectl exec -it`) landed as the `ExecStream`
+**negotiation surface** (#132), a peer of the Attach/PortForward interactive
+surfaces below: capability-gated by `Capabilities.ExecStream` (separate from
+`Capabilities.Exec`, which is ExecSync), it validates the target and returns an
+`ExecStreamResponse` describing the session it would open — which streams attach,
+whether a TTY was granted (a TTY folds stderr into stdout) — flagged
+`Simulated:true`. The actual bidirectional VM-internal byte plumbing has nothing to
+attach to in a stub/fake and remains a future production streaming transport.
 
 ### 4. Stats (AC3)
 
@@ -71,9 +79,11 @@ unobservable samples.
 
 ## Deferred (follow-ups)
 
-- **#131** — Attach / PortForward (issue non-goal; CRI RPC returns
-  `Unimplemented` until the streaming follow-up lands).
-- **#132** — interactive/streaming Exec (beyond `ExecSync`).
+- **#131** — Attach / PortForward negotiation surfaces (landed, simulated;
+  real byte plumbing is the documented non-goal).
+- **#132** — interactive/streaming Exec (`ExecStream`) negotiation surface
+  (landed, simulated; real bidirectional byte plumbing remains a future transport
+  concern).
 - **#133** — back logs/exec/stats with real Apple Containerization data and drop
   the `simulated` flags once measured.
 

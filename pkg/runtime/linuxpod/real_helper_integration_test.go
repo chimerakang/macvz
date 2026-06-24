@@ -2,7 +2,6 @@ package linuxpod
 
 import (
 	"context"
-	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -134,22 +133,106 @@ func TestRealLinuxPodHelperLifecycle(t *testing.T) {
 	t.Logf("LIVE EVIDENCE: sidecar id=%s phase=%s identityVerified=%v observed=%q createdAfterPodRunning=%v localhostReachable=%v",
 		sidecar.ID, sidecar.Phase, sidecar.IdentityVerified, sidecar.ObservedIdentity, sidecar.CreatedAfterPodRunning, sidecar.LocalhostReachable)
 
-	// The real helper does not yet back the kubelet surfaces (CRI-L4 #129); it must
-	// say so honestly rather than fake results.
-	if info.Capabilities.Logs || info.Capabilities.Exec || info.Capabilities.Stats {
-		t.Errorf("real helper should advertise no kubelet surfaces yet, got %+v", info.Capabilities)
+	// CRI-L4 follow-up (#133): the real helper now backs logs, exec, and stats with
+	// real Pod-VM data.
+	if !info.Capabilities.Exec || !info.Capabilities.Stats {
+		t.Errorf("real helper should advertise exec+stats backed, got %+v", info.Capabilities)
 	}
+
+	// Exec: run a real command in the app container; verify measured stdout + exit.
+	ctx, cancel = call(2 * time.Minute)
+	execRes, err := client.ExecSync(ctx, ExecRequest{
+		PodID: podID, ContainerID: app.ID, Command: []string{"/bin/sh", "-c", "echo macvz-exec-ok"}})
+	cancel()
+	if err != nil {
+		t.Fatalf("ExecSync: %v", err)
+	}
+	if execRes.ExitCode != 0 || !strings.Contains(string(execRes.Stdout), "macvz-exec-ok") {
+		t.Errorf("ExecSync did not return real output: exit=%d stdout=%q stderr=%q",
+			execRes.ExitCode, execRes.Stdout, execRes.Stderr)
+	}
+	t.Logf("LIVE EVIDENCE: exec app `echo macvz-exec-ok` -> exit=%d stdout=%q",
+		execRes.ExitCode, strings.TrimSpace(string(execRes.Stdout)))
+
+	// Exec faithfully reports a non-zero exit code from the real process.
 	ctx, cancel = call(time.Minute)
-	if _, err := client.ExecSync(ctx, ExecRequest{PodID: podID, ContainerID: app.ID, Command: []string{"echo", "hi"}}); !errors.Is(err, ErrUnsupported) {
-		t.Errorf("ExecSync = %v, want ErrUnsupported", err)
-	}
-	if _, err := client.ContainerStats(ctx, Ref{PodID: podID, ContainerID: app.ID}); !errors.Is(err, ErrUnsupported) {
-		t.Errorf("ContainerStats = %v, want ErrUnsupported", err)
-	}
-	if _, err := client.ContainerLogPath(ctx, Ref{PodID: podID, ContainerID: app.ID}); !errors.Is(err, ErrUnsupported) {
-		t.Errorf("ContainerLogPath = %v, want ErrUnsupported", err)
+	if r, err := client.ExecSync(ctx, ExecRequest{
+		PodID: podID, ContainerID: app.ID, Command: []string{"/bin/sh", "-c", "exit 7"}}); err != nil || r.ExitCode != 7 {
+		t.Errorf("ExecSync exit-code passthrough: err=%v exit=%d (want exit 7)", err, r.ExitCode)
 	}
 	cancel()
+
+	// Stats: a real, non-simulated cgroup sample with non-zero memory for a running container.
+	ctx, cancel = call(time.Minute)
+	st, err := client.ContainerStats(ctx, Ref{PodID: podID, ContainerID: app.ID})
+	cancel()
+	if err != nil {
+		t.Fatalf("ContainerStats: %v", err)
+	}
+	if st.Simulated {
+		t.Errorf("ContainerStats must be measured (Simulated=false), got %+v", st)
+	}
+	if st.MemoryWorkingSetBytes == 0 {
+		t.Errorf("ContainerStats memory working set is 0; expected a measured non-zero value: %+v", st)
+	}
+	t.Logf("LIVE EVIDENCE: stats app cpuNanoCores=%d memWorkingSetBytes=%d simulated=%v",
+		st.CPUUsageNanoCores, st.MemoryWorkingSetBytes, st.Simulated)
+
+	// Logs: a container created with a log path streams its real stdout into a
+	// CRI-format log file. Create a logger container that echoes a marker, start it,
+	// then read the CRI log file back and verify the measured output.
+	if !info.Capabilities.Logs {
+		t.Errorf("real helper should advertise logs backed, got %+v", info.Capabilities)
+	}
+	logFile := filepath.Join(dir, "logger.cri.log")
+	ctx, cancel = call(3 * time.Minute)
+	lrootfs, err := client.PrepareContainerRootfs(ctx, RootfsRequest{
+		PodID: podID, ContainerName: "logger", Image: "busybox", ExpectedIdentity: "macvz-rootfs-id=logger"})
+	cancel()
+	if err != nil {
+		t.Fatalf("PrepareContainerRootfs(logger): %v", err)
+	}
+	ctx, cancel = call(2 * time.Minute)
+	lcreated, err := client.CreateContainer(ctx, CreateRequest{
+		PodID: podID, Name: "logger", RootfsToken: lrootfs.Token, LogPath: logFile,
+		Command: []string{"/bin/sh", "-c", "echo macvz-log-marker; exec sleep 600"}})
+	cancel()
+	if err != nil {
+		t.Fatalf("CreateContainer(logger): %v", err)
+	}
+	ctx, cancel = call(3 * time.Minute)
+	lstarted, err := client.StartContainer(ctx, Ref{PodID: podID, ContainerID: lcreated.ID})
+	cancel()
+	if err != nil || lstarted.Phase != "Running" {
+		t.Fatalf("StartContainer(logger): err=%v phase=%s", err, lstarted.Phase)
+	}
+
+	ctx, cancel = call(time.Minute)
+	logInfo, err := client.ContainerLogPath(ctx, Ref{PodID: podID, ContainerID: lcreated.ID})
+	cancel()
+	if err != nil {
+		t.Fatalf("ContainerLogPath: %v", err)
+	}
+	if logInfo.Format != "cri" || logInfo.Path == "" {
+		t.Errorf("ContainerLogPath unexpected: %+v", logInfo)
+	}
+	// The stdout write is streamed asynchronously; poll the CRI log file briefly.
+	var logBody string
+	for i := 0; i < 30; i++ {
+		b, _ := os.ReadFile(logInfo.Path)
+		logBody = string(b)
+		if strings.Contains(logBody, "macvz-log-marker") {
+			break
+		}
+		time.Sleep(time.Second)
+	}
+	if !strings.Contains(logBody, "macvz-log-marker") {
+		t.Errorf("CRI log file missing real container stdout; got %q", logBody)
+	}
+	if !strings.Contains(logBody, "stdout F") {
+		t.Errorf("CRI log file not in CRI format (no 'stdout F' marker); got %q", logBody)
+	}
+	t.Logf("LIVE EVIDENCE: logs container stdout -> %s : %q", logInfo.Path, strings.TrimSpace(logBody))
 }
 
 // startContainerLive runs PrepareContainerRootfs -> CreateContainer -> StartContainer

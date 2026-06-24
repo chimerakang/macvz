@@ -95,7 +95,7 @@ func NewFakeBackend() *FakeBackend {
 		pods:                     map[string]*fakePod{},
 		rootfs:                   map[string]*fakeRootfs{},
 		ObservedIdentityFor:      map[string]string{},
-		Capabilities:             Capabilities{Logs: true, Exec: true, Stats: true},
+		Capabilities:             Capabilities{Logs: true, Exec: true, ExecStream: true, Stats: true, Attach: true, PortForward: true},
 		SandboxAddressFor:        map[string]string{},
 		SandboxAddressReadyAfter: map[string]int{},
 	}
@@ -414,6 +414,54 @@ func (f *FakeBackend) ContainerStats(_ context.Context, ref Ref) (ContainerStats
 		CPUUsageNanoCores:     0,
 		MemoryWorkingSetBytes: 0,
 		Simulated:             true,
+	}, nil
+}
+
+func (f *FakeBackend) Attach(_ context.Context, req AttachRequest) (AttachResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.Capabilities.Attach {
+		return AttachResponse{}, fmt.Errorf("%w: attach", ErrUnsupported)
+	}
+	_, c, err := f.lookupLocked(Ref{PodID: req.PodID, ContainerID: req.ContainerID})
+	if err != nil {
+		return AttachResponse{}, err
+	}
+	if c.phase != runtime.PhaseRunning {
+		return AttachResponse{}, fmt.Errorf("%w: container %q is %s, attach requires Running", ErrInvalid, req.ContainerID, c.phase)
+	}
+	// Simulated negotiation: echo the requested streams as attachable. A real backend
+	// wires bidirectional vminitd streams here; that plumbing is the #131 non-goal.
+	return AttachResponse{
+		Stdin:     req.Stdin,
+		Stdout:    req.Stdout,
+		Stderr:    req.Stderr,
+		TTY:       req.TTY,
+		Simulated: true,
+		Message:   "simulated attach negotiation (no real VM-internal streams)",
+	}, nil
+}
+
+func (f *FakeBackend) PortForward(_ context.Context, req PortForwardRequest) (PortForwardResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.Capabilities.PortForward {
+		return PortForwardResponse{}, fmt.Errorf("%w: portforward", ErrUnsupported)
+	}
+	if _, ok := f.pods[req.PodID]; !ok {
+		return PortForwardResponse{}, fmt.Errorf("%w: %s", ErrPodNotFound, req.PodID)
+	}
+	for _, p := range req.Ports {
+		if p <= 0 || p > 65535 {
+			return PortForwardResponse{}, fmt.Errorf("%w: port %d out of range", ErrInvalid, p)
+		}
+	}
+	// Simulated negotiation: report the requested ports as forwardable. A real backend
+	// forwards host<->VM byte streams here; that plumbing is the #131 non-goal.
+	return PortForwardResponse{
+		Ports:     append([]int32(nil), req.Ports...),
+		Simulated: true,
+		Message:   "simulated port-forward negotiation (no real byte streams)",
 	}, nil
 }
 

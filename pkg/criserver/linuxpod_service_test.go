@@ -206,6 +206,104 @@ func TestLinuxPodServiceIdentityMismatchNotRunning(t *testing.T) {
 	}
 }
 
+func TestLinuxPodServiceRecreatesExitedSameName(t *testing.T) {
+	backend := linuxpod.NewFakeBackend()
+	svc := newLinuxPodTestService(t, backend)
+	ctx := context.Background()
+
+	sandboxID := lpRunSandbox(t, svc)
+	firstID := lpCreateStart(t, svc, sandboxID, "app")
+	if _, err := svc.StopContainer(ctx, &runtimeapi.StopContainerRequest{ContainerId: firstID}); err != nil {
+		t.Fatalf("StopContainer(first): %v", err)
+	}
+
+	resp, err := svc.CreateContainer(ctx, &runtimeapi.CreateContainerRequest{
+		PodSandboxId: sandboxID,
+		Config: &runtimeapi.ContainerConfig{
+			Metadata: &runtimeapi.ContainerMetadata{Name: "app", Attempt: 1},
+			Image:    &runtimeapi.ImageSpec{Image: "docker.io/library/busybox:1.36.1"},
+			Command:  []string{"/bin/sh", "-c", "sleep 300"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateContainer(replacement): %v", err)
+	}
+	replacementID := resp.GetContainerId()
+	if replacementID == "" || replacementID == firstID {
+		t.Fatalf("replacement container ID = %q, first ID = %q", replacementID, firstID)
+	}
+	if _, err := svc.StartContainer(ctx, &runtimeapi.StartContainerRequest{ContainerId: replacementID}); err != nil {
+		t.Fatalf("StartContainer(replacement): %v", err)
+	}
+
+	firstStatus, err := svc.ContainerStatus(ctx, &runtimeapi.ContainerStatusRequest{ContainerId: firstID})
+	if err != nil {
+		t.Fatalf("ContainerStatus(first): %v", err)
+	}
+	if got := firstStatus.GetStatus().GetState(); got != runtimeapi.ContainerState_CONTAINER_EXITED {
+		t.Errorf("first container state = %s, want EXITED", got)
+	}
+	replacementStatus, err := svc.ContainerStatus(ctx, &runtimeapi.ContainerStatusRequest{ContainerId: replacementID})
+	if err != nil {
+		t.Fatalf("ContainerStatus(replacement): %v", err)
+	}
+	if got := replacementStatus.GetStatus().GetState(); got != runtimeapi.ContainerState_CONTAINER_RUNNING {
+		t.Errorf("replacement container state = %s, want RUNNING", got)
+	}
+}
+
+func TestLinuxPodServiceTranslatesKubeletMounts(t *testing.T) {
+	backend := linuxpod.NewFakeBackend()
+	podsDir := t.TempDir()
+	source := filepath.Join(podsDir, "uid", "volumes", "kubernetes.io~configmap", "web")
+	if err := os.MkdirAll(source, 0o755); err != nil {
+		t.Fatalf("mkdir source: %v", err)
+	}
+	svc, err := NewLinuxPodService(LinuxPodOptions{
+		Backend: backend,
+		Mounts:  MountPolicy{KubeletPodsDir: podsDir},
+	})
+	if err != nil {
+		t.Fatalf("NewLinuxPodService: %v", err)
+	}
+	ctx := context.Background()
+	sandboxID := lpRunSandbox(t, svc)
+	resp, err := svc.CreateContainer(ctx, &runtimeapi.CreateContainerRequest{
+		PodSandboxId: sandboxID,
+		Config: &runtimeapi.ContainerConfig{
+			Metadata: &runtimeapi.ContainerMetadata{Name: "app"},
+			Image:    &runtimeapi.ImageSpec{Image: "docker.io/library/busybox:1.36.1"},
+			Annotations: map[string]string{
+				"io.kubernetes.container.hash": "fixture-hash",
+			},
+			Mounts: []*runtimeapi.Mount{
+				{HostPath: source, ContainerPath: "/www", Readonly: true},
+				{ContainerPath: "/cache"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateContainer: %v", err)
+	}
+	statusResp, err := svc.ContainerStatus(ctx, &runtimeapi.ContainerStatusRequest{ContainerId: resp.GetContainerId()})
+	if err != nil {
+		t.Fatalf("ContainerStatus: %v", err)
+	}
+	mounts := statusResp.GetStatus().GetMounts()
+	if len(mounts) != 2 {
+		t.Fatalf("ContainerStatus mounts = %d, want 2", len(mounts))
+	}
+	if mounts[0].GetHostPath() != source || mounts[0].GetContainerPath() != "/www" || !mounts[0].GetReadonly() {
+		t.Errorf("bind mount = %+v, want %s -> /www readonly", mounts[0], source)
+	}
+	if mounts[1].GetHostPath() != "" || mounts[1].GetContainerPath() != "/cache" {
+		t.Errorf("tmpfs mount = %+v, want guest-local /cache", mounts[1])
+	}
+	if got := statusResp.GetStatus().GetAnnotations()["io.kubernetes.container.hash"]; got != "fixture-hash" {
+		t.Errorf("status annotation hash = %q, want fixture-hash", got)
+	}
+}
+
 func TestLinuxPodServiceKubeletSurfaces(t *testing.T) {
 	backend := linuxpod.NewFakeBackend()
 	svc := newLinuxPodTestService(t, backend)
@@ -284,6 +382,54 @@ func TestLinuxPodServiceKubeletSurfaces(t *testing.T) {
 	}
 	if len(podStats.GetStats().GetLinux().GetContainers()) != 1 {
 		t.Errorf("PodSandboxStats container count = %d, want 1", len(podStats.GetStats().GetLinux().GetContainers()))
+	}
+}
+
+func TestLinuxPodServiceImageFsInfoUsesKubeletPortableMountpoint(t *testing.T) {
+	backend := linuxpod.NewFakeBackend()
+	svc := newLinuxPodTestService(t, backend)
+
+	resp, err := svc.ImageFsInfo(context.Background(), &runtimeapi.ImageFsInfoRequest{})
+	if err != nil {
+		t.Fatalf("ImageFsInfo: %v", err)
+	}
+	fs := resp.GetImageFilesystems()
+	if len(fs) != 1 {
+		t.Fatalf("ImageFsInfo returned %d filesystem(s), want 1", len(fs))
+	}
+	if got := fs[0].GetFsId().GetMountpoint(); got != "/" {
+		t.Errorf("ImageFsInfo mountpoint = %q, want /", got)
+	}
+	if fs[0].GetTimestamp() == 0 {
+		t.Error("ImageFsInfo timestamp must be populated")
+	}
+}
+
+func TestLinuxPodServiceImageStatusIncludesKubeletRequiredSize(t *testing.T) {
+	backend := linuxpod.NewFakeBackend()
+	svc := newLinuxPodTestService(t, backend)
+	ctx := context.Background()
+	ref := "busybox:1.36.1"
+
+	if _, err := svc.PullImage(ctx, &runtimeapi.PullImageRequest{Image: &runtimeapi.ImageSpec{Image: ref}}); err != nil {
+		t.Fatalf("PullImage: %v", err)
+	}
+	statusResp, err := svc.ImageStatus(ctx, &runtimeapi.ImageStatusRequest{Image: &runtimeapi.ImageSpec{Image: ref}})
+	if err != nil {
+		t.Fatalf("ImageStatus: %v", err)
+	}
+	if statusResp.GetImage().GetId() == "" {
+		t.Fatal("ImageStatus image ID must be populated for kubelet")
+	}
+	if statusResp.GetImage().GetSize() == 0 {
+		t.Fatal("ImageStatus image size must be non-zero for kubelet")
+	}
+	listResp, err := svc.ListImages(ctx, &runtimeapi.ListImagesRequest{})
+	if err != nil {
+		t.Fatalf("ListImages: %v", err)
+	}
+	if len(listResp.GetImages()) != 1 || listResp.GetImages()[0].GetSize() == 0 {
+		t.Fatalf("ListImages = %+v, want one image with non-zero size", listResp.GetImages())
 	}
 }
 

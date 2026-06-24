@@ -1,31 +1,30 @@
 # CRI-L5 LinuxPod-Backed Kubelet/k3s In-Loop Validation Report (#130)
 
-Date: 2026-06-23
+Date: 2026-06-23; updated 2026-06-24
 Parent: #125 · Depends on: #127 (serving), #128 (Pod networking), #129 (logs/exec/stats)
-Outcome: **`linuxpodKubeletInLoopBlocked`** — every layer proven on real hardware
-up to a kubelet-*observed* Running Pod; CRI-L3 (#128) now has live CRI podnet
-attach plus external host-to-Pod Pod IP reachability evidence, and the remaining
-gate is applying that same podnet wiring to the kubelet/k3s node so it reaches
-Ready. Honest, precise blocker — not a silent pass, and not a CRI-path or backend
-defect.
+Outcome: **`linuxpodKubeletInLoopPartiallyValidated`** — a real kubelet/kind
+node now drives the genuine (`simulated=false`) LinuxPod backend to a Deployment
+`Available` rollout with Pod IP, ClusterIP Service reachability, bounded short
+soak, cleanup, and default-route-preservation evidence. Remaining failures are
+the explicit unimplemented LinuxPod helper/kubelet surfaces: logs, exec,
+port-forward, and the harness's sidecar shared-proof collection path.
 
 ## Summary
 
 This phase adds the real kubelet/k3s **in-loop validation harness** for the
-experimental LinuxPod-backed CRI path and then drove the path as far as real,
-non-disruptive validation allows. Proven on real hardware: (1) the real Apple
+experimental LinuxPod-backed CRI path and then drove the path as far as the
+current LinuxPod helper surfaces allow. Proven on real hardware: (1) the real Apple
 Containerization LinuxPod helper runs an app + *late* sidecar to **Running** in a
 shared namespace with verified identity; (2) `macvz-cri`'s CRI serving drives that
 real backend to `CONTAINER_RUNNING` via `crictl` (the exact CRI API a kubelet
 uses); (3) CRI-L3 live podnet attach now reports `NetworkReady=true`, assigns a
 Pod IP, preserves the host default route on `test@192.168.1.122`, and serves HTTP
 over the Pod IP from an external Mac route; (4) a
-**real in-cluster kubelet** was temporarily repointed at the
-LinuxPod backend and **drove it in-loop** (its log carries this backend's Status
-RPC), then cleanly restored. The one remaining gate to a kubelet-observed
-`Running` Pod is bringing up the kubelet node with the now-proven #128 podnet
-settings (node-Ready requires `NetworkReady=true`) and running the in-loop
-harness. The harness still **refuses to pass** LinuxPod acceptances on a
+**real in-cluster kubelet** was repointed at the LinuxPod backend with #128
+podnet enabled and drove the LinuxPod fixture to `rollout status` success,
+Pod IP `10.244.102.2`, ClusterIP reachability from a Linux-node probe, short soak
+pass, cleanup pass, and unchanged default route. The harness still **refuses to
+pass** LinuxPod acceptances on a
 `simulated=true` handshake (honesty gate below); discipline mirrors #119
 `kubeletHandoffSmokeBlocked`.
 
@@ -204,24 +203,77 @@ busybox `httpd`; CRI verbose status exposed `podIP=10.244.102.2`,
 `macvz-linuxpod-podnet-ok`. The remaining step is to run the kubelet node with
 that same podnet wiring and collect the kubelet-observed `Running` evidence.
 
-So the literal kubelet smoke is blocked at the **final** step — applying the
-now-live-proven pod-network settings to the kubelet node — not by the CRI serving
-path (proven via crictl), the backend (proven on a real VM), or the CRI podnet
-attach path. The `linuxpod-inloop.sh` harness should be the next evidence
-collector once that node is launched with #128 networking enabled.
+### Real in-loop kubelet run with #128 podnet enabled — partial PASS, honest surface blockers
+
+On 2026-06-24, `kind-macvz61`'s `macvz-b-cri` kubelet was pointed at the remote
+LinuxPod-backed CRI socket on `test@192.168.1.122`, with the node-side adapter
+started as:
+
+```text
+macvz-cri --experimental-linuxpod-backend
+  --linuxpod-helper-socket .../linuxpod-helper.sock
+  --pod-cidr 10.244.102.0/24
+  --pod-network-interface bridge100
+  --pod-network-helper-socket /var/run/macvz-netd.sock
+  --pod-network-ingress-interface en0
+  --pod-network-enable-forwarding
+  --kubelet-pods-dir /Users/test/macvz-cri-i5-test/kubelet-root/pods
+  --volume-host-path-allowed /Users/test/macvz-cri-i5-test
+```
+
+Several kubelet-specific blockers were found and fixed in the CRI/LinuxPod path:
+
+- `ImageFsInfo` now reports mountpoint `/`, because kubelet stats that path on
+  the Linux control-plane side of the tunneled CRI socket.
+- `ImageStatus`/`ListImages` return a non-zero placeholder size until the helper
+  exposes authoritative image sizes; kubelet rejects size `0`.
+- same-name recreate after an exited container now removes stale backend state
+  before `CreateContainer`, matching kubelet restart ordering.
+- LinuxPod `CreateContainer` now preserves CRI annotations, including kubelet's
+  container hash, avoiding false "container definition changed" restarts.
+- the LinuxPod protocol was bumped to v4 and carries CRI mounts; the Swift helper
+  stages kubelet-managed ConfigMap/Secret/projected/emptyDir sources into the Pod
+  VM, materializes Kubernetes atomic-writer symlinks, and uses hash-suffixed
+  staging names to avoid collisions between long kubelet volume paths.
+- `macvz-netd` policy was reloaded with `podNetwork.vmNetCIDRs:
+  ["192.168.64.0/20"]` after vmnet assigned `192.168.68.2`/`192.168.69.2`; the
+  global default route remained `192.168.1.1` via `en0` throughout.
+
+Latest short in-loop result (2026-06-24, one soak sample):
+
+```text
+PASS preflight: node macvz-b-cri Ready
+PASS default-route audit before
+PASS fixture applied
+PASS kubectl rollout status (Deployment available)
+PASS scheduled onto macvz-b-cri
+PASS Pod events clean (no FailedScheduling/FailedCreatePodSandBox)
+PASS backend evidence: genuine LinuxPod backend, simulated=false, protocolVersion=4
+PASS Pod IP assigned: 10.244.102.2
+PASS Pod IP belongs to the LinuxPod-backed sandbox
+PASS ClusterIP Service reachable from a Linux-node probe
+PASS Pod Running for the full short soak
+PASS restartCount bounded
+PASS no fixture Pods remain after delete
+PASS default route unchanged after run
+FAIL shared sandbox sidecar proof collection
+FAIL kubectl logs app/sidecar
+FAIL kubectl exec Secret/ConfigMap/shared proof
+FAIL kubectl port-forward
+```
+
+The remaining failures align with the helper's honest capability report
+(`capLogs=false capExec=false capStats=false`) and the still-open streaming
+surface work: real-helper logs/exec/stats (#133), interactive/streaming exec
+(#132), and Attach/PortForward (#131). They are no longer kubelet ordering,
+image metadata, Pod networking, or volume materialization blockers.
 
 ## Acceptance criteria — honest status
 
 1. **Live kubelet/k3s smoke reaches Running for a LinuxPod-backed app+sidecar
-   Pod.** ◑ **Everything up to a kubelet-observed Running is proven; final gate is
-   applying #128 live pod networking to the kubelet node.** Three layers proven on real hardware: (a) real
-   helper test PASS (app + late sidecar Running on a real VM, shared namespace,
-   identity verified); (b) `macvz-cri` CRI serving → real helper, crictl-driven,
-   both containers `CONTAINER_RUNNING` (FAILED=0); (c) a **real in-cluster kubelet
-   driving this LinuxPod backend** (its log carries this backend's Status RPC). The
-   one remaining gap to a kubelet-observed `Running` Pod: the node stays NotReady
-   until it is launched with the now-proven CRI-L3 (#128) live pod networking
-   flags — operator/shared-infra, not a CRI-path or backend defect.
+   Pod.** ✅ **Short in-loop smoke reaches Deployment Available/Pod Running with
+   Pod IP and Service reachability.** Remaining failures are logs/exec/
+   port-forward/shared-proof surfaces, not lifecycle admission or podnet.
 2. **Evidence of shared namespace, sidecar localhost, identity, Pod IP.** ◑
    **Proven live at backend + CRI podnet layers; kubelet-observed Pod IP pending.**
    The real-helper run shows the
@@ -250,12 +302,10 @@ collector once that node is launched with #128 networking enabled.
   `CONTAINER_RUNNING` for app + late sidecar (crictl E2E PASS, 15:45).
 - ~~**B2 — LinuxPod `ImageService.ImageFsInfo` unimplemented.**~~ **RESOLVED**;
   `crictl pull` validate now passes.
-- **Remaining for literal AC1 — kubelet node with #128 podnet enabled.** The
-  kubelet↔LinuxPod-backend connection is proven (a real in-cluster kubelet drove
-  this `macvz-cri`), and CRI-L3 live podnet attach is now proven through the CRI
-  serving test. Bring a LinuxPod node up with `--pod-cidr`/
-  `--pod-network-interface`/`--pod-network-helper-socket` live, then
-  `linuxpod-inloop.sh` collects the kubelet `Running` evidence.
+- ~~**Remaining for literal AC1 — kubelet node with #128 podnet enabled.**~~
+  **RESOLVED for short smoke:** the in-loop kubelet run now reaches rollout
+  available, Pod IP, ClusterIP Service reachability, short soak, cleanup, and
+  route-after pass on the genuine LinuxPod backend.
 - ~~**CRI-L3 Pod networking (#128) live CRI attach/reachability.**~~ **RESOLVED
   for CRI-level attach and external host-to-Pod Pod IP:** `TestLiveLinuxPodServingThroughHelper`
   passed on `test@192.168.1.122` with `NetworkReady=true`, Pod IP

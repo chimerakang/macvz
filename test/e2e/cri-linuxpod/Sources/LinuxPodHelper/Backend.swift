@@ -13,8 +13,8 @@ import Logging
 // VM-mutating op serializes here, so the LinuxPod and vminitd calls never race.
 
 // helperProtocolVersion is the NDJSON wire-protocol version this helper speaks; it
-// must equal pkg/runtime/linuxpod ProtocolVersion (currently 3).
-let helperProtocolVersion = 3
+// must equal pkg/runtime/linuxpod ProtocolVersion (currently 4).
+let helperProtocolVersion = 4
 
 // parseEvidenceText extracts the observed identity and net-namespace inode the late
 // process wrote into the handoff evidence channel. Free (nonisolated) so the
@@ -27,6 +27,32 @@ func parseEvidenceText(_ text: String) -> (identity: String, netns: String) {
         if line.hasPrefix("netns=") { netns = String(line.dropFirst("netns=".count)) }
     }
     return (identity, netns)
+}
+
+struct GuestMount: Sendable {
+    let source: String
+    let guestSource: String
+    let target: String
+    let readOnly: Bool
+    let tmpfs: Bool
+}
+
+func safeGuestMountName(_ source: String) -> String {
+    let mapped = source.unicodeScalars.map { scalar -> Character in
+        if CharacterSet.alphanumerics.contains(scalar) { return Character(scalar) }
+        return "-"
+    }
+    let body = String(mapped).trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+    return String((body.isEmpty ? "mount" : body).prefix(80)) + "-" + stableMountHash(source)
+}
+
+func stableMountHash(_ source: String) -> String {
+    var hash: UInt64 = 14695981039346656037
+    for byte in source.utf8 {
+        hash ^= UInt64(byte)
+        hash &*= 1099511628211
+    }
+    return String(hash, radix: 16)
 }
 
 // MARK: - State
@@ -389,6 +415,7 @@ actor LinuxPodBackend {
         let command = (p["command"] as? [String]) ?? []
         let args = (p["args"] as? [String]) ?? []
         let realCommand = command + args
+        let mounts = try materializeMounts(parseMounts(p["mounts"] as? [[String: Any]], podID: podID))
 
         // Late-sidecar evidence: the holder is excluded from pods[].containers, so a
         // running peer here means an app/sidecar is already up — the late case.
@@ -407,7 +434,7 @@ actor LinuxPodBackend {
 
         let spec = stagedContainerSpec(
             podID: podID, processID: processID, rootfsPath: rf.guestRootfsPath,
-            evidenceGuestPath: rf.guestEvidencePath, realCommand: realCommand)
+            evidenceGuestPath: rf.guestEvidencePath, realCommand: realCommand, extraMounts: mounts)
 
         // Hoist the staging paths into Sendable locals (URL/String) so the
         // @Sendable withVirtualMachineInstance closure does not capture the
@@ -416,6 +443,7 @@ actor LinuxPodBackend {
         let guestRootfsPath = rf.guestRootfsPath
         let hostEvidenceDir = rf.hostEvidenceDir
         let guestEvidencePath = rf.guestEvidencePath
+        let guestMounts = mounts
 
         try await pod.pod.withVirtualMachineInstance { vm in
             let agent = try await vm.dialAgent()
@@ -432,6 +460,10 @@ actor LinuxPodBackend {
                 vm: vm, vminitd: vminitd, source: hostPreparedRootfs, guestPath: guestRootfsPath)
             try await Transport.copyHostPathToGuest(
                 vm: vm, vminitd: vminitd, source: hostEvidenceDir, guestPath: guestEvidencePath)
+            for mount in guestMounts where !mount.tmpfs {
+                try await Transport.copyHostPathToGuest(
+                    vm: vm, vminitd: vminitd, source: URL(fileURLWithPath: mount.source), guestPath: mount.guestSource)
+            }
             try await vminitd.sync()
             do {
                 try await vminitd.createProcess(
@@ -480,6 +512,59 @@ actor LinuxPodBackend {
     }
 
     private struct Observed: Sendable { let identity: String; let netns: String }
+
+    private func parseMounts(_ raw: [[String: Any]]?, podID: String) -> [GuestMount] {
+        guard let raw else { return [] }
+        return raw.compactMap { item in
+            let target = (item["target"] as? String) ?? ""
+            if target.isEmpty { return nil }
+            let source = (item["source"] as? String) ?? ""
+            let tmpfs = (item["tmpfs"] as? Bool) ?? false
+            let guestSource = tmpfs ? "" : "/run/macvz-mounts/\(podID)/\(safeGuestMountName(source))"
+            return GuestMount(
+                source: source,
+                guestSource: guestSource,
+                target: target,
+                readOnly: (item["readOnly"] as? Bool) ?? false,
+                tmpfs: tmpfs)
+        }
+    }
+
+    private func materializeMounts(_ mounts: [GuestMount]) throws -> [GuestMount] {
+        try mounts.map { mount in
+            if mount.tmpfs || mount.source.isEmpty { return mount }
+            var isDir: ObjCBool = false
+            if !FileManager.default.fileExists(atPath: mount.source, isDirectory: &isDir) || !isDir.boolValue {
+                return mount
+            }
+            let names = try FileManager.default.contentsOfDirectory(atPath: mount.source)
+            if !names.contains(where: { !$0.hasPrefix(".") }) {
+                return mount
+            }
+            let materialized = runtime.workRoot
+                .appendingPathComponent("_materialized-mounts")
+                .appendingPathComponent(safeGuestMountName(mount.source))
+            try? FileManager.default.removeItem(at: materialized)
+            try FileManager.default.createDirectory(at: materialized, withIntermediateDirectories: true)
+            for name in names where !name.hasPrefix(".") {
+                let src = URL(fileURLWithPath: mount.source).appendingPathComponent(name)
+                let dst = materialized.appendingPathComponent(name)
+                var childIsDir: ObjCBool = false
+                if FileManager.default.fileExists(atPath: src.path, isDirectory: &childIsDir), childIsDir.boolValue {
+                    try FileManager.default.copyItem(at: src, to: dst)
+                    continue
+                }
+                let data = try Data(contentsOf: src)
+                try data.write(to: dst, options: .atomic)
+            }
+            return GuestMount(
+                source: materialized.path,
+                guestSource: mount.guestSource,
+                target: mount.target,
+                readOnly: mount.readOnly,
+                tmpfs: mount.tmpfs)
+        }
+    }
 
     // startAndVerify starts the staged process and bounded-waits for the identity
     // evidence the process writes to the bind-mounted handoff channel, reading it
@@ -631,7 +716,7 @@ actor LinuxPodBackend {
     // staged rootfs identity and its net namespace into the bind-mounted handoff
     // evidence channel, syncs, then execs the real workload. It shares the Pod VM's
     // network (no net namespace) so containers reach each other over localhost.
-    private func stagedContainerSpec(podID: String, processID: String, rootfsPath: String, evidenceGuestPath: String, realCommand: [String]) -> ContainerizationOCI.Spec {
+    private func stagedContainerSpec(podID: String, processID: String, rootfsPath: String, evidenceGuestPath: String, realCommand: [String], extraMounts: [GuestMount]) -> ContainerizationOCI.Spec {
         let exec: String
         if realCommand.isEmpty {
             exec = "exec sleep 2147483647"
@@ -650,7 +735,7 @@ actor LinuxPodBackend {
         sync
         \(exec)
         """
-        let mounts = [
+        var mounts = [
             ContainerizationOCI.Mount(type: "proc", source: "proc", destination: "/proc"),
             ContainerizationOCI.Mount(type: "tmpfs", source: "tmpfs", destination: "/dev", options: ["nosuid", "mode=755", "size=65536k"]),
             ContainerizationOCI.Mount(type: "devpts", source: "devpts", destination: "/dev/pts", options: ["nosuid", "noexec", "newinstance", "gid=5", "mode=0620", "ptmxmode=0666"]),
@@ -658,6 +743,15 @@ actor LinuxPodBackend {
             ContainerizationOCI.Mount(type: "tmpfs", source: "tmpfs", destination: "/dev/shm", options: ["nosuid", "noexec", "nodev", "mode=1777", "size=65536k"]),
             ContainerizationOCI.Mount(type: "bind", source: evidenceGuestPath, destination: "/macvz-evidence", options: ["rbind", "rw"]),
         ]
+        for mount in extraMounts {
+            if mount.tmpfs {
+                mounts.append(ContainerizationOCI.Mount(type: "tmpfs", source: "tmpfs", destination: mount.target, options: ["nosuid", "nodev", "mode=1777"]))
+                continue
+            }
+            mounts.append(ContainerizationOCI.Mount(
+                type: "bind", source: mount.guestSource, destination: mount.target,
+                options: ["rbind", mount.readOnly ? "ro" : "rw"]))
+        }
         // The guest runs sethostname(), which rejects names over HOST_NAME_MAX=64
         // with EINVAL. processID is a long sanitized rootfs token, so "macvz-<id>"
         // overflows; clamp to 63 chars (non-empty, valid label characters).

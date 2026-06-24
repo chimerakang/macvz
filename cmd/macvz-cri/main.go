@@ -253,7 +253,7 @@ func run(ctx context.Context, listen, stateDir, runtimeBinary string, rosetta bo
 	// apple/container path. This is a SEPARATE service; the apple/container path
 	// below is untouched and unreachable in this mode.
 	if lc.enabled {
-		return serveLinuxPod(ctx, lis, socketPath, sandboxes, containers, pn, lc)
+		return serveLinuxPod(ctx, lis, socketPath, sandboxes, containers, pn, mc, lc)
 	}
 
 	driver := container.New(container.Config{Binary: runtimeBinary, Rosetta: rosetta})

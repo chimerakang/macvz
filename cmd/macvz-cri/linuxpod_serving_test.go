@@ -85,7 +85,7 @@ func TestLiveLinuxPodServingThroughHelper(t *testing.T) {
 		// chain without touching pf/route. Set MACVZ_LINUXPOD_PODNET=1 to include
 		// the #128 podnet attach path in a live, operator-controlled environment.
 		serveErr <- serveLinuxPod(ctx, lis, criSock, sandboxes, containers,
-			pn, linuxpodConfig{enabled: true, helperSocket: helperSock})
+			pn, mountConfig{}, linuxpodConfig{enabled: true, helperSocket: helperSock})
 	}()
 	waitForFile(t, criSock)
 

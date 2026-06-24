@@ -226,11 +226,21 @@ type CreateRequest struct {
 	Command     []string          `json:"command,omitempty"`
 	Args        []string          `json:"args,omitempty"`
 	Env         map[string]string `json:"env,omitempty"`
+	Mounts      []Mount           `json:"mounts,omitempty"`
 	// LogPath is the kubelet-assigned CRI container log path. When set (and the
 	// backend advertises Capabilities.Logs) the backend creates the file and writes
 	// container lifecycle output to it in CRI log format. Empty means the container
 	// has no kubelet log file, and ContainerLogPath then returns ErrInvalid.
 	LogPath string `json:"logPath,omitempty"`
+}
+
+// Mount is a kubelet-provided mount the backend should realize inside the late
+// container's rootfs namespace.
+type Mount struct {
+	Source   string `json:"source,omitempty"`
+	Target   string `json:"target"`
+	ReadOnly bool   `json:"readOnly,omitempty"`
+	Tmpfs    bool   `json:"tmpfs,omitempty"`
 }
 
 // StopRequest stops a container with a grace timeout.
@@ -332,4 +342,6 @@ type CleanupReport struct {
 // kubelet surfaces (capabilities in Ping, ContainerLogPath/ExecSync/ContainerStats
 // ops, CreateRequest.LogPath) for CRI-L4 (#129). v3 added the PodStatus op and
 // PodStatus.SandboxAddress for Pod networking address discovery, CRI-L3 (#128).
-const ProtocolVersion = 3
+// v4 added CreateRequest.Mounts so kubelet-managed ConfigMap/Secret/emptyDir
+// volumes reach the LinuxPod helper in the #130 in-loop path.
+const ProtocolVersion = 4

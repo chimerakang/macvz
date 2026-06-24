@@ -84,10 +84,13 @@ func (p MountPolicy) kubeletPodsDir() string {
 // A CRI Mount with an empty HostPath is treated as a guest-local tmpfs: the
 // kubelet uses this for a Memory-medium emptyDir, which has no host backing.
 func (s *Server) translateMounts(mounts []*runtimeapi.Mount) ([]types.Mount, []store.Mount, error) {
+	return translateMountsWithPolicy(s.mountPolicy, mounts)
+}
+
+func translateMountsWithPolicy(policy MountPolicy, mounts []*runtimeapi.Mount) ([]types.Mount, []store.Mount, error) {
 	if len(mounts) == 0 {
 		return nil, nil, nil
 	}
-	policy := s.mountPolicy
 	podsDir := policy.kubeletPodsDir()
 
 	rtMounts := make([]types.Mount, 0, len(mounts))
@@ -162,7 +165,11 @@ const (
 )
 
 func (s *Server) waitForKubeletMountSources(ctx context.Context, mounts []types.Mount) error {
-	podsDir := s.mountPolicy.kubeletPodsDir()
+	return waitForKubeletMountSourcesWithPolicy(ctx, s.mountPolicy, mounts)
+}
+
+func waitForKubeletMountSourcesWithPolicy(ctx context.Context, policy MountPolicy, mounts []types.Mount) error {
+	podsDir := policy.kubeletPodsDir()
 	var pending []string
 	for _, m := range mounts {
 		if m.Source != "" && withinPrefix(filepath.Clean(m.Source), podsDir) {

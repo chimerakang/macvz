@@ -75,7 +75,7 @@ func (lc linuxpodConfig) handshake(ctx context.Context) (info linuxpod.HelperInf
 // over the persisted stores, reconciles recovered records against the live
 // backend, and serves until the context is cancelled. The default apple/container
 // path is not constructed in this mode.
-func serveLinuxPod(ctx context.Context, lis net.Listener, socketPath string, sandboxes *store.Store, containers *store.ContainerStore, pn podNetConfig, lc linuxpodConfig) error {
+func serveLinuxPod(ctx context.Context, lis net.Listener, socketPath string, sandboxes *store.Store, containers *store.ContainerStore, pn podNetConfig, mc mountConfig, lc linuxpodConfig) error {
 	backend := linuxpod.NewSocketClient(lc.helperSocket)
 
 	// Wire the Pod network path (CRI-L3, #128) only when explicitly configured. The
@@ -94,6 +94,10 @@ func serveLinuxPod(ctx context.Context, lis net.Listener, socketPath string, san
 		RuntimeVersion: version.Version,
 		PodNetwork:     podNet,
 		IPAM:           ipam,
+		Mounts: criserver.MountPolicy{
+			KubeletPodsDir:          mc.kubeletPodsDir,
+			HostPathAllowedPrefixes: mc.hostPathAllowed,
+		},
 	})
 	if err != nil {
 		return fmt.Errorf("build LinuxPod CRI service: %w", err)

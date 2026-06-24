@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/chimerakang/macvz/internal/types"
 	"github.com/chimerakang/macvz/pkg/criserver/store"
 	"github.com/chimerakang/macvz/pkg/runtime/linuxpod"
 	"google.golang.org/grpc"
@@ -59,8 +60,9 @@ type LinuxPodService struct {
 	addrPollAttempts int
 	addrPollInterval time.Duration
 
-	mu     sync.Mutex
-	images map[string]struct{} // images "pulled" through the minimal ImageService
+	mu          sync.Mutex
+	mountPolicy MountPolicy
+	images      map[string]struct{} // images "pulled" through the minimal ImageService
 }
 
 // LinuxPodOptions configures a LinuxPodService.
@@ -75,6 +77,7 @@ type LinuxPodOptions struct {
 	// *network.PodIPAM.
 	PodNetwork PodNetwork
 	IPAM       PodIPAllocator
+	Mounts     MountPolicy
 	// Now is injectable for deterministic tests; defaults to time.Now.
 	Now func() time.Time
 }
@@ -108,6 +111,7 @@ func NewLinuxPodService(opts LinuxPodOptions) (*LinuxPodService, error) {
 		now:              now,
 		podNet:           opts.PodNetwork,
 		ipam:             opts.IPAM,
+		mountPolicy:      opts.Mounts,
 		addrPollAttempts: defaultVMIPPollAttempts,
 		addrPollInterval: defaultVMIPPollInterval,
 		images:           map[string]struct{}{},
@@ -122,6 +126,13 @@ func (s *LinuxPodService) Register(g *grpc.Server) {
 }
 
 const linuxpodRuntimeName = "macvz-cri-linuxpod"
+
+// linuxpodUnknownImageSize is the smallest non-zero image size accepted by
+// kubelet's ImageStatus validation. The real LinuxPod helper owns the image store
+// today and does not expose authoritative image sizes yet; returning zero makes
+// kubelet stop before CreateContainer with ImageInspectError. Keep this visibly
+// non-authoritative until the helper grows a real image-status surface.
+const linuxpodUnknownImageSize uint64 = 1
 
 // Version reports the CRI runtime identity for the LinuxPod path.
 func (s *LinuxPodService) Version(_ context.Context, req *runtimeapi.VersionRequest) (*runtimeapi.VersionResponse, error) {
@@ -256,9 +267,18 @@ func (s *LinuxPodService) CreateContainer(ctx context.Context, req *runtimeapi.C
 		return nil, status.Errorf(codes.FailedPrecondition, "CreateContainer: sandbox %q is %s", sandboxID, sb.State)
 	}
 	for _, existing := range s.containers.ListBySandbox(sandboxID) {
-		if existing.Metadata.Name == name && existing.State != store.ContainerExited {
+		if existing.Metadata.Name != name {
+			continue
+		}
+		if existing.State != store.ContainerExited {
 			return nil, status.Errorf(codes.AlreadyExists,
 				"CreateContainer: container %q already exists in sandbox %q", name, sandboxID)
+		}
+		if existing.LinuxPod != nil {
+			err := s.backend.RemoveContainer(ctx, linuxpod.Ref{PodID: sandboxID, ContainerID: existing.LinuxPod.BackendContainerID})
+			if err != nil && !errors.Is(err, linuxpod.ErrContainerNotFound) && !errors.Is(err, linuxpod.ErrPodNotFound) {
+				return nil, linuxpodToCRIError("CreateContainer: cleanup exited replacement", err)
+			}
 		}
 	}
 
@@ -267,6 +287,13 @@ func (s *LinuxPodService) CreateContainer(ctx context.Context, req *runtimeapi.C
 		return nil, status.Errorf(codes.Internal, "CreateContainer: %v", err)
 	}
 	expectedIdentity := linuxpodExpectedIdentity(id)
+	rtMounts, recMounts, err := translateMountsWithPolicy(s.mountPolicy, cfg.GetMounts())
+	if err != nil {
+		return nil, err
+	}
+	if err := waitForKubeletMountSourcesWithPolicy(ctx, s.mountPolicy, rtMounts); err != nil {
+		return nil, err
+	}
 
 	rootfs, err := s.backend.PrepareContainerRootfs(ctx, linuxpod.RootfsRequest{
 		PodID: sandboxID, ContainerName: name, Image: image, ExpectedIdentity: expectedIdentity,
@@ -281,6 +308,7 @@ func (s *LinuxPodService) CreateContainer(ctx context.Context, req *runtimeapi.C
 		Command:     cfg.GetCommand(),
 		Args:        cfg.GetArgs(),
 		Env:         kvToMap(cfg.GetEnvs()),
+		Mounts:      linuxpodMounts(rtMounts),
 		LogPath:     linuxpodLogPath(sb, cfg),
 	})
 	if err != nil {
@@ -288,16 +316,18 @@ func (s *LinuxPodService) CreateContainer(ctx context.Context, req *runtimeapi.C
 	}
 
 	c := &store.Container{
-		ID:        id,
-		SandboxID: sandboxID,
-		Image:     image,
-		Command:   cfg.GetCommand(),
-		Args:      cfg.GetArgs(),
-		Env:       kvToMap(cfg.GetEnvs()),
-		Labels:    cfg.GetLabels(),
-		LogPath:   cfg.GetLogPath(),
-		State:     store.ContainerCreated,
-		CreatedAt: s.now().UnixNano(),
+		ID:          id,
+		SandboxID:   sandboxID,
+		Image:       image,
+		Command:     cfg.GetCommand(),
+		Args:        cfg.GetArgs(),
+		Env:         kvToMap(cfg.GetEnvs()),
+		Labels:      cfg.GetLabels(),
+		Annotations: cfg.GetAnnotations(),
+		LogPath:     cfg.GetLogPath(),
+		Mounts:      recMounts,
+		State:       store.ContainerCreated,
+		CreatedAt:   s.now().UnixNano(),
 		LinuxPod: &store.LinuxPodContainer{
 			BackendContainerID: created.ID,
 			RootfsToken:        rootfs.Token,
@@ -631,7 +661,7 @@ func (s *LinuxPodService) ImageStatus(_ context.Context, req *runtimeapi.ImageSt
 	if !ok {
 		return &runtimeapi.ImageStatusResponse{}, nil // absent: nil image, per CRI
 	}
-	return &runtimeapi.ImageStatusResponse{Image: &runtimeapi.Image{Id: ref, RepoTags: []string{ref}}}, nil
+	return &runtimeapi.ImageStatusResponse{Image: linuxpodCRIImage(ref)}, nil
 }
 
 func (s *LinuxPodService) ListImages(_ context.Context, _ *runtimeapi.ListImagesRequest) (*runtimeapi.ListImagesResponse, error) {
@@ -639,7 +669,7 @@ func (s *LinuxPodService) ListImages(_ context.Context, _ *runtimeapi.ListImages
 	defer s.mu.Unlock()
 	var out []*runtimeapi.Image
 	for ref := range s.images {
-		out = append(out, &runtimeapi.Image{Id: ref, RepoTags: []string{ref}})
+		out = append(out, linuxpodCRIImage(ref))
 	}
 	return &runtimeapi.ListImagesResponse{Images: out}, nil
 }
@@ -651,16 +681,40 @@ func (s *LinuxPodService) RemoveImage(_ context.Context, req *runtimeapi.RemoveI
 	return &runtimeapi.RemoveImageResponse{}, nil
 }
 
-// ImageFsInfo returns image-filesystem usage. crictl and the kubelet call it during
-// image validation, so an Unimplemented here blocks them (the CRI-L5 #130 crictl
-// E2E hit exactly this). The LinuxPod helper owns the real image store, so the
-// adapter cannot report authoritative usage; it returns one valid, timestamped
-// filesystem entry with zeroed usage rather than faking numbers or erroring. Real
-// usage is the helper's to report once it exposes it.
+func linuxpodCRIImage(ref string) *runtimeapi.Image {
+	return &runtimeapi.Image{Id: ref, RepoTags: []string{ref}, Size: linuxpodUnknownImageSize}
+}
+
+func linuxpodMounts(mounts []types.Mount) []linuxpod.Mount {
+	if len(mounts) == 0 {
+		return nil
+	}
+	out := make([]linuxpod.Mount, 0, len(mounts))
+	for _, m := range mounts {
+		out = append(out, linuxpod.Mount{
+			Source:   m.Source,
+			Target:   m.Target,
+			ReadOnly: m.ReadOnly,
+			Tmpfs:    m.Tmpfs,
+		})
+	}
+	return out
+}
+
+// ImageFsInfo returns image-filesystem usage. crictl and the kubelet call it
+// during image validation, so an Unimplemented here blocks them (the CRI-L5 #130
+// crictl E2E hit exactly this). The LinuxPod helper owns the real image store, so
+// the adapter cannot report authoritative usage yet; it returns one timestamped
+// filesystem entry with zeroed usage rather than faking numbers or erroring. Use
+// "/" as the portable mountpoint because the kubelet stats path stats this value
+// on the kubelet host, which may be a Linux control-plane node reaching a remote
+// macOS CRI socket over a tunnel. Runtime-private paths such as
+// /run/macvz/containers need not exist on that host and make kubelet imageFs stats
+// fail before the workload is even scheduled.
 func (s *LinuxPodService) ImageFsInfo(_ context.Context, _ *runtimeapi.ImageFsInfoRequest) (*runtimeapi.ImageFsInfoResponse, error) {
 	entry := &runtimeapi.FilesystemUsage{
 		Timestamp:  s.now().UnixNano(),
-		FsId:       &runtimeapi.FilesystemIdentifier{Mountpoint: "/run/macvz/containers"},
+		FsId:       &runtimeapi.FilesystemIdentifier{Mountpoint: "/"},
 		UsedBytes:  &runtimeapi.UInt64Value{Value: 0},
 		InodesUsed: &runtimeapi.UInt64Value{Value: 0},
 	}

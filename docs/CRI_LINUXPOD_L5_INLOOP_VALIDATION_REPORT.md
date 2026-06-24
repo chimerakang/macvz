@@ -288,8 +288,41 @@ apple/container service to the LinuxPod service:
   plumbing is still a future production streaming transport.
 
 Validation for the code-level fix: `go test ./...`, `go vet ./...`,
-`go build ./...`. A fresh `test@192.168.1.122` in-loop run is still required
-before replacing the historical FAIL lines above with live PASS evidence.
+`go build ./...`.
+
+Fresh live retest on `test@192.168.1.122` (diagnostics:
+`/tmp/cri-linuxpod-streaming-20260624140316`) proved the PortForward half of the
+streaming fix:
+
+```text
+PASS backend evidence: genuine LinuxPod backend, simulated=false
+PASS Pod IP assigned: 10.244.102.2
+PASS kubectl port-forward + curl returns the served marker
+PASS ClusterIP Service reachable from a Linux-node probe
+PASS Pod Running for the short soak
+PASS default route unchanged after run
+```
+
+The run intentionally used the last vmnet-working helper binary, which still
+advertises protocol v4 with `capLogs=false capExec=false capStats=false`.
+Accordingly `kubectl logs` and `kubectl exec` failed with the honest
+`capability not supported` error rather than exercising the #133 real-surface
+code. Deploying the freshly built protocol-v5 helper (the one with real
+logs/exec/stats) currently fails before serving:
+
+```text
+Error: failed to create vmnet network with status vmnet_return_t(rawValue: 1002)
+```
+
+The node was restored to the vmnet-working v4 helper after that failed deploy,
+and the global default route remained `192.168.1.1` via `en0` throughout.
+
+The same retest also found a cleanup bug in the helper: kubelet atomic-writer
+mounts materialized under `helper-work/_materialized-mounts` were left behind
+after Pod deletion. The helper now removes those host-side temporary copies as
+soon as `CreateContainer` has copied them into the guest, including error paths
+via `defer`. Validation for that cleanup fix: `swift build --product
+linuxpod-helper`, `go test ./...`, `go vet ./...`, and `git diff --check`.
 
 ## Acceptance criteria — honest status
 
@@ -336,11 +369,11 @@ before replacing the historical FAIL lines above with live PASS evidence.
   global default route, and local `curl http://10.244.102.2:8080/` over the
   `10.244.102.0/24 -> 192.168.1.122` route returning HTTP 200. Pod-to-host
   callback remains an optional diagnostic, not a #128 blocker.
-- **CRI-L4 logs/exec/stats/streaming retest.** Helper now advertises
-  `capLogs/capExec/capStats`; LinuxPod CRI streaming handoff for non-interactive
-  Exec and PortForward is wired locally. End-to-end kubelet logs/exec/stats/exec/
-  port-forward against a real LinuxPod VM remain to be revalidated on
-  `test@192.168.1.122`.
+- **CRI-L4 logs/exec/stats/streaming retest.** PortForward is now live-proven
+  through kubelet (`kubectl port-forward` PASS). Logs/non-interactive exec still
+  need a protocol-v5 real helper in the same vmnet-enabled in-loop topology; the
+  current freshly built v5 helper fails vmnet creation with status `1002`, while
+  the restored vmnet-working v4 helper advertises `capLogs=false capExec=false`.
 - **k3s topology.** Same operator-pending topology as #85/#119: a Linux k3s
   control plane plus a macOS node running `macvz-cri --experimental-linuxpod-backend`.
 

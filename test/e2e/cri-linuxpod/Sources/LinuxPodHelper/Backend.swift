@@ -421,6 +421,7 @@ actor LinuxPodBackend {
         let args = (p["args"] as? [String]) ?? []
         let realCommand = command + args
         let mounts = try materializeMounts(parseMounts(p["mounts"] as? [[String: Any]], podID: podID))
+        defer { cleanupMaterializedMounts(mounts) }
 
         // Late-sidecar evidence: the holder is excluded from pods[].containers, so a
         // running peer here means an app/sidecar is already up — the late case.
@@ -633,6 +634,19 @@ actor LinuxPodBackend {
                 target: mount.target,
                 readOnly: mount.readOnly,
                 tmpfs: mount.tmpfs)
+        }
+    }
+
+    private func cleanupMaterializedMounts(_ mounts: [GuestMount]) {
+        let root = runtime.workRoot.appendingPathComponent("_materialized-mounts").standardizedFileURL.path
+        for mount in mounts where !mount.tmpfs && !mount.source.isEmpty {
+            let source = URL(fileURLWithPath: mount.source).standardizedFileURL.path
+            if source == root || source.hasPrefix(root + "/") {
+                try? FileManager.default.removeItem(atPath: source)
+            }
+        }
+        if let entries = try? FileManager.default.contentsOfDirectory(atPath: root), entries.isEmpty {
+            try? FileManager.default.removeItem(atPath: root)
         }
     }
 

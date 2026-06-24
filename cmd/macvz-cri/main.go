@@ -253,7 +253,7 @@ func run(ctx context.Context, listen, stateDir, runtimeBinary string, rosetta bo
 	// apple/container path. This is a SEPARATE service; the apple/container path
 	// below is untouched and unreachable in this mode.
 	if lc.enabled {
-		return serveLinuxPod(ctx, lis, socketPath, sandboxes, containers, pn, mc, lc)
+		return serveLinuxPod(ctx, lis, socketPath, sandboxes, containers, streamingAddr, pn, mc, lc)
 	}
 
 	driver := container.New(container.Config{Binary: runtimeBinary, Rosetta: rosetta})
@@ -349,7 +349,12 @@ func run(ctx context.Context, listen, stateDir, runtimeBinary string, rosetta bo
 // clear FailedPrecondition. The returned stop function shuts the streaming server
 // down on adapter exit. A startup failure is fatal: serving dead streaming URLs is
 // worse than failing fast.
-func setupStreaming(srv *criserver.Server, addr string) (func(), error) {
+type streamingTarget interface {
+	SetStreamingServer(criserver.StreamingServer)
+	StreamingRuntime() streaming.Runtime
+}
+
+func setupStreaming(srv streamingTarget, addr string) (func(), error) {
 	if addr == "" {
 		klog.InfoS("CRI streaming disabled; exec and port-forward will return FailedPrecondition")
 		return func() {}, nil

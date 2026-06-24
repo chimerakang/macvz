@@ -60,9 +60,10 @@ type LinuxPodService struct {
 	addrPollAttempts int
 	addrPollInterval time.Duration
 
-	mu          sync.Mutex
-	mountPolicy MountPolicy
-	images      map[string]struct{} // images "pulled" through the minimal ImageService
+	mu           sync.Mutex
+	mountPolicy  MountPolicy
+	images       map[string]struct{} // images "pulled" through the minimal ImageService
+	streamServer StreamingServer
 }
 
 // LinuxPodOptions configures a LinuxPodService.

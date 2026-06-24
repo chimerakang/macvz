@@ -120,20 +120,6 @@ func (s *LinuxPodService) ListPodSandboxStats(ctx context.Context, req *runtimea
 	return &runtimeapi.ListPodSandboxStatsResponse{Stats: items}, nil
 }
 
-// Exec and PortForward are streaming surfaces. They stay unsupported on the
-// LinuxPod backend until the streaming follow-ups (#131/#132) land.
-func (s *LinuxPodService) Exec(context.Context, *runtimeapi.ExecRequest) (*runtimeapi.ExecResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "Exec: LinuxPod backend streaming exec is tracked in #132")
-}
-
-func (s *LinuxPodService) Attach(context.Context, *runtimeapi.AttachRequest) (*runtimeapi.AttachResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "Attach: LinuxPod backend attach is tracked in #131")
-}
-
-func (s *LinuxPodService) PortForward(context.Context, *runtimeapi.PortForwardRequest) (*runtimeapi.PortForwardResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "PortForward: LinuxPod backend port-forward is tracked in #131")
-}
-
 func (s *LinuxPodService) linuxpodContainer(id, method string) (store.Container, error) {
 	if id == "" {
 		return store.Container{}, status.Errorf(codes.InvalidArgument, "%s: container id is required", method)

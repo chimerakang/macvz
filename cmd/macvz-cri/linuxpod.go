@@ -75,7 +75,7 @@ func (lc linuxpodConfig) handshake(ctx context.Context) (info linuxpod.HelperInf
 // over the persisted stores, reconciles recovered records against the live
 // backend, and serves until the context is cancelled. The default apple/container
 // path is not constructed in this mode.
-func serveLinuxPod(ctx context.Context, lis net.Listener, socketPath string, sandboxes *store.Store, containers *store.ContainerStore, pn podNetConfig, mc mountConfig, lc linuxpodConfig) error {
+func serveLinuxPod(ctx context.Context, lis net.Listener, socketPath string, sandboxes *store.Store, containers *store.ContainerStore, streamingAddr string, pn podNetConfig, mc mountConfig, lc linuxpodConfig) error {
 	backend := linuxpod.NewSocketClient(lc.helperSocket)
 
 	// Wire the Pod network path (CRI-L3, #128) only when explicitly configured. The
@@ -112,9 +112,18 @@ func serveLinuxPod(ctx context.Context, lis net.Listener, socketPath string, san
 	// trusting stale identity evidence (identity is a start invariant).
 	svc.RecoverContainers(ctx)
 
+	// Wire the kubelet streaming URL server so LinuxPod-backed `kubectl exec`
+	// (non-interactive) and `kubectl port-forward` have the same CRI handoff path
+	// as the default apple/container service.
+	stopStreaming, err := setupStreaming(svc, streamingAddr)
+	if err != nil {
+		return err
+	}
+	defer stopStreaming()
+
 	klog.InfoS("serving experimental LinuxPod-backed CRI (prototype; not the shipped Virtual Kubelet runtime)",
 		"socket", socketPath, "helper", lc.helperSocket,
-		"note", "lifecycle served through pkg/runtime/linuxpod backend; logs/exec/stats per helper capabilities (CRI-L2/#127)")
+		"note", "lifecycle served through pkg/runtime/linuxpod backend; logs/exec/stats/streaming per helper capabilities")
 
 	go func() {
 		<-ctx.Done()

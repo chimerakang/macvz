@@ -1,6 +1,7 @@
 package criserver
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"path/filepath"
@@ -457,14 +458,87 @@ func TestLinuxPodServiceUnsupportedSurfacesAreHonest(t *testing.T) {
 	if stats.GetStats().GetCpu() != nil || stats.GetStats().GetMemory() != nil {
 		t.Errorf("unsupported stats should not fake samples: %+v", stats.GetStats())
 	}
-	if _, err := svc.Exec(ctx, &runtimeapi.ExecRequest{ContainerId: id}); status.Code(err) != codes.Unimplemented {
-		t.Errorf("streaming Exec = %v, want Unimplemented", err)
+	if _, err := svc.Exec(ctx, &runtimeapi.ExecRequest{ContainerId: id, Cmd: []string{"true"}}); status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("streaming Exec without streaming server = %v, want FailedPrecondition", err)
 	}
 	if _, err := svc.Attach(ctx, &runtimeapi.AttachRequest{ContainerId: id}); status.Code(err) != codes.Unimplemented {
 		t.Errorf("Attach = %v, want Unimplemented", err)
 	}
-	if _, err := svc.PortForward(ctx, &runtimeapi.PortForwardRequest{PodSandboxId: sandboxID}); status.Code(err) != codes.Unimplemented {
-		t.Errorf("PortForward = %v, want Unimplemented", err)
+	if _, err := svc.PortForward(ctx, &runtimeapi.PortForwardRequest{PodSandboxId: sandboxID}); status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("PortForward without streaming server = %v, want FailedPrecondition", err)
+	}
+}
+
+func TestLinuxPodServiceStreamingURLHandoff(t *testing.T) {
+	backend := linuxpod.NewFakeBackend()
+	svc := newLinuxPodTestService(t, backend)
+	ctx := context.Background()
+	sandboxID := lpRunSandbox(t, svc)
+	id := lpCreateStart(t, svc, sandboxID, "app")
+	fss := &fakeStreamingServer{}
+	svc.SetStreamingServer(fss)
+
+	exec, err := svc.Exec(ctx, &runtimeapi.ExecRequest{ContainerId: id, Cmd: []string{"echo", "hi"}, Stdout: true})
+	if err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+	if exec.GetUrl() != "http://stream/exec/tok" || fss.execReq.GetContainerId() != id {
+		t.Fatalf("Exec handoff = url %q req %+v", exec.GetUrl(), fss.execReq)
+	}
+	pf, err := svc.PortForward(ctx, &runtimeapi.PortForwardRequest{PodSandboxId: sandboxID, Port: []int32{8080}})
+	if err != nil {
+		t.Fatalf("PortForward: %v", err)
+	}
+	if pf.GetUrl() != "http://stream/portforward/tok" || fss.pfReq.GetPodSandboxId() != sandboxID {
+		t.Fatalf("PortForward handoff = url %q req %+v", pf.GetUrl(), fss.pfReq)
+	}
+}
+
+func TestLinuxPodStreamingRuntimeExecUsesBackendExecSync(t *testing.T) {
+	backend := linuxpod.NewFakeBackend()
+	svc := newLinuxPodTestService(t, backend)
+	ctx := context.Background()
+	sandboxID := lpRunSandbox(t, svc)
+	id := lpCreateStart(t, svc, sandboxID, "app")
+
+	var stdout, stderr bytes.Buffer
+	err := svc.StreamingRuntime().Exec(ctx, id, []string{"echo", "hi"}, nil, nopWriteCloser{&stdout}, nopWriteCloser{&stderr}, false, nil)
+	if err != nil {
+		t.Fatalf("streaming Exec callback: %v", err)
+	}
+	if got := stdout.String(); got != "echo hi\n" {
+		t.Errorf("stdout = %q, want backend ExecSync output", got)
+	}
+	if !strings.Contains(stderr.String(), "simulated exec") {
+		t.Errorf("stderr = %q, want backend ExecSync stderr", stderr.String())
+	}
+}
+
+type nopWriteCloser struct{ *bytes.Buffer }
+
+func (n nopWriteCloser) Close() error { return nil }
+
+func TestLinuxPodPortForwardTargetPrefersSandboxVMIP(t *testing.T) {
+	backend := linuxpod.NewFakeBackend()
+	svc := newLinuxPodTestService(t, backend)
+	sandboxID := lpRunSandbox(t, svc)
+	lpCreateStart(t, svc, sandboxID, "app")
+	sb, ok := svc.sandboxes.Get(sandboxID)
+	if !ok {
+		t.Fatalf("sandbox %s missing", sandboxID)
+	}
+	sb.Network.VMIP = "192.168.66.2"
+	sb.Network.PodIP = "10.244.102.2"
+	sb.Network.Interface = "bridge100"
+	if err := svc.sandboxes.Put(&sb); err != nil {
+		t.Fatalf("persist sandbox network: %v", err)
+	}
+	target, err := svc.linuxpodPortForwardTarget(sandboxID)
+	if err != nil {
+		t.Fatalf("linuxpodPortForwardTarget: %v", err)
+	}
+	if target.host != "192.168.66.2" || target.iface != "bridge100" {
+		t.Fatalf("target = %+v, want VM IP on bridge100", target)
 	}
 }
 

@@ -268,6 +268,29 @@ surface work: real-helper logs/exec/stats (#133), interactive/streaming exec
 (#132), and Attach/PortForward (#131). They are no longer kubelet ordering,
 image metadata, Pod networking, or volume materialization blockers.
 
+### Post-review streaming fix (2026-06-24)
+
+After #131/#132/#133 landed, the remaining #130 `kubectl exec` and
+`kubectl port-forward` failures still had one CRI-serving gap: `LinuxPodService`
+did not wire kubelet's streaming URL server, so the RuntimeService `Exec` and
+`PortForward` RPCs returned before any backend helper call could happen. The
+follow-up code fix adds the same streaming handoff used by the default
+apple/container service to the LinuxPod service:
+
+- `macvz-cri --experimental-linuxpod-backend` now starts the CRI streaming server
+  when `--streaming-addr` is set and installs it on `LinuxPodService`.
+- LinuxPod `Exec` mints a kubelet streaming URL; the callback currently runs the
+  command through real backend `ExecSync` and writes captured stdout/stderr to
+  the client, covering non-interactive `kubectl exec`.
+- LinuxPod `PortForward` mints a streaming URL; the callback proxies bytes to the
+  sandbox's host-reachable VM IP, falling back to Pod IP if needed.
+- Attach remains honestly `Unimplemented`; true interactive stdin/TTY byte
+  plumbing is still a future production streaming transport.
+
+Validation for the code-level fix: `go test ./...`, `go vet ./...`,
+`go build ./...`. A fresh `test@192.168.1.122` in-loop run is still required
+before replacing the historical FAIL lines above with live PASS evidence.
+
 ## Acceptance criteria — honest status
 
 1. **Live kubelet/k3s smoke reaches Running for a LinuxPod-backed app+sidecar
@@ -313,9 +336,11 @@ image metadata, Pod networking, or volume materialization blockers.
   global default route, and local `curl http://10.244.102.2:8080/` over the
   `10.244.102.0/24 -> 192.168.1.122` route returning HTTP 200. Pod-to-host
   callback remains an optional diagnostic, not a #128 blocker.
-- **CRI-L4 logs/exec/stats (#129).** Helper advertises `capLogs/capExec/capStats`;
-  end-to-end kubelet logs/exec/stats against a real LinuxPod VM remain to be
-  validated.
+- **CRI-L4 logs/exec/stats/streaming retest.** Helper now advertises
+  `capLogs/capExec/capStats`; LinuxPod CRI streaming handoff for non-interactive
+  Exec and PortForward is wired locally. End-to-end kubelet logs/exec/stats/exec/
+  port-forward against a real LinuxPod VM remain to be revalidated on
+  `test@192.168.1.122`.
 - **k3s topology.** Same operator-pending topology as #85/#119: a Linux k3s
   control plane plus a macOS node running `macvz-cri --experimental-linuxpod-backend`.
 

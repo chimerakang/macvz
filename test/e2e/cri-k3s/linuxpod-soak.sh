@@ -341,6 +341,23 @@ exec_logs_ok() {
 	return 0
 }
 
+# wait_exec_logs_ok <tag> -> echoes the usable Pod name once exec/logs recover.
+# Helper restart can leave the old Pod phase as Running while kubelet is still
+# reconciling a recreated sandbox, so phase alone is not a readiness signal here.
+wait_exec_logs_ok() {
+	local tag="$1" pod="" _
+	for _ in $(seq 1 "$RECOVER_TRIES"); do
+		pod="$(pod_name)"
+		if [ -n "$pod" ] && [ "$(pod_phase "$pod")" = "Running" ] && exec_logs_ok "$pod" "$tag"; then
+			printf '%s' "$pod"
+			return 0
+		fi
+		sleep "$RECOVER_INTERVAL"
+	done
+	printf '%s' "$pod"
+	return 1
+}
+
 # --- phases ------------------------------------------------------------------
 phase_preflight() {
 	CURRENT_PHASE="preflight"
@@ -562,7 +579,7 @@ churn_helper() {
 	else
 		log "helper: recovery was a bounded kubelet recreate ($uid_before -> $uid_after)"
 	fi
-	if exec_logs_ok "$pod_after" "iter-$ITER-helper"; then
+	if pod_after="$(wait_exec_logs_ok "iter-$ITER-helper")"; then
 		pass "helper: exec + logs work after restart (live recovery or bounded recreate)"
 	else
 		fail "helper: exec/logs did not recover after restart (Running-but-unusable; see $OUT_DIR/iter-$ITER-helper-exec.err)"

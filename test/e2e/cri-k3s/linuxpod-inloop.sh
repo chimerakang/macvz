@@ -467,7 +467,7 @@ phase_service() {
 	if kn run "$probe" --image="$IMAGE" --restart=Never --command -- \
 		sh -c "for i in \$(seq 1 30); do wget -T 5 -qO- http://$SVC.$NS.svc:80/index.html && exit 0; sleep 1; done; exit 1" \
 		>"$OUT_DIR/probe-run.log" 2>&1; then
-		kn wait --for=condition=Ready "pod/$probe" --timeout=2m >/dev/null 2>&1 || true
+		:
 	fi
 	local phase _
 	for _ in $(seq 1 180); do

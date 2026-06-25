@@ -52,6 +52,14 @@ func dispatch(ctx context.Context, backend Backend, line []byte) wireResponse {
 	switch req.Op {
 	case opPing:
 		return result(backend.Ping(ctx))
+	case opAdopt:
+		var p struct {
+			PodID string `json:"podID"`
+		}
+		if err := decode(req.Payload, &p); err != nil {
+			return errResponse(err)
+		}
+		return result(backend.Adopt(ctx, p.PodID))
 	case opCreatePod:
 		var spec PodSpec
 		if err := decode(req.Payload, &spec); err != nil {

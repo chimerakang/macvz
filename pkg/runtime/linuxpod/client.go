@@ -97,6 +97,14 @@ func (c *HelperClient) Ping(ctx context.Context) (HelperInfo, error) {
 	return info, err
 }
 
+func (c *HelperClient) Adopt(ctx context.Context, podID string) (AdoptionResult, error) {
+	var res AdoptionResult
+	err := c.call(ctx, opAdopt, struct {
+		PodID string `json:"podID"`
+	}{PodID: podID}, &res)
+	return res, err
+}
+
 func (c *HelperClient) CreatePod(ctx context.Context, spec PodSpec) (PodStatus, error) {
 	var st PodStatus
 	err := c.call(ctx, opCreatePod, spec, &st)

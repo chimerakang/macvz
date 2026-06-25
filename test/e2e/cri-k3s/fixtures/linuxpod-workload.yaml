@@ -17,10 +17,10 @@
 # Pod is genuinely LinuxPod-backed (not the simulated handshake) — see #127/#128.
 #
 #   - app:     httpd serving the projected ConfigMap marker on :8080.
-#   - sidecar: starts second, curls the app on 127.0.0.1:8080 (proving shared
-#              network namespace + localhost), records the marker to a file the
-#              exec phase reads, then idles. A native sidecar (restartPolicy
-#              Always init container) keeps the Pod's Ready gate tied to both.
+#   - sidecar: declared after the app as a normal container, so kubelet drives the
+#              ordinary multi-container Pod order: app create/start, then sidecar
+#              create/start into the already-running sandbox. It curls the app on
+#              127.0.0.1:8080, records the marker to a shared file, then idles.
 #
 # #84 scheduling-exclusion opt-in is unchanged: select the MacVz runtime label
 # and tolerate the host-namespace taint. Keys mirror pkg/criserver/nodescheme.go.
@@ -80,36 +80,6 @@ spec:
           operator: Equal
           value: "true"
           effect: NoSchedule
-      # The sidecar is declared as a native sidecar (an init container with
-      # restartPolicy: Always). The kubelet starts it and keeps it running for
-      # the Pod's lifetime, and the app container starts after it — but at the
-      # CRI/LinuxPod-backend layer the *app* sandbox owner is created first and
-      # the sidecar joins the already-running Pod namespace late (the ordering
-      # the LinuxPod FakeBackend asserts via CreatedAfterPodRunning). The sidecar
-      # proves shared-namespace localhost reachability against the app.
-      initContainers:
-        - name: sidecar
-          image: busybox:1.36.1
-          restartPolicy: Always
-          # Wait for the app's localhost listener, then record proof that this
-          # container shares the Pod network namespace and reached the app over
-          # 127.0.0.1. The marker file is read back by the exec phase. Idle after.
-          command:
-            - sh
-            - -c
-            - >-
-              for i in $(seq 1 60); do
-                if wget -T 2 -qO- http://127.0.0.1:8080/index.html | grep -q macvz-cri-l5-inloop-ok; then
-                  echo macvz-cri-l5-sidecar-localhost-ok > /shared/sidecar-localhost;
-                  echo macvz-cri-l5-sidecar-boot;
-                  break;
-                fi;
-                sleep 1;
-              done;
-              tail -f /dev/null
-          volumeMounts:
-            - name: shared
-              mountPath: /shared
       containers:
         - name: app
           image: busybox:1.36.1
@@ -142,6 +112,27 @@ spec:
             - name: secret
               mountPath: /etc/app-secret
               readOnly: true
+            - name: shared
+              mountPath: /shared
+        - name: sidecar
+          image: busybox:1.36.1
+          # Wait for the app's localhost listener, then record proof that this
+          # container shares the Pod network namespace and reached the app over
+          # 127.0.0.1. The marker file is read back by the exec phase. Idle after.
+          command:
+            - sh
+            - -c
+            - >-
+              for i in $(seq 1 60); do
+                if wget -T 2 -qO- http://127.0.0.1:8080/index.html | grep -q macvz-cri-l5-inloop-ok; then
+                  echo macvz-cri-l5-sidecar-localhost-ok > /shared/sidecar-localhost;
+                  echo macvz-cri-l5-sidecar-boot;
+                  break;
+                fi;
+                sleep 1;
+              done;
+              tail -f /dev/null
+          volumeMounts:
             - name: shared
               mountPath: /shared
       volumes:

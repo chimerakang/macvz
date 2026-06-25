@@ -31,6 +31,23 @@ type FakeBackend struct {
 	pods   map[string]*fakePod
 	rootfs map[string]*fakeRootfs
 
+	// journal is the durable, restart-surviving record a real helper would persist
+	// to disk (#138). SimulateHelperRestart populates it from the live pods, drops
+	// the live (in-memory) handles, then runs the startup adoption pass that
+	// reattaches the pods whose micro-VM survived. It models the helper losing its
+	// process state while the Pod VMs keep running. Read/written under mu.
+	journal map[string]*journalPod
+	// adoption records the most recent startup adoption pass so Ping can report it.
+	// Read under mu.
+	adoption AdoptionStatus
+
+	// VMSurvivesRestart overrides, per pod id, whether that pod's micro-VM survives
+	// the next SimulateHelperRestart. Absent pods survive (the common case: the VM
+	// outlives the helper process). A test sets false to model a VM that died with
+	// the helper and so cannot be adopted, exercising the fall-back-to-recreate path.
+	// Read under mu.
+	VMSurvivesRestart map[string]bool
+
 	// ObservedIdentityFor overrides the identity a container's late process reports
 	// at StartContainer, keyed by container name. Absent names report the expected
 	// identity (verification passes). Tests set a wrong value to exercise the
@@ -88,16 +105,28 @@ type fakeContainer struct {
 	createdAfterPodRunning bool
 }
 
+// journalPod is one pod's durable record (#138): everything a restarted helper
+// needs to readopt the live Pod VM and reconstruct its containers without rerunning
+// identity verification (identity is a start invariant). vmAlive records whether the
+// micro-VM survived the helper restart and can therefore be reacquired.
+type journalPod struct {
+	pod     *fakePod
+	rootfs  []*fakeRootfs
+	vmAlive bool
+}
+
 // NewFakeBackend returns an empty fake. now defaults to time.Now when nil.
 func NewFakeBackend() *FakeBackend {
 	return &FakeBackend{
 		now:                      time.Now,
 		pods:                     map[string]*fakePod{},
 		rootfs:                   map[string]*fakeRootfs{},
+		journal:                  map[string]*journalPod{},
 		ObservedIdentityFor:      map[string]string{},
-		Capabilities:             Capabilities{Logs: true, Exec: true, ExecStream: true, Stats: true, Attach: true, PortForward: true},
+		Capabilities:             Capabilities{Logs: true, Exec: true, ExecStream: true, Stats: true, Attach: true, PortForward: true, Adopt: true},
 		SandboxAddressFor:        map[string]string{},
 		SandboxAddressReadyAfter: map[string]int{},
+		VMSurvivesRestart:        map[string]bool{},
 	}
 }
 
@@ -111,13 +140,105 @@ func (f *FakeBackend) nextSeq() int {
 func (f *FakeBackend) Ping(context.Context) (HelperInfo, error) {
 	f.mu.Lock()
 	caps := f.Capabilities
+	adoption := f.adoption
+	adoption.Supported = caps.Adopt
 	f.mu.Unlock()
 	return HelperInfo{
 		Name:            "linuxpod-fake-backend",
 		ProtocolVersion: ProtocolVersion,
 		Simulated:       true,
 		Capabilities:    caps,
+		Adoption:        adoption,
 	}, nil
+}
+
+// SimulateHelperRestart models the LinuxPod helper process restarting while the Pod
+// VMs keep running (#138). It snapshots the live pods into the durable journal,
+// drops the live in-memory handles (so an un-adopted pod answers ErrPodNotFound,
+// exactly as the pre-#138 fail-fast path), then runs the startup adoption pass:
+// every pod whose micro-VM survived (VMSurvivesRestart, default true) is reattached
+// into the live set and counted Adopted; the rest are counted Lost and left for the
+// adapter's BackendLost/recreate fallback. It records the pass in adoption for Ping.
+func (f *FakeBackend) SimulateHelperRestart() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.Capabilities.Adopt {
+		// A helper without the capability loses everything on restart (legacy path).
+		f.pods = map[string]*fakePod{}
+		f.rootfs = map[string]*fakeRootfs{}
+		f.journal = map[string]*journalPod{}
+		f.adoption = AdoptionStatus{}
+		return
+	}
+	// Snapshot live state into the durable journal, deciding per pod whether its VM
+	// survived the restart.
+	journal := map[string]*journalPod{}
+	for id, p := range f.pods {
+		alive := true
+		if v, ok := f.VMSurvivesRestart[id]; ok {
+			alive = v
+		}
+		jp := &journalPod{pod: p, vmAlive: alive}
+		for _, rf := range f.rootfs {
+			if rf.podID == id {
+				jp.rootfs = append(jp.rootfs, rf)
+			}
+		}
+		journal[id] = jp
+	}
+	f.journal = journal
+
+	// Drop live handles: the restarted helper has no in-memory state yet.
+	f.pods = map[string]*fakePod{}
+	f.rootfs = map[string]*fakeRootfs{}
+
+	// Startup adoption pass: reattach the pods whose VM survived.
+	adopted, lost := 0, 0
+	for _, jp := range f.journal {
+		if jp.vmAlive {
+			f.reattachLocked(jp)
+			adopted++
+		} else {
+			lost++
+		}
+	}
+	f.adoption = AdoptionStatus{Supported: true, AdoptedPods: adopted, LostPods: lost}
+}
+
+// reattachLocked restores a journaled pod and its rootfs into the live set so
+// subsequent PodStatus/Status/Adopt calls observe the reacquired VM. Caller holds mu.
+func (f *FakeBackend) reattachLocked(jp *journalPod) {
+	f.pods[jp.pod.spec.ID] = jp.pod
+	for _, rf := range jp.rootfs {
+		f.rootfs[rf.token] = rf
+	}
+}
+
+// Adopt reports whether the restarted helper reattached to a Pod VM (#138). A pod
+// in the live set (reacquired by the startup adoption pass) is Adopted with its
+// containers' current status; a journaled pod whose VM did not survive is not
+// adopted (the adapter falls back); an entirely unknown pod is ErrPodNotFound.
+func (f *FakeBackend) Adopt(_ context.Context, podID string) (AdoptionResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.Capabilities.Adopt {
+		return AdoptionResult{}, fmt.Errorf("%w: adopt", ErrUnsupported)
+	}
+	if p, ok := f.pods[podID]; ok {
+		res := AdoptionResult{PodID: podID, Adopted: true}
+		for _, c := range p.containers {
+			res.Containers = append(res.Containers, f.statusLocked(p, c))
+		}
+		return res, nil
+	}
+	if jp, ok := f.journal[podID]; ok && !jp.vmAlive {
+		return AdoptionResult{
+			PodID:   podID,
+			Adopted: false,
+			Reason:  "pod VM did not survive helper restart; recreate required",
+		}, nil
+	}
+	return AdoptionResult{}, fmt.Errorf("%w: %s", ErrPodNotFound, podID)
 }
 
 func (f *FakeBackend) CreatePod(_ context.Context, spec PodSpec) (PodStatus, error) {
@@ -129,6 +250,7 @@ func (f *FakeBackend) CreatePod(_ context.Context, spec PodSpec) (PodStatus, err
 	if _, ok := f.pods[spec.ID]; ok {
 		return PodStatus{}, fmt.Errorf("%w: pod %q already exists", ErrInvalid, spec.ID)
 	}
+	delete(f.journal, spec.ID)
 	addr := f.SandboxAddressFor[spec.ID]
 	if addr == "" {
 		// Deterministic, plausible host-only address so a test reading it sees an
@@ -341,6 +463,7 @@ func (f *FakeBackend) Cleanup(_ context.Context, podID string) (CleanupReport, e
 	defer f.mu.Unlock()
 	p, ok := f.pods[podID]
 	if !ok {
+		delete(f.journal, podID)
 		return CleanupReport{PodID: podID}, nil // idempotent
 	}
 	rep := CleanupReport{PodID: podID, PodRemoved: true, RemovedContainers: len(p.containers)}
@@ -351,6 +474,7 @@ func (f *FakeBackend) Cleanup(_ context.Context, podID string) (CleanupReport, e
 		}
 	}
 	delete(f.pods, podID)
+	delete(f.journal, podID)
 	return rep, nil
 }
 

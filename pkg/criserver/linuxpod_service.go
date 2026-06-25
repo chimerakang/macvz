@@ -10,6 +10,7 @@ import (
 
 	"github.com/chimerakang/macvz/internal/types"
 	"github.com/chimerakang/macvz/pkg/criserver/store"
+	"github.com/chimerakang/macvz/pkg/runtime"
 	"github.com/chimerakang/macvz/pkg/runtime/linuxpod"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -796,6 +797,98 @@ func (s *LinuxPodService) RecoverContainers(ctx context.Context) {
 	}
 }
 
+// AdoptSandboxes runs the live-VM adoption pass after an adapter/helper restart
+// (#138), before the fail-fast reconciler can mark sandboxes BackendLost. For each
+// Ready sandbox it asks the backend to reattach to the existing Pod VM. When the
+// helper reacquires the live VM and every recorded-Running container is confirmed
+// live, the sandbox stays Ready and kubelet never recreates the Pod. When the helper
+// cannot reacquire the VM, or adoption is incomplete (a recorded-Running container is
+// not live), it falls back to the supported BackendLost/recreate path - never leaving
+// a stale Running-but-unusable Pod. A backend without the adoption capability
+// (ErrUnsupported) makes this an immediate no-op, so the legacy fallback is unchanged.
+// Call it once at startup, after RecoverNetwork, before RecoverContainers.
+func (s *LinuxPodService) AdoptSandboxes(ctx context.Context) {
+	var ready []string
+	for _, sb := range s.sandboxes.List() {
+		if sb.State == store.StateReady {
+			ready = append(ready, sb.ID)
+		}
+	}
+	adopted, fellBack := 0, 0
+	for _, sandboxID := range ready {
+		res, err := s.backend.Adopt(ctx, sandboxID)
+		if errors.Is(err, linuxpod.ErrUnsupported) {
+			// The backend does not support adoption: leave everything to the reconciler's
+			// BackendLost/recreate path so behavior matches the pre-#138 helper exactly.
+			return
+		}
+		if err != nil && !linuxpodBackendMissing(err) {
+			klog.ErrorS(err, "LinuxPod sandbox adoption probe failed; retaining last known CRI state",
+				"sandbox", sandboxID)
+			continue
+		}
+
+		s.mu.Lock()
+		sb, ok := s.sandboxes.Get(sandboxID)
+		if !ok || sb.State != store.StateReady {
+			s.mu.Unlock()
+			continue
+		}
+		if err != nil || !res.Adopted {
+			reason := res.Reason
+			if reason == "" && err != nil {
+				reason = err.Error()
+			}
+			if reason == "" {
+				reason = "LinuxPod helper could not adopt this sandbox after restart"
+			}
+			s.markSandboxBackendLostLocked(ctx, sandboxID, reason)
+			fellBack++
+			klog.InfoS("LinuxPod sandbox could not be adopted after restart; will recreate",
+				"sandbox", sandboxID, "reason", reason, "err", err)
+			s.mu.Unlock()
+			continue
+		}
+		if s.applyAdoptionLocked(ctx, sandboxID, res) {
+			adopted++
+		} else {
+			fellBack++
+		}
+		s.mu.Unlock()
+	}
+	if adopted > 0 || fellBack > 0 {
+		klog.InfoS("LinuxPod live-VM adoption pass after restart",
+			"adopted", adopted, "fellBackToRecreate", fellBack)
+	}
+}
+
+// applyAdoptionLocked reconciles a sandbox's container records against the live
+// status the helper returned for an adopted Pod VM. It confirms every recorded-Running
+// container is still live; if any is missing or not Running it funnels the whole
+// sandbox into the BackendLost/recreate fallback and returns false, so adoption never
+// leaves a Running-but-unusable Pod. Identity evidence is not re-read - it is a start
+// invariant (#110/#117), so a container that verified at start stays verified. Caller
+// holds mu.
+func (s *LinuxPodService) applyAdoptionLocked(ctx context.Context, sandboxID string, res linuxpod.AdoptionResult) bool {
+	live := make(map[string]linuxpod.ContainerStatus, len(res.Containers))
+	for _, st := range res.Containers {
+		live[st.ID] = st
+	}
+	for _, c := range s.containers.ListBySandbox(sandboxID) {
+		if c.LinuxPod == nil || c.State != store.ContainerRunning {
+			continue
+		}
+		if st, ok := live[c.LinuxPod.BackendContainerID]; !ok || st.Phase != runtime.PhaseRunning {
+			s.markSandboxBackendLostLocked(ctx, sandboxID,
+				"LinuxPod adoption incomplete after helper restart: a running container was not reacquired")
+			return false
+		}
+	}
+	klog.InfoS("adopted LinuxPod sandbox after helper restart; Pod preserved without recreate",
+		"sandbox", sandboxID, "containers", len(res.Containers))
+	return true
+}
+
 // StartBackendReconciler periodically probes Ready LinuxPod sandboxes against the
 // helper. A restarted helper currently cannot adopt the old helper's live VM
 // handles, so it answers ErrPodNotFound for those sandboxes. The reconciler turns
@@ -878,6 +971,18 @@ func (s *LinuxPodService) reconcileSandboxBackendState(ctx context.Context, sand
 	if !ok || sb.State != store.StateReady {
 		return
 	}
+	s.markSandboxBackendLostLocked(ctx, sandboxID,
+		"LinuxPod helper no longer has live backend state for this sandbox")
+}
+
+// markSandboxBackendLostLocked drives the fail-fast/recreate fallback for a sandbox
+// whose live backend state is gone or whose adoption was incomplete (#138): it tears
+// down the Pod network host path, marks every still-live container Exited/BackendLost,
+// and sets the sandbox NotReady so kubelet recreates the Pod. It is the single
+// fallback both the backend reconciler and the adoption pass funnel through, so the
+// supported recreate behavior stays intact regardless of which path detected the
+// loss. Caller holds mu.
+func (s *LinuxPodService) markSandboxBackendLostLocked(ctx context.Context, sandboxID, reason string) {
 	if err := s.detachSandboxNetwork(ctx, sandboxID); err != nil {
 		klog.ErrorS(err, "failed to detach LinuxPod network after backend state loss", "sandbox", sandboxID)
 	}
@@ -888,7 +993,7 @@ func (s *LinuxPodService) reconcileSandboxBackendState(ctx context.Context, sand
 		c.State = store.ContainerExited
 		c.FinishedAt = s.now().UnixNano()
 		c.Reason = "BackendLost"
-		c.Message = "LinuxPod helper no longer has live backend state for this sandbox"
+		c.Message = reason
 		if err := s.containers.Put(&c); err != nil {
 			klog.ErrorS(err, "failed to persist LinuxPod container backend-loss state", "containerID", c.ID, "sandbox", sandboxID)
 		}
@@ -897,7 +1002,7 @@ func (s *LinuxPodService) reconcileSandboxBackendState(ctx context.Context, sand
 		klog.ErrorS(err, "failed to persist LinuxPod sandbox backend-loss state", "sandbox", sandboxID)
 		return
 	}
-	klog.InfoS("marked LinuxPod sandbox not ready after backend state loss", "sandbox", sandboxID)
+	klog.InfoS("marked LinuxPod sandbox not ready after backend state loss", "sandbox", sandboxID, "reason", reason)
 }
 
 // --- helpers ---

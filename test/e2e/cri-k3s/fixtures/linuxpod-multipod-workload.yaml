@@ -1,0 +1,197 @@
+# CRI-L6-3 (#137) LinuxPod-backed multi-Pod concurrency fixture.
+#
+# The single-Pod sibling fixtures/linuxpod-workload.yaml proves one app+late
+# sidecar Pod on the LinuxPod backend. This fixture proves *concurrency*: a
+# Deployment of N (default 3) replicas, each an app + late sidecar sharing one
+# Pod sandbox, all scheduled by a real Linux k3s/kubelet control plane onto the
+# *single* macOS MacVz CRI node that runs
+# `macvz-cri --experimental-linuxpod-backend` (CRI-L, #125..#129).
+#
+# Because the node is a single MacVz host, every replica lands on it — so this
+# exercises several concurrent LinuxPod micro-VMs side by side under one adapter
+# and one linuxpod-helper. linuxpod-multipod.sh asserts each Pod gets a unique
+# Pod IP from the node PodCIDR, each is reachable (Service + direct Pod IP),
+# logs/exec/port-forward work per Pod, adapter RSS and helper/process counts stay
+# bounded across concurrent Pods and churn, no duplicate pf/binat/helper-work
+# state is left behind, and cleanup leaves zero residual state with the default
+# route unchanged.
+#
+# As with the single-Pod fixture, the two-container shape is meaningful ONLY on a
+# LinuxPod-backed node; on the default apple/container path multi-container Pods
+# are excluded (#82/#86). linuxpod-multipod.sh refuses to pass the LinuxPod
+# acceptances unless a backend-evidence hook proves each Pod is genuinely
+# LinuxPod-backed (not the simulated handshake) — see #127/#128.
+#
+#   - app:     httpd serving the projected ConfigMap marker on :8080. Each Pod
+#              also serves its own Pod name/IP at /whoami via a tiny CGI so the
+#              Service phase can prove it actually reached distinct backends.
+#   - sidecar: declared after the app as a normal container, so kubelet drives the
+#              ordinary multi-container Pod order: app create/start, then sidecar
+#              create/start into the already-running sandbox. It curls the app on
+#              127.0.0.1:8080, records the marker to a shared file, then idles.
+#
+# #84 scheduling-exclusion opt-in is unchanged: select the MacVz runtime label
+# and tolerate the host-namespace taint. Keys mirror pkg/criserver/nodescheme.go.
+#
+# Image: an arm64 busybox providing sh + httpd + wget. linuxpod-multipod.sh
+# substitutes MACVZ_CRI_IMAGE at apply time and rewrites `replicas` to
+# MACVZ_MULTIPOD_REPLICAS.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: macvz-cri-linuxpod-mp-e2e
+  labels:
+    app.kubernetes.io/part-of: macvz-cri-linuxpod-multipod
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+  namespace: macvz-cri-linuxpod-mp-e2e
+data:
+  index.html: |
+    macvz-cri-l6-multipod-ok
+  app.conf: |
+    role=linuxpod-multipod-fixture
+    marker=macvz-cri-l6-multipod-ok
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: app-secret
+  namespace: macvz-cri-linuxpod-mp-e2e
+type: Opaque
+stringData:
+  token: macvz-cri-l6-secret-ok
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: linuxpod-multipod
+  namespace: macvz-cri-linuxpod-mp-e2e
+  labels:
+    app: linuxpod-multipod
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: linuxpod-multipod
+  template:
+    metadata:
+      labels:
+        app: linuxpod-multipod
+    spec:
+      nodeSelector:
+        node.macvz.io/runtime: apple-container
+      tolerations:
+        - key: node.macvz.io/host-namespace-unsupported
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      # Spread replicas is a no-op on a single node, but declaring it keeps the
+      # intent explicit and harmless if the node pool ever grows.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: linuxpod-multipod
+      containers:
+        - name: app
+          image: busybox:1.36.1
+          env:
+            - name: MACVZ_POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: MACVZ_POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          # Write a per-Pod identity file (name + IP) that the app serves at
+          # /whoami, then serve the shared web root on :8080. The Service phase
+          # collects distinct /whoami responses to prove it load-balanced across
+          # several distinct LinuxPod-backed Pods, not one Pod answering N times.
+          command:
+            - sh
+            - -c
+            - >-
+              pod_name="$(cat /proc/sys/kernel/hostname 2>/dev/null || echo unknown)";
+              echo "macvz-cri-l6-app-boot pod=${pod_name}";
+              mkdir -p /www-rw;
+              cat /www/index.html > /www-rw/index.html;
+              echo "macvz-cri-l6-whoami pod=${pod_name}" > /www-rw/whoami;
+              httpd -f -p 8080 -h /www-rw
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /index.html
+              port: 8080
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            failureThreshold: 12
+          livenessProbe:
+            httpGet:
+              path: /index.html
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          volumeMounts:
+            - name: web
+              mountPath: /www
+              readOnly: true
+            - name: secret
+              mountPath: /etc/app-secret
+              readOnly: true
+            - name: shared
+              mountPath: /shared
+        - name: sidecar
+          image: busybox:1.36.1
+          command:
+            - sh
+            - -c
+            - >-
+              for i in $(seq 1 60); do
+                if wget -T 2 -qO- http://127.0.0.1:8080/index.html | grep -q macvz-cri-l6-multipod-ok; then
+                  echo macvz-cri-l6-sidecar-localhost-ok > /shared/sidecar-localhost;
+                  echo "macvz-cri-l6-sidecar-boot pod=${MACVZ_POD_NAME}";
+                  break;
+                fi;
+                sleep 1;
+              done;
+              tail -f /dev/null
+          env:
+            - name: MACVZ_POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          volumeMounts:
+            - name: shared
+              mountPath: /shared
+      volumes:
+        - name: web
+          configMap:
+            name: app-config
+        - name: secret
+          secret:
+            secretName: app-secret
+        - name: shared
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: linuxpod-multipod
+  namespace: macvz-cri-linuxpod-mp-e2e
+spec:
+  type: ClusterIP
+  selector:
+    app: linuxpod-multipod
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080

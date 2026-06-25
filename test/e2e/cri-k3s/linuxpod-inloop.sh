@@ -86,7 +86,6 @@
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-ROOT="$(cd "$HERE/../../.." && pwd)"
 FIXTURE="$HERE/fixtures/linuxpod-workload.yaml"
 NS="macvz-cri-linuxpod-e2e"
 DEPLOY="linuxpod-inloop"
@@ -111,6 +110,7 @@ TAINT_KEY="node.macvz.io/host-namespace-unsupported"
 FAILURES=0
 SKIPS=0
 TMP_ROOT=""
+OUT_DIR_WAS_SET=0
 PF_PID=""
 # LINUXPOD_BACKED is set to 1 only once the backend-evidence phase proves the Pod
 # is served by a genuine, non-simulated LinuxPod backend. Until then the
@@ -189,7 +189,11 @@ setup() {
 		|| die "cluster unreachable (KUBECONFIG=${KUBECONFIG:-unset}); set a reachable kubeconfig"
 
 	TMP_ROOT="$(mktemp -d -t macvz-cri-linuxpod-inloop)"
-	[ -n "$OUT_DIR" ] || OUT_DIR="$TMP_ROOT/out"
+	if [ -n "$OUT_DIR" ]; then
+		OUT_DIR_WAS_SET=1
+	else
+		OUT_DIR="$TMP_ROOT/out"
+	fi
 	mkdir -p "$OUT_DIR"
 	log "out=$OUT_DIR image=$IMAGE"
 }
@@ -199,7 +203,9 @@ cleanup_trap() {
 	if [ "${MACVZ_CRI_KEEP:-0}" != 1 ]; then
 		kubectl delete namespace "$NS" --wait=false >/dev/null 2>&1 || true
 	fi
-	[ -n "$TMP_ROOT" ] && [ "${MACVZ_CRI_KEEP:-0}" != 1 ] && rm -rf "$TMP_ROOT"
+	if [ -n "$TMP_ROOT" ] && [ "${MACVZ_CRI_KEEP:-0}" != 1 ] && [ "$OUT_DIR_WAS_SET" = 1 ]; then
+		rm -rf "$TMP_ROOT"
+	fi
 }
 trap cleanup_trap EXIT
 

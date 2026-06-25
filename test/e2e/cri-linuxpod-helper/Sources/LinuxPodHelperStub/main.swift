@@ -12,7 +12,7 @@ import Foundation
 //
 // Usage: linuxpod-helper-stub --socket /path/to/helper.sock
 
-let protocolVersion = 5
+let protocolVersion = 6
 
 // Capabilities advertised in Ping. The stub backs the kubelet surfaces — logs,
 // exec, stats (CRI-L4 #129), execStream (CRI-L4 follow-up #132), and attach,
@@ -23,7 +23,7 @@ let protocolVersion = 5
 enum Capabilities {
     static let all: [String: Bool] = [
         "logs": true, "exec": true, "execStream": true, "stats": true,
-        "attach": true, "portForward": true,
+        "attach": true, "portForward": true, "adopt": true,
     ]
 }
 
@@ -100,8 +100,26 @@ final class Model {
     private func next() -> Int { seq += 1; return seq }
 
     func ping() -> [String: Any] {
+        // The stub keeps every Pod live in-process, so its startup adoption pass (a
+        // restart of this single process is out of band for the stub) reports the
+        // current live pods as adopted and none lost — the simulated counterpart of a
+        // helper whose VMs survived (#138).
         ["name": "linuxpod-helper-stub", "protocolVersion": protocolVersion,
-         "simulated": true, "capabilities": Capabilities.all]
+         "simulated": true, "capabilities": Capabilities.all,
+         "adoption": ["supported": true, "adoptedPods": pods.count, "lostPods": 0]]
+    }
+
+    // adopt reports whether a pod can be reattached after a helper restart (#138).
+    // The stub models a helper whose Pod VMs survive: any known pod is adopted with
+    // its containers' current status; an unknown pod is ErrPodNotFound so the adapter
+    // falls back to recreate. A real helper decides this by probing the live VM handle.
+    func adopt(_ p: [String: Any]) throws -> [String: Any] {
+        let podID = (p["podID"] as? String) ?? ""
+        guard let pod = pods[podID] else {
+            throw BackendError(code: "PodNotFound", message: podID)
+        }
+        let containers = pod.containers.values.map { status(pod, $0) }
+        return ["podID": podID, "adopted": true, "containers": containers]
     }
 
     // appendCRILog writes one CRI-format log line ("<rfc3339nano> <stream> F <msg>")
@@ -423,6 +441,8 @@ func dispatch(_ model: Model, _ line: Data) -> [String: Any] {
         switch op {
         case "Ping":
             return ok(model.ping())
+        case "Adopt":
+            return ok(try model.adopt(payload))
         case "CreatePod":
             return ok(try model.createPod(payload))
         case "PodStatus":

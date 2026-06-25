@@ -73,6 +73,23 @@ func TestSwiftHelperStubContract(t *testing.T) {
 		!info.Capabilities.Attach || !info.Capabilities.PortForward {
 		t.Errorf("swift stub should advertise all surfaces, got %+v", info.Capabilities)
 	}
+
+	// #138: the stub advertises live-VM adoption and answers Adopt over the same
+	// socket, proving the new op round-trips. The stub keeps every Pod live, so the
+	// running app's Pod adopts with its container status returned.
+	if !info.Capabilities.Adopt || !info.Adoption.Supported {
+		t.Errorf("swift stub should advertise adoption, got cap=%+v adoption=%+v", info.Capabilities, info.Adoption)
+	}
+	adopt, err := client.Adopt(ctx, app.PodID)
+	if err != nil {
+		t.Fatalf("Adopt over swift stub: %v", err)
+	}
+	if !adopt.Adopted || len(adopt.Containers) == 0 {
+		t.Errorf("swift stub adopt did not round-trip live pod: %+v", adopt)
+	}
+	if _, err := client.Adopt(ctx, "no-such-pod"); !errors.Is(err, ErrPodNotFound) {
+		t.Errorf("Adopt(unknown) over swift stub = %v, want ErrPodNotFound", err)
+	}
 	res, err := client.ExecSync(ctx, ExecRequest{PodID: app.PodID, ContainerID: app.ID, Command: []string{"echo", "ok"}})
 	if err != nil {
 		t.Fatalf("ExecSync over swift stub: %v", err)

@@ -34,9 +34,49 @@ release.
   skipped loudly, never passed). `make cri-linuxpod-inloop`. Gated by
   `MACVZ_INTEGRATION=1` + `KUBECONFIG`. Report:
   `docs/CRI_LINUXPOD_L5_INLOOP_VALIDATION_REPORT.md`.
+- `linuxpod-soak.sh` — gated **LinuxPod soak/churn** harness (CRI-L6-1 #135), the
+  soak sibling of `linuxpod-inloop.sh`. It drives the same real kubelet/k3s
+  topology and `fixtures/linuxpod-workload.yaml`, but instead of a single
+  lifecycle pass it loops restarts and lifecycle churn over
+  `MACVZ_SOAK_ITERATIONS` iterations, round-robin over the enabled
+  `MACVZ_SOAK_CHURN_MODES` (`rollout`, `cri`, `helper`, `netd`). Each iteration
+  records Pod UID, Pod IP, restartCount, adapter RSS, helper RSS, and residual
+  LinuxPod-state count to `soak-samples.csv`, and re-asserts the host default
+  route is unchanged. It proves the #134 recovery acceptances: a `cri` restart
+  preserves the Pod UID with no duplicate backend state; a `helper` restart
+  recovers live or via bounded recreate with exec/logs working afterward; a
+  `netd` restart/reload never mutates the default route and restores
+  reachability; and cleanup leaves zero residual state. It inherits the #130
+  **honesty gate** (`MACVZ_LINUXPOD_BACKEND_EVIDENCE_CMD`): LinuxPod-backend
+  claims are skipped loudly unless the Pod is proven non-simulated. A churn mode
+  whose hook is unset is dropped with a loud skip. `make cri-linuxpod-soak`.
+  Gated by `MACVZ_INTEGRATION=1` + `KUBECONFIG`.
+- `linuxpod-multipod.sh` — gated **LinuxPod multi-Pod concurrency** suite
+  (CRI-L6-3 #137), the concurrency sibling of `linuxpod-inloop.sh`. It schedules
+  `fixtures/linuxpod-multipod-workload.yaml` (a Deployment of N>=3 app+late-sidecar
+  replicas, all landing on the single MacVz node) and proves several concurrent
+  LinuxPod micro-VMs run side by side: >=3 Pods reach Ready, each gets a **unique**
+  Pod IP from the node PodCIDR, the ClusterIP Service load-balances across distinct
+  Pod backends, every Pod is reachable on its **direct Pod IP**, and logs/exec/
+  port-forward work per Pod. It then exercises concurrency recovery — a `macvz-cri`
+  restart keeps every Pod UID with no doubled residual state; a `linuxpod-helper`
+  restart yields bounded recreate with exec working on every Pod afterward — and
+  asserts **no duplicate pf/binat or helper-work** record is left behind
+  (`MACVZ_LINUXPOD_DUP_AUDIT_CMD`). A scale-churn loop
+  (`MACVZ_MULTIPOD_CHURN_CYCLES`) proves Pod IPs stay unique and residual state +
+  helper/process count return to baseline, and the soak tracks adapter RSS and
+  helper/process count under concurrency against documented pass/fail thresholds
+  (`MACVZ_INLOOP_RSS_GROWTH_KB`, `MACVZ_MULTIPOD_PROC_GROWTH` via
+  `MACVZ_LINUXPOD_HELPER_PROC_CMD`). It inherits the #130 **honesty gate**: it
+  requires `MACVZ_LINUXPOD_BACKEND_EVIDENCE_CMD` to prove **every** Pod is a
+  genuine, non-simulated LinuxPod backend or the LinuxPod acceptances skip loudly.
+  `make cri-linuxpod-multipod`. Gated by `MACVZ_INTEGRATION=1` + `KUBECONFIG`.
 - `fixtures/linuxpod-workload.yaml` — the #130 two-container fixture (app + late
   sidecar) for the LinuxPod backend; the multi-container shared-namespace shape
   the default apple/container path excludes (#82/#86).
+- `fixtures/linuxpod-multipod-workload.yaml` — the #137 multi-replica fixture: N>=3
+  app+late-sidecar Pods plus one ClusterIP Service, each app serving a per-Pod
+  `/whoami` identity so the Service phase can prove it reached distinct backends.
 
 `run.sh`/`soak.sh` are gated by `MACVZ_INTEGRATION=1`; `k3s-inloop.sh`
 additionally needs a reachable `KUBECONFIG`. Without their gates each prints its
@@ -249,6 +289,27 @@ default apple/container path, run a LinuxPod helper and start the adapter with
    with the #126/#127/#128/#129 blocker rather than passing falsely, so the report
    never claims live evidence the runtime did not produce. See the script header
    for the full env contract and `docs/CRI_RUNTIME_R17_LINUXPOD_BACKEND_REPORT.md`.
+
+4. Run the LinuxPod **multi-Pod concurrency** suite (CRI-L6-3 #137; same gates,
+   plan-only and exit 0 without them). It deploys N>=3 app+late-sidecar replicas
+   onto the single MacVz node, asserts unique Pod IPs, distinct Service backends,
+   direct Pod-IP reachability, per-Pod logs/exec/port-forward, bounded `macvz-cri`
+   and `linuxpod-helper` restart recovery, no duplicate pf/binat/helper-work
+   state, and bounded RSS + helper/process growth across scale churn:
+
+   ```sh
+   MACVZ_INTEGRATION=1 KUBECONFIG=/path/to/k3s.yaml \
+     MACVZ_MULTIPOD_REPLICAS=3 \
+     MACVZ_RESTART_CRI_CMD="…" MACVZ_RESTART_HELPER_CMD="…" \
+     MACVZ_ADAPTER_RSS_CMD="…" MACVZ_LINUXPOD_HELPER_PROC_CMD="…" \
+     MACVZ_LINUXPOD_AUDIT_CMD="…" MACVZ_LINUXPOD_DUP_AUDIT_CMD="…" \
+     MACVZ_ROUTE_AUDIT_CMD="…" \
+     ./test/e2e/cri-k3s/linuxpod-multipod.sh
+   ```
+
+   The same **honesty gate** applies per Pod: every replica must prove
+   `simulated=false` via `MACVZ_LINUXPOD_BACKEND_EVIDENCE_CMD` or the LinuxPod
+   acceptances skip loudly. See the script header for the full env contract.
 
 ## Known limitations
 

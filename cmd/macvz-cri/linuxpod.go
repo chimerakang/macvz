@@ -67,6 +67,11 @@ func (lc linuxpodConfig) handshake(ctx context.Context) (info linuxpod.HelperInf
 			"LinuxPod helper handshake on %s failed: %w; start the helper or pass the correct --linuxpod-helper-socket",
 			lc.helperSocket, err)
 	}
+	if info.ProtocolVersion != linuxpod.ProtocolVersion {
+		return linuxpod.HelperInfo{}, false, fmt.Errorf(
+			"LinuxPod helper handshake on %s failed: protocol version %d is incompatible with adapter version %d; rebuild/restart the matching helper",
+			lc.helperSocket, info.ProtocolVersion, linuxpod.ProtocolVersion)
+	}
 	return info, true, nil
 }
 
@@ -108,6 +113,10 @@ func serveLinuxPod(ctx context.Context, lis net.Listener, socketPath string, san
 	// Rebuild Pod IP reservations and re-attach surviving sandboxes so a restart
 	// neither leaks addresses nor wipes other Pods' host rules. No-op when off.
 	svc.RecoverNetwork(ctx)
+	// Attempt live-VM adoption first (#138): a restarted helper that kept its Pod VMs
+	// reattaches here so kubelet never recreates a healthy Pod. Sandboxes that cannot
+	// be adopted are left for the fail-fast BackendLost/recreate path below.
+	svc.AdoptSandboxes(ctx)
 	// Reconcile persisted records against the live backend after a restart without
 	// trusting stale identity evidence (identity is a start invariant).
 	svc.RecoverContainers(ctx)

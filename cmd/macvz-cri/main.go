@@ -111,6 +111,7 @@ func main() {
 		handoffRoot     string
 		linuxpodBackend bool
 		linuxpodSocket  string
+		linuxpodDiag    bool
 		pn              podNetConfig
 	)
 	flag.StringVar(&listen, "listen", defaultListen,
@@ -151,6 +152,8 @@ func main() {
 		"opt into the experimental LinuxPod late-rootfs runtime backend prototype (CRI-R17, #124): connect to a LinuxPod helper over --linuxpod-helper-socket and verify the backend contract at startup; off by default, experimental (not production-ready), and does not replace the shipped apple/container CRI serving path (docs/CRI_RUNTIME_R17_LINUXPOD_BACKEND_REPORT.md)")
 	flag.StringVar(&linuxpodSocket, "linuxpod-helper-socket", "",
 		"unix socket of the LinuxPod helper that speaks the pkg/runtime/linuxpod NDJSON contract (required with --experimental-linuxpod-backend)")
+	flag.BoolVar(&linuxpodDiag, "diagnose-linuxpod", false,
+		"scan persisted LinuxPod CRI state for residual/stale records (CRI-L6-2, #136), print a machine-readable JSON report to stdout, and exit without serving; read-only (never mutates records, IP reservations, or host routes). Pass --linuxpod-helper-socket to probe the live helper backend, otherwise sandbox liveness is reported as unprobed")
 	flag.BoolVar(&showVersion, "version", false, "print version and exit")
 
 	klog.InitFlags(nil)
@@ -163,6 +166,17 @@ func main() {
 
 	mc := mountConfig{kubeletPodsDir: kubeletPodsDir, hostPathAllowed: hostPathAllowed}
 	hc := handoffConfig{enabled: handoff, root: handoffRoot}
+
+	if linuxpodDiag {
+		lc := linuxpodConfig{enabled: linuxpodBackend, helperSocket: linuxpodSocket}
+		if err := runLinuxPodDiagnose(context.Background(), os.Stdout, stateDir, lc); err != nil {
+			klog.ErrorS(err, "macvz-cri LinuxPod diagnostic failed")
+			klog.Flush()
+			os.Exit(1)
+		}
+		klog.Flush()
+		return
+	}
 
 	if doPreflight {
 		if err := runPreflight(preflightConfig{
@@ -195,6 +209,7 @@ func main() {
 		klog.InfoS("experimental LinuxPod backend handshake succeeded; CRI serving will use LinuxPod backend",
 			"helper", info.Name, "protocolVersion", info.ProtocolVersion, "simulated", info.Simulated,
 			"capLogs", info.Capabilities.Logs, "capExec", info.Capabilities.Exec, "capStats", info.Capabilities.Stats,
+			"capAdopt", info.Capabilities.Adopt, "adoptedPods", info.Adoption.AdoptedPods, "lostPods", info.Adoption.LostPods,
 			"socket", linuxpodSocket)
 	}
 

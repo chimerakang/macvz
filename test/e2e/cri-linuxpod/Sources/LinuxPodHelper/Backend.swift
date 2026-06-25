@@ -14,7 +14,7 @@ import Logging
 
 // helperProtocolVersion is the NDJSON wire-protocol version this helper speaks; it
 // must equal pkg/runtime/linuxpod ProtocolVersion.
-let helperProtocolVersion = 5
+let helperProtocolVersion = 6
 
 // parseEvidenceText extracts the observed identity and net-namespace inode the late
 // process wrote into the handoff evidence channel. Free (nonisolated) so the
@@ -168,6 +168,13 @@ actor LinuxPodBackend {
         do {
             switch op {
             case "Ping": return wrap(ping())
+            case "Adopt":
+                // Live-VM adoption after a helper restart (#138) needs a durable journal
+                // and reacquisition of the running Apple Containerization VM handles. That
+                // is not implemented here yet, so the helper answers Unsupported and the
+                // adapter falls back to the supported BackendLost/recreate path — the
+                // behavior the issue keeps as the default until real adoption lands.
+                return ["ok": false, "code": "Unsupported", "error": "adopt: live-VM adoption not implemented"]
             case "CreatePod": return wrap(try await createPod(payload))
             case "PodStatus": return wrap(try podStatus(payload))
             case "PrepareContainerRootfs": return wrap(try await prepareRootfs(payload))
@@ -207,7 +214,11 @@ actor LinuxPodBackend {
             "name": "linuxpod-helper",
             "protocolVersion": helperProtocolVersion,
             "simulated": false,
-            "capabilities": ["logs": true, "exec": true, "stats": true],
+            // adopt:false — the real helper does not yet persist a durable journal to
+            // reattach live Pod VMs after its own restart (#138); it falls back to
+            // BackendLost/recreate. The Go contract + FakeBackend model the mechanism.
+            "capabilities": ["logs": true, "exec": true, "stats": true, "adopt": false],
+            "adoption": ["supported": false, "adoptedPods": 0, "lostPods": 0],
         ]
     }
 

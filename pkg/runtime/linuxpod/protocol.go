@@ -21,6 +21,7 @@ type Op string
 
 const (
 	opPing            Op = "Ping"
+	opAdopt           Op = "Adopt"
 	opCreatePod       Op = "CreatePod"
 	opPodStatus       Op = "PodStatus"
 	opPrepareRootfs   Op = "PrepareContainerRootfs"

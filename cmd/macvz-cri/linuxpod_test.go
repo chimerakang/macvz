@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bufio"
 	"context"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -93,5 +95,41 @@ func TestLinuxPodHandshakeAgainstRealSocket(t *testing.T) {
 	// the operator log can report what the helper backs.
 	if !info.Capabilities.Logs || !info.Capabilities.Exec || !info.Capabilities.Stats {
 		t.Errorf("fake backend should advertise logs/exec/stats capabilities, got %+v", info.Capabilities)
+	}
+}
+
+// TestLinuxPodHandshakeRejectsProtocolMismatch keeps old helpers from starting a
+// newer adapter successfully and then failing later on a missing op.
+func TestLinuxPodHandshakeRejectsProtocolMismatch(t *testing.T) {
+	dir, err := os.MkdirTemp("", "lp")
+	if err != nil {
+		t.Fatalf("mkdtemp: %v", err)
+	}
+	defer os.RemoveAll(dir)
+	socket := filepath.Join(dir, "h.sock")
+	lis, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer lis.Close()
+
+	go func() {
+		conn, err := lis.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_, _ = bufio.NewReader(conn).ReadBytes('\n')
+		_, _ = fmt.Fprintf(conn,
+			"{\"ok\":true,\"result\":{\"name\":\"old-linuxpod-helper\",\"protocolVersion\":%d,\"simulated\":true,\"capabilities\":{}}}\n",
+			linuxpod.ProtocolVersion-1)
+	}()
+
+	_, ok, err := (linuxpodConfig{enabled: true, helperSocket: socket}).handshake(context.Background())
+	if ok || err == nil {
+		t.Fatalf("protocol mismatch handshake should fail, got ok=%v err=%v", ok, err)
+	}
+	if !strings.Contains(err.Error(), "protocol version") || !strings.Contains(err.Error(), "rebuild/restart") {
+		t.Errorf("protocol mismatch error should be actionable, got %q", err.Error())
 	}
 }

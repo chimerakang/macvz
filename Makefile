@@ -48,6 +48,14 @@ cri-k3s-inloop: ## Run the CRI-P9 real kubelet/k3s in-loop suite (set MACVZ_INTE
 cri-linuxpod-inloop: ## Run the CRI-L5 LinuxPod-backed kubelet/k3s in-loop suite (set MACVZ_INTEGRATION=1 + KUBECONFIG to run live)
 	./test/e2e/cri-k3s/linuxpod-inloop.sh
 
+.PHONY: cri-linuxpod-multipod
+cri-linuxpod-multipod: ## Run the CRI-L6-3 LinuxPod-backed multi-Pod concurrency suite (set MACVZ_INTEGRATION=1 + KUBECONFIG to run live)
+	./test/e2e/cri-k3s/linuxpod-multipod.sh
+
+.PHONY: cri-linuxpod-soak
+cri-linuxpod-soak: ## Run the CRI-L6-1 LinuxPod soak/churn harness (set MACVZ_INTEGRATION=1 + KUBECONFIG to run live)
+	./test/e2e/cri-k3s/linuxpod-soak.sh
+
 .PHONY: cri-handoff
 cri-handoff: cri ## Run the CRI-I4-1 handoff-lifecycle crictl fixture (set MACVZ_INTEGRATION=1 to run live)
 	./test/e2e/cri-handoff/run.sh

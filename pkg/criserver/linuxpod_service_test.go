@@ -3,6 +3,7 @@ package criserver
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -782,5 +783,168 @@ func TestLinuxPodServiceRestartRecovery(t *testing.T) {
 	}
 	if c.State != store.ContainerExited {
 		t.Errorf("post-recovery state = %s, want Exited (backend lost the container)", c.State)
+	}
+}
+
+// restartedLinuxPodService reopens the persisted stores against the given backend,
+// modeling a macvz-cri restart that rediscovers what it was running.
+func restartedLinuxPodService(t *testing.T, dir string, backend linuxpod.Backend) *LinuxPodService {
+	t.Helper()
+	sb, _, err := store.New(filepath.Join(dir, "sandboxes"))
+	if err != nil {
+		t.Fatalf("reopen sandbox store: %v", err)
+	}
+	cs, _, err := store.NewContainerStore(filepath.Join(dir, "containers"))
+	if err != nil {
+		t.Fatalf("reopen container store: %v", err)
+	}
+	svc, err := NewLinuxPodService(LinuxPodOptions{Backend: backend, Sandboxes: sb, Containers: cs})
+	if err != nil {
+		t.Fatalf("reopen NewLinuxPodService: %v", err)
+	}
+	return svc
+}
+
+type adoptErrorBackend struct {
+	*linuxpod.FakeBackend
+	err error
+}
+
+func (b adoptErrorBackend) Adopt(context.Context, string) (linuxpod.AdoptionResult, error) {
+	return linuxpod.AdoptionResult{}, b.err
+}
+
+// TestLinuxPodServiceAdoptsLiveVMAfterHelperRestart proves the #138 happy path: when
+// the helper restarts but keeps the Pod VM, the adapter's adoption pass reattaches
+// the sandbox so it stays Ready with its container Running - kubelet never recreates
+// the Pod, and the periodic reconciler leaves it Ready because PodStatus now answers.
+func TestLinuxPodServiceAdoptsLiveVMAfterHelperRestart(t *testing.T) {
+	dir := t.TempDir()
+	sb, _, _ := store.New(filepath.Join(dir, "sandboxes"))
+	cs, _, _ := store.NewContainerStore(filepath.Join(dir, "containers"))
+
+	backend := linuxpod.NewFakeBackend()
+	svc, err := NewLinuxPodService(LinuxPodOptions{Backend: backend, Sandboxes: sb, Containers: cs})
+	if err != nil {
+		t.Fatalf("NewLinuxPodService: %v", err)
+	}
+	ctx := context.Background()
+	sandboxID := lpRunSandbox(t, svc)
+	appID := lpCreateStart(t, svc, sandboxID, "app")
+
+	// Helper restarts; the Pod VM survives. The adapter restarts too and runs the
+	// adoption pass before the fail-fast reconciler.
+	backend.SimulateHelperRestart()
+	svc2 := restartedLinuxPodService(t, dir, backend)
+	svc2.AdoptSandboxes(ctx)
+	svc2.RecoverContainers(ctx)
+
+	if sbRec, ok := svc2.sandboxes.Get(sandboxID); !ok || sbRec.State != store.StateReady {
+		t.Fatalf("sandbox after adoption = %+v, want Ready (adopted, no recreate)", sbRec)
+	}
+	if c, _ := svc2.containers.Get(appID); c.State != store.ContainerRunning {
+		t.Fatalf("container after adoption = %s, want Running", c.State)
+	}
+	// The periodic reconciler must not undo the adoption: PodStatus answers for the
+	// reattached VM, so the sandbox stays Ready.
+	svc2.reconcileAllSandboxBackendState(ctx)
+	if sbRec, _ := svc2.sandboxes.Get(sandboxID); sbRec.State != store.StateReady {
+		t.Fatalf("sandbox after reconcile = %s, want Ready (live VM adopted)", sbRec.State)
+	}
+	// Adoption is usable, not just Running-on-paper: exec reaches the live container.
+	if _, err := svc2.ExecSync(ctx, &runtimeapi.ExecSyncRequest{
+		ContainerId: appID, Cmd: []string{"true"}, Timeout: 5,
+	}); err != nil {
+		t.Fatalf("ExecSync on adopted container: %v", err)
+	}
+}
+
+// TestLinuxPodServiceFallsBackToRecreateWhenVMLost proves the #138 fallback remains
+// intact: when the helper restart loses the Pod VM, adoption fails and the sandbox is
+// driven to NotReady with its container BackendLost so kubelet recreates it - never a
+// stale Running-but-unusable Pod.
+func TestLinuxPodServiceFallsBackToRecreateWhenVMLost(t *testing.T) {
+	dir := t.TempDir()
+	sb, _, _ := store.New(filepath.Join(dir, "sandboxes"))
+	cs, _, _ := store.NewContainerStore(filepath.Join(dir, "containers"))
+
+	backend := linuxpod.NewFakeBackend()
+	svc, err := NewLinuxPodService(LinuxPodOptions{Backend: backend, Sandboxes: sb, Containers: cs})
+	if err != nil {
+		t.Fatalf("NewLinuxPodService: %v", err)
+	}
+	ctx := context.Background()
+	sandboxID := lpRunSandbox(t, svc)
+	appID := lpCreateStart(t, svc, sandboxID, "app")
+
+	// Helper restarts and the Pod VM dies with it: adoption is impossible.
+	backend.VMSurvivesRestart[sandboxID] = false
+	backend.SimulateHelperRestart()
+	svc2 := restartedLinuxPodService(t, dir, backend)
+	svc2.AdoptSandboxes(ctx)
+
+	if sbRec, _ := svc2.sandboxes.Get(sandboxID); sbRec.State != store.StateNotReady {
+		t.Fatalf("sandbox after lost VM = %s, want NotReady (fall back to recreate)", sbRec.State)
+	}
+	c, _ := svc2.containers.Get(appID)
+	if c.State != store.ContainerExited || c.Reason != "BackendLost" {
+		t.Fatalf("container after lost VM = state %s reason %q, want Exited/BackendLost", c.State, c.Reason)
+	}
+}
+
+func TestLinuxPodServiceAdoptionTransientErrorRetainsState(t *testing.T) {
+	dir := t.TempDir()
+	sb, _, _ := store.New(filepath.Join(dir, "sandboxes"))
+	cs, _, _ := store.NewContainerStore(filepath.Join(dir, "containers"))
+
+	base := linuxpod.NewFakeBackend()
+	svc, err := NewLinuxPodService(LinuxPodOptions{Backend: base, Sandboxes: sb, Containers: cs})
+	if err != nil {
+		t.Fatalf("NewLinuxPodService: %v", err)
+	}
+	ctx := context.Background()
+	sandboxID := lpRunSandbox(t, svc)
+	appID := lpCreateStart(t, svc, sandboxID, "app")
+
+	svc2 := restartedLinuxPodService(t, dir, adoptErrorBackend{
+		FakeBackend: base,
+		err:         errors.New("temporary helper transport failure"),
+	})
+	svc2.AdoptSandboxes(ctx)
+
+	if sbRec, _ := svc2.sandboxes.Get(sandboxID); sbRec.State != store.StateReady {
+		t.Fatalf("sandbox after transient adoption error = %s, want Ready", sbRec.State)
+	}
+	c, _ := svc2.containers.Get(appID)
+	if c.State != store.ContainerRunning || c.Reason == "BackendLost" {
+		t.Fatalf("container after transient adoption error = state %s reason %q, want Running/non-BackendLost", c.State, c.Reason)
+	}
+}
+
+// TestLinuxPodServiceAdoptionIncompleteFallsBack proves adoption never leaves a stale
+// Running Pod: if the helper reattaches the VM but a recorded-Running container is not
+// live, the adapter funnels the whole sandbox into the recreate fallback.
+func TestLinuxPodServiceAdoptionIncompleteFallsBack(t *testing.T) {
+	ctx := context.Background()
+	backend := linuxpod.NewFakeBackend()
+	svc := newLinuxPodTestService(t, backend)
+	sandboxID := lpRunSandbox(t, svc)
+	appID := lpCreateStart(t, svc, sandboxID, "app")
+
+	// Adopt reports the VM back but WITHOUT the recorded-Running container.
+	c, _ := svc.containers.Get(appID)
+	res := linuxpod.AdoptionResult{PodID: sandboxID, Adopted: true} // no Containers
+	svc.mu.Lock()
+	ok := svc.applyAdoptionLocked(ctx, sandboxID, res)
+	svc.mu.Unlock()
+	if ok {
+		t.Fatalf("applyAdoptionLocked must reject adoption missing a running container")
+	}
+	if sbRec, _ := svc.sandboxes.Get(sandboxID); sbRec.State != store.StateNotReady {
+		t.Fatalf("sandbox after incomplete adoption = %s, want NotReady", sbRec.State)
+	}
+	got, _ := svc.containers.Get(c.ID)
+	if got.State != store.ContainerExited || got.Reason != "BackendLost" {
+		t.Fatalf("container after incomplete adoption = state %s reason %q, want Exited/BackendLost", got.State, got.Reason)
 	}
 }

@@ -77,10 +77,10 @@ processes outlived it.
 
 | Criterion | Status |
 | --- | --- |
-| Helper restart preserves a LinuxPod-backed Pod without recreate when adoption succeeds | ✅ proven against the modeled backend (`TestLinuxPodServiceAdoptsLiveVMAfterHelperRestart`); real-helper live evidence pending |
+| Helper restart preserves a LinuxPod-backed Pod without recreate when adoption succeeds | ✅ proven against the modeled backend (`TestLinuxPodServiceAdoptsLiveVMAfterHelperRestart`) and Swift stub contract; real-helper implementation pending |
 | `exec`/logs/stats/port-forward/Service work after adoption | ✅ exec exercised post-adoption in the adapter test; live surfaces resume because `PodStatus`/`Status` observe the reattached VM; full live run pending |
 | Incomplete adoption never leaves stale Running-but-unusable Pod; fallback intact | ✅ `TestLinuxPodServiceAdoptionIncompleteFallsBack`, `TestLinuxPodServiceFallsBackToRecreateWhenVMLost` |
-| Live test evidence compares adoption vs fallback | ✅ at the modeled-backend level (adopt vs VM-gone vs incomplete); real-helper hardware run is the remaining step |
+| Live test evidence compares adoption vs fallback | ✅ at the modeled-backend level (adopt vs VM-gone vs incomplete); live real-helper probe `/tmp/macvz-live-adoption-probe-20260627002536` confirms today's helper advertises `adopt:false` and returns `Unsupported`, so real journal-backed reattachment remains pending |
 
 ## Non-goals (honored)
 

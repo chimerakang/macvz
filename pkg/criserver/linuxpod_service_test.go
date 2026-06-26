@@ -814,6 +814,14 @@ func (b adoptErrorBackend) Adopt(context.Context, string) (linuxpod.AdoptionResu
 	return linuxpod.AdoptionResult{}, b.err
 }
 
+type missingPodStatusBackend struct {
+	*linuxpod.FakeBackend
+}
+
+func (b missingPodStatusBackend) PodStatus(context.Context, string) (linuxpod.PodStatus, error) {
+	return linuxpod.PodStatus{}, linuxpod.ErrPodNotFound
+}
+
 // TestLinuxPodServiceAdoptsLiveVMAfterHelperRestart proves the #138 happy path: when
 // the helper restarts but keeps the Pod VM, the adapter's adoption pass reattaches
 // the sandbox so it stays Ready with its container Running - kubelet never recreates
@@ -856,6 +864,31 @@ func TestLinuxPodServiceAdoptsLiveVMAfterHelperRestart(t *testing.T) {
 		ContainerId: appID, Cmd: []string{"true"}, Timeout: 5,
 	}); err != nil {
 		t.Fatalf("ExecSync on adopted container: %v", err)
+	}
+}
+
+func TestLinuxPodServiceReconcilerAdoptsAfterHelperRestart(t *testing.T) {
+	backend := linuxpod.NewFakeBackend()
+	svc := newLinuxPodTestService(t, backend)
+	ctx := context.Background()
+	sandboxID := lpRunSandbox(t, svc)
+	appID := lpCreateStart(t, svc, sandboxID, "app")
+
+	// macvz-cri stayed alive, but the helper's status path temporarily lost its
+	// in-memory Pod handle. The reconciler must try Adopt before BackendLost.
+	svc.backend = missingPodStatusBackend{FakeBackend: backend}
+	svc.reconcileSandboxBackendState(ctx, sandboxID)
+
+	if sbRec, ok := svc.sandboxes.Get(sandboxID); !ok || sbRec.State != store.StateReady {
+		t.Fatalf("sandbox after reconciler adoption = %+v, want Ready", sbRec)
+	}
+	if c, _ := svc.containers.Get(appID); c.State != store.ContainerRunning {
+		t.Fatalf("container after reconciler adoption = %s, want Running", c.State)
+	}
+	if _, err := svc.ExecSync(ctx, &runtimeapi.ExecSyncRequest{
+		ContainerId: appID, Cmd: []string{"true"}, Timeout: 5,
+	}); err != nil {
+		t.Fatalf("ExecSync after reconciler adoption: %v", err)
 	}
 }
 

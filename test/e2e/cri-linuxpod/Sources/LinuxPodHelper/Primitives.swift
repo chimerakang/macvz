@@ -44,7 +44,6 @@ final class HelperRuntime: @unchecked Sendable {
     ) async throws -> HelperRuntime {
         let fm = FileManager.default
         let workRoot = URL(fileURLWithPath: workDir)
-        try? fm.removeItem(at: workRoot)
         try fm.createDirectory(at: workRoot, withIntermediateDirectories: true)
 
         guard fm.fileExists(atPath: kernel) else {

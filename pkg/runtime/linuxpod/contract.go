@@ -72,20 +72,20 @@ type Backend interface {
 	// succeed before the adapter trusts the backend.
 	Ping(ctx context.Context) (HelperInfo, error)
 
-	// Adopt attempts to reattach to a Pod VM and its containers after the helper's
-	// own process restart (#138), without forcing the adapter to recreate the Pod.
-	// It is the live-VM counterpart to the fail-fast PodStatus probe: where
-	// PodStatus answers ErrPodNotFound for a pod the restarted helper lost, Adopt
-	// asks the helper to reacquire it from its durable journal.
+	// Adopt attempts to recover a Pod VM and its containers after the helper's own
+	// process restart (#138), without forcing the adapter to recreate the Pod when
+	// recovery is possible. It is the live-VM counterpart to the fail-fast PodStatus
+	// probe: where PodStatus answers ErrPodNotFound for a pod the restarted helper
+	// lost, Adopt asks the helper to resolve it from its durable journal.
 	//
 	// On success it returns AdoptionResult{Adopted:true} with the containers' current
 	// live status, and subsequent PodStatus/Status calls observe the reattached VM.
 	// If the Pod VM did not survive the restart (or adoption is otherwise incomplete)
 	// it returns AdoptionResult{Adopted:false} with a Reason and NO error, so the
 	// adapter falls back to BackendLost/recreate — the supported behavior remains
-	// intact. It returns ErrUnsupported when the helper does not persist an adoptable
-	// journal (Capabilities.Adopt false), and ErrPodNotFound when the pod id is
-	// unknown to the helper's journal entirely.
+	// intact. It returns ErrUnsupported when the helper does not implement a durable
+	// adoption protocol (Capabilities.Adopt false), and ErrPodNotFound when the pod
+	// id is unknown to the helper's journal entirely.
 	Adopt(ctx context.Context, podID string) (AdoptionResult, error)
 
 	// CreatePod boots the LinuxPod sandbox VM (the RunPodSandbox analog) and returns
@@ -201,22 +201,22 @@ type HelperInfo struct {
 	// backs. The adapter reads it once at the startup handshake and only calls a
 	// surface the helper advertises (CRI-L4, #129).
 	Capabilities Capabilities `json:"capabilities"`
-	// Adoption reports the helper's most recent startup live-VM adoption pass (#138):
-	// whether the helper supports reattaching to journaled Pod VMs after its own
-	// restart, and how many it reacquired vs. could not. The adapter and diagnostics
-	// read it to learn whether a restart preserved workloads or fell back to recreate.
-	// Its zero value (Supported false) is honest for a helper that predates the
-	// feature or carries no durable journal.
+	// Adoption reports the helper's most recent startup adoption pass (#138): whether
+	// the helper supports the durable adoption protocol for journaled Pod VMs after
+	// its own restart, and how many it reacquired vs. could not. The adapter and
+	// diagnostics read it to learn whether a restart preserved workloads or fell back
+	// to recreate. Its zero value (Supported false) is honest for a helper that
+	// predates the feature or carries no durable journal.
 	Adoption AdoptionStatus `json:"adoption"`
 }
 
-// AdoptionStatus summarizes a helper's startup live-VM adoption pass (#138). It is
-// surfaced through Ping so an operator or the adapter can see, at the handshake,
-// whether a helper restart reattached to live Pod VMs or fell back to recreate.
+// AdoptionStatus summarizes a helper's startup adoption pass (#138). It is surfaced
+// through Ping so an operator or the adapter can see, at the handshake, whether a
+// helper restart reattached to live Pod VMs or fell back to recreate.
 type AdoptionStatus struct {
-	// Supported is true when the helper persists a durable journal and can reattach
-	// to a surviving Pod VM after its own restart. False means every restart falls
-	// back to BackendLost/recreate (the pre-#138 behavior).
+	// Supported is true when the helper persists a durable journal and implements
+	// Adopt for per-pod recovery outcomes after its own restart. False means every
+	// restart falls back to BackendLost/recreate (the pre-#138 behavior).
 	Supported bool `json:"supported"`
 	// AdoptedPods is how many journaled Pod VMs the helper reacquired at startup.
 	AdoptedPods int `json:"adoptedPods"`
@@ -276,10 +276,12 @@ type Capabilities struct {
 	// ports are forwardable; the actual byte-stream forwarding is out of scope (#131
 	// non-goal). False → PortForward returns ErrUnsupported.
 	PortForward bool `json:"portForward"`
-	// Adopt is true when the helper persists a durable journal and can reattach to a
-	// live Pod VM after its own process restart (#138), answering per-pod adoption
-	// through Adopt. False means a helper restart always loses Pod VM state and the
-	// adapter falls back to BackendLost/recreate; Adopt then returns ErrUnsupported.
+	// Adopt is true when the helper persists a durable journal and implements per-pod
+	// recovery outcomes through Adopt after its own process restart (#138). A helper
+	// may still return Adopted=false for a journaled pod it cannot reacquire, letting
+	// the adapter fall back immediately. False means a helper restart always loses
+	// Pod VM state and the adapter uses BackendLost/recreate; Adopt then returns
+	// ErrUnsupported.
 	Adopt bool `json:"adopt"`
 }
 
@@ -495,7 +497,7 @@ type CleanupReport struct {
 // v4 added CreateRequest.Mounts so kubelet-managed ConfigMap/Secret/emptyDir
 // volumes reach the LinuxPod helper in the #130 in-loop path. v5 added the
 // interactive surface ops + capabilities: Attach and PortForward (CRI-L4
-// follow-up #131) and ExecStream (CRI-L4 follow-up #132). v6 added the live-VM
-// adoption op + capability (Adopt) and HelperInfo.Adoption so a restarted helper
-// can reattach to existing Pod VM state instead of forcing a recreate (#138).
+// follow-up #131) and ExecStream (CRI-L4 follow-up #132). v6 added the adoption op
+// + capability (Adopt) and HelperInfo.Adoption so a restarted helper can either
+// reattach to existing Pod VM state or report an immediate recreate fallback (#138).
 const ProtocolVersion = 6

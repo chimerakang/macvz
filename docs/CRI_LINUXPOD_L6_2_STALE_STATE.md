@@ -11,11 +11,12 @@ The shipped Virtual Kubelet / apple-container path is untouched.
 
 ## Fail-fast / recreate policy
 
-The adapter supports an opt-in live-VM adoption pass (#138), but the real
-`linuxpod-helper` currently advertises `adopt:false` because it does not yet persist
-a durable VM journal. So the production-facing fallback remains: MacVz does **not**
-keep a Pod "Running" across a backend that has lost it. It fails fast and lets
-kubelet recreate:
+The adapter supports an opt-in adoption pass (#138), and the real
+`linuxpod-helper` now persists a durable journal so it can report per-pod adoption
+outcomes instead of `Unsupported`. True VM-handle reattachment still depends on a
+Containerization lookup/reattach hook, so the production-facing fallback remains:
+MacVz does **not** keep a Pod "Running" across a backend that has lost it. It fails
+fast and lets kubelet recreate:
 
 1. **Backend reconciliation.** A background reconciler (and every status read)
    probes each `Ready` sandbox against the helper with `PodStatus`. If the helper

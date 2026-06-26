@@ -968,6 +968,9 @@ func (s *LinuxPodService) reconcileSandboxBackendState(ctx context.Context, sand
 			"sandbox", sandboxID, "err", err)
 		return
 	}
+	if s.tryAdoptSandboxAfterBackendMiss(ctx, sandboxID) {
+		return
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -977,6 +980,47 @@ func (s *LinuxPodService) reconcileSandboxBackendState(ctx context.Context, sand
 	}
 	s.markSandboxBackendLostLocked(ctx, sandboxID,
 		"LinuxPod helper no longer has live backend state for this sandbox")
+}
+
+// tryAdoptSandboxAfterBackendMiss gives a helper with the #138 adoption capability
+// one chance to reattach a Ready sandbox when PodStatus says the in-memory handle is
+// missing. This covers a helper-process restart while macvz-cri itself stayed alive;
+// the startup AdoptSandboxes pass covers the adapter+helper restart case. It returns
+// true when the caller should stop: either adoption succeeded, the backend reported a
+// transient adoption error and we retained CRI state, or adoption failed and this
+// method already marked the sandbox BackendLost. Unsupported/unknown falls through
+// so the legacy BackendLost fallback remains unchanged.
+func (s *LinuxPodService) tryAdoptSandboxAfterBackendMiss(ctx context.Context, sandboxID string) bool {
+	s.statusProbeMu.Lock()
+	res, err := s.backend.Adopt(ctx, sandboxID)
+	s.statusProbeMu.Unlock()
+	if errors.Is(err, linuxpod.ErrUnsupported) || linuxpodBackendMissing(err) {
+		return false
+	}
+	if err != nil {
+		klog.V(4).InfoS("LinuxPod backend adoption probe failed; retaining last known CRI state",
+			"sandbox", sandboxID, "err", err)
+		return true
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sb, ok := s.sandboxes.Get(sandboxID)
+	if !ok || sb.State != store.StateReady {
+		return true
+	}
+	if !res.Adopted {
+		reason := res.Reason
+		if reason == "" {
+			reason = "LinuxPod helper could not adopt this sandbox after backend state loss"
+		}
+		s.markSandboxBackendLostLocked(ctx, sandboxID, reason)
+		klog.InfoS("LinuxPod sandbox could not be adopted after backend state loss; will recreate",
+			"sandbox", sandboxID, "reason", reason)
+		return true
+	}
+	s.applyAdoptionLocked(ctx, sandboxID, res)
+	return true
 }
 
 // markSandboxBackendLostLocked drives the fail-fast/recreate fallback for a sandbox

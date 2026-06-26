@@ -131,6 +131,33 @@ final class PodState {
     }
 }
 
+struct JournalContainer: Codable {
+    var id: String
+    var name: String
+    var rootfsToken: String
+    var processID: String
+    var expectedIdentity: String
+    var observedIdentity: String
+    var identityVerified: Bool
+    var createdAfterPodRunning: Bool
+    var phase: String
+    var logPath: String
+}
+
+struct JournalPod: Codable {
+    var id: String
+    var sandboxNamespace: String
+    var sandboxAddress: String
+    var interfaceID: String?
+    var phase: String
+    var containers: [String: JournalContainer]
+}
+
+struct AdoptionJournal: Codable {
+    var protocolVersion = helperProtocolVersion
+    var pods: [String: JournalPod] = [:]
+}
+
 // MARK: - Backend
 
 actor LinuxPodBackend {
@@ -138,11 +165,20 @@ actor LinuxPodBackend {
     private let logger: Logger
     private var pods: [String: PodState] = [:]
     private var rootfsByToken: [String: RootfsState] = [:]
+    private var journal: AdoptionJournal
+    private var startupLostPods: Int
     private var seq = 0
 
     init(runtime: HelperRuntime, logger: Logger) {
         self.runtime = runtime
         self.logger = logger
+        let loaded = Self.loadJournal(from: Self.journalURL(runtime: runtime), logger: logger)
+        self.journal = loaded
+        // Containerization's public VirtualMachineManager only exposes create(config:).
+        // It does not expose lookup/reattach for an already-running VM, so journaled
+        // pods discovered at helper startup are honest lost candidates. The adapter
+        // uses Adopt(... adopted:false) to fall back immediately and clean the journal.
+        self.startupLostPods = loaded.pods.count
     }
 
     private func next() -> Int { seq += 1; return seq }
@@ -168,13 +204,7 @@ actor LinuxPodBackend {
         do {
             switch op {
             case "Ping": return wrap(ping())
-            case "Adopt":
-                // Live-VM adoption after a helper restart (#138) needs a durable journal
-                // and reacquisition of the running Apple Containerization VM handles. That
-                // is not implemented here yet, so the helper answers Unsupported and the
-                // adapter falls back to the supported BackendLost/recreate path — the
-                // behavior the issue keeps as the default until real adoption lands.
-                return ["ok": false, "code": "Unsupported", "error": "adopt: live-VM adoption not implemented"]
+            case "Adopt": return wrap(try adopt(payload))
             case "CreatePod": return wrap(try await createPod(payload))
             case "PodStatus": return wrap(try podStatus(payload))
             case "PrepareContainerRootfs": return wrap(try await prepareRootfs(payload))
@@ -203,6 +233,69 @@ actor LinuxPodBackend {
         ["ok": true, "result": result]
     }
 
+    private static func journalURL(runtime: HelperRuntime) -> URL {
+        runtime.workRoot.appendingPathComponent("adoption-journal.json")
+    }
+
+    private static func loadJournal(from url: URL, logger: Logger) -> AdoptionJournal {
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            return AdoptionJournal()
+        }
+        do {
+            let data = try Data(contentsOf: url)
+            let journal = try JSONDecoder().decode(AdoptionJournal.self, from: data)
+            if journal.protocolVersion == helperProtocolVersion {
+                return journal
+            }
+            logger.warning("ignoring LinuxPod adoption journal with mismatched protocol",
+                metadata: ["path": "\(url.path)", "version": "\(journal.protocolVersion)"])
+        } catch {
+            logger.warning("ignoring unreadable LinuxPod adoption journal",
+                metadata: ["path": "\(url.path)", "error": "\(error)"])
+        }
+        return AdoptionJournal()
+    }
+
+    private func persistJournal() {
+        let url = Self.journalURL(runtime: runtime)
+        do {
+            let data = try JSONEncoder().encode(journal)
+            try data.write(to: url, options: .atomic)
+        } catch {
+            logger.error("failed to persist LinuxPod adoption journal",
+                metadata: ["path": "\(url.path)", "error": "\(error)"])
+        }
+    }
+
+    private func journalContainer(_ c: ContainerState) -> JournalContainer {
+        JournalContainer(
+            id: c.id, name: c.name, rootfsToken: c.rootfsToken, processID: c.processID,
+            expectedIdentity: c.expectedIdentity, observedIdentity: c.observedIdentity,
+            identityVerified: c.identityVerified, createdAfterPodRunning: c.createdAfterPodRunning,
+            phase: c.phase, logPath: c.logPath)
+    }
+
+    private func upsertJournalPod(_ pod: PodState) {
+        var containers: [String: JournalContainer] = [:]
+        for (id, c) in pod.containers {
+            containers[id] = journalContainer(c)
+        }
+        journal.pods[pod.id] = JournalPod(
+            id: pod.id,
+            sandboxNamespace: pod.sandboxNamespace,
+            sandboxAddress: pod.sandboxAddress,
+            interfaceID: pod.interfaceID,
+            phase: pod.phase,
+            containers: containers)
+        persistJournal()
+    }
+
+    private func removeJournalPod(_ podID: String) {
+        if journal.pods.removeValue(forKey: podID) != nil {
+            persistJournal()
+        }
+    }
+
     // MARK: Handshake
 
     func ping() -> [String: Any] {
@@ -214,11 +307,34 @@ actor LinuxPodBackend {
             "name": "linuxpod-helper",
             "protocolVersion": helperProtocolVersion,
             "simulated": false,
-            // adopt:false — the real helper does not yet persist a durable journal to
-            // reattach live Pod VMs after its own restart (#138); it falls back to
-            // BackendLost/recreate. The Go contract + FakeBackend model the mechanism.
-            "capabilities": ["logs": true, "exec": true, "stats": true, "adopt": false],
-            "adoption": ["supported": false, "adoptedPods": 0, "lostPods": 0],
+            "capabilities": ["logs": true, "exec": true, "stats": true, "adopt": true],
+            "adoption": ["supported": true, "adoptedPods": 0, "lostPods": startupLostPods],
+        ]
+    }
+
+    func adopt(_ p: [String: Any]) throws -> [String: Any] {
+        let podID = (p["podID"] as? String) ?? ""
+        if podID.isEmpty {
+            throw BackendError(code: "Invalid", message: "podID is required")
+        }
+        if let pod = pods[podID] {
+            var containers: [[String: Any]] = []
+            for c in pod.containers.values {
+                containers.append(status(pod, c))
+            }
+            return [
+                "podID": podID,
+                "adopted": true,
+                "containers": containers,
+            ]
+        }
+        guard journal.pods[podID] != nil else {
+            throw BackendError(code: "PodNotFound", message: podID)
+        }
+        return [
+            "podID": podID,
+            "adopted": false,
+            "reason": "LinuxPod VM handle was not reacquired after helper restart; public Containerization API has no VM lookup/reattach",
         ]
     }
 
@@ -292,6 +408,7 @@ actor LinuxPodBackend {
 
         let state = PodState(id: id, pod: pod, sandboxAddress: sandboxAddress, interfaceID: interfaceID)
         pods[id] = state
+        upsertJournalPod(state)
         releaseInterfaceOnFailure = false
         return [
             "id": id, "phase": state.phase,
@@ -521,6 +638,7 @@ actor LinuxPodBackend {
         c.logPath = logPath
         c.logTasks = logTasks
         pod.containers[cid] = c
+        upsertJournalPod(pod)
         return status(pod, c)
     }
 
@@ -583,6 +701,7 @@ actor LinuxPodBackend {
             c.identityVerified = true
             c.message = ""
             if !observed.netns.isEmpty { pod.sandboxNamespace = observed.netns }
+            upsertJournalPod(pod)
             return status(pod, c)
         }
         // Identity did not verify: tear the process down and leave it non-Running.
@@ -591,6 +710,7 @@ actor LinuxPodBackend {
         c.identityVerified = false
         c.message = "rootfs identity not verified (observed=\(observed.identity), expected=\(c.expectedIdentity))"
         try? await deleteProcess(pod: pod, processID: c.processID)
+        upsertJournalPod(pod)
         throw BackendError(code: "IdentityUnverified", message: c.message)
     }
 
@@ -730,6 +850,7 @@ actor LinuxPodBackend {
             try? await deleteProcess(pod: pod, processID: c.processID)
             c.phase = "Stopped"
             c.exitCode = 0
+            upsertJournalPod(pod)
         }
         return status(pod, c)
     }
@@ -747,6 +868,7 @@ actor LinuxPodBackend {
             rootfsByToken.removeValue(forKey: c.rootfsToken)
         }
         pod.containers.removeValue(forKey: cid)
+        upsertJournalPod(pod)
     }
 
     func statusOf(_ p: [String: Any]) throws -> [String: Any] {
@@ -757,6 +879,8 @@ actor LinuxPodBackend {
     func cleanup(_ p: [String: Any]) async throws -> [String: Any] {
         let podID = (p["podID"] as? String) ?? ""
         guard let pod = pods[podID] else {
+            removeJournalPod(podID)
+            try? FileManager.default.removeItem(at: runtime.workRoot.appendingPathComponent(podID))
             return ["podID": podID, "removedContainers": 0, "removedRootfs": 0,
                     "podRemoved": false, "staleState": false]
         }
@@ -778,6 +902,7 @@ actor LinuxPodBackend {
         }
         try? FileManager.default.removeItem(at: runtime.workRoot.appendingPathComponent(podID))
         pods.removeValue(forKey: podID)
+        removeJournalPod(podID)
         return ["podID": podID, "removedContainers": removedContainers,
                 "removedRootfs": removedRootfs, "podRemoved": true, "staleState": false]
     }

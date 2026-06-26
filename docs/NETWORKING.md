@@ -385,7 +385,7 @@ backing the micro-VMs (commonly `bridge100`) with `ifconfig` and set it as
 | `podNetwork.ingressInterfaces` | Extra host interfaces that may receive Pod-IP traffic and need Pod `binat` rules, such as a local test bridge. They do not grant route or default-route control. |
 | `podNetwork.anchor` | pf anchor to manage (default `macvz/pods`). |
 | `podNetwork.enableForwarding` | Enable IPv4 forwarding (default `true`). |
-| `podNetwork.vmNetCIDRs` | Host-only vmnet CIDRs local micro-VMs may receive; used by `macvz-netd` to validate pf targets (default `192.168.64.0/22`). |
+| `podNetwork.vmNetCIDRs` | Host-only vmnet CIDRs local micro-VMs may receive; used by `macvz-netd` to validate pf targets (default `192.168.64.0/18`). |
 
 ```yaml
 node:
@@ -395,7 +395,7 @@ podNetwork:
   enabled: true
   interface: bridge100
   ingressInterfaces: ["en0"] # optional; only for explicit non-mesh ingress paths
-  vmNetCIDRs: ["192.168.64.0/22"]
+  vmNetCIDRs: ["192.168.64.0/18"]
 ```
 
 ### Verifying

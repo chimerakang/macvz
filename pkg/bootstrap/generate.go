@@ -60,7 +60,7 @@ type PeerParams struct {
 type PodNetworkParams struct {
 	Interface  string   // host vmnet bridge, e.g. "bridge100" (required)
 	Anchor     string   // pf anchor (default macvz/pods)
-	VMNetCIDRs []string // host-only vmnet ranges (default 192.168.64.0/22)
+	VMNetCIDRs []string // host-only vmnet ranges (default 192.168.64.0/18)
 }
 
 const (

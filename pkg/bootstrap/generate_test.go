@@ -69,7 +69,7 @@ func TestGenerateConfigMeshAndPodNetwork(t *testing.T) {
 		"name: macvz-b",
 		"podNetwork:\n  enabled: true",
 		"interface: bridge100",
-		`vmNetCIDRs: ["192.168.64.0/22"]`, // default applied
+		`vmNetCIDRs: ["192.168.64.0/18"]`, // default applied
 		`clusterDNS: ["10.96.0.10"]`,
 	} {
 		if !strings.Contains(out, want) {

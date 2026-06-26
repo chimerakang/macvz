@@ -268,6 +268,9 @@ pod_count() { pod_names | wc -l | tr -d ' '; }
 pod_uid() { kn get pod "$1" -o jsonpath='{.metadata.uid}' 2>/dev/null; }
 pod_phase() { kn get pod "$1" -o jsonpath='{.status.phase}' 2>/dev/null; }
 pod_ip() { kn get pod "$1" -o jsonpath='{.status.podIP}' 2>/dev/null; }
+pod_app_container_id() {
+	kn get pod "$1" -o jsonpath='{.status.containerStatuses[?(@.name=="app")].containerID}' 2>/dev/null
+}
 ready_count() {
 	kn get pods -l "$APP_LABEL" \
 		-o jsonpath='{range .items[*]}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}' 2>/dev/null \
@@ -712,6 +715,14 @@ phase_restart_helper() {
 		return 0
 	fi
 	local count_before; count_before="$(pod_count)"
+	: >"$OUT_DIR/restart-helper-containerids-before.txt"
+	local before_pod
+	while IFS= read -r before_pod; do
+		[ -n "$before_pod" ] || continue
+		printf '%s %s\n' "$before_pod" "$(pod_app_container_id "$before_pod")" >>"$OUT_DIR/restart-helper-containerids-before.txt"
+	done <<EOF
+$(pod_names)
+EOF
 	log "restarting/crashing the LinuxPod helper via operator hook"
 	run_hook "$MACVZ_RESTART_HELPER_CMD" >"$OUT_DIR/restart-helper.log" 2>&1 \
 		|| { fail "MACVZ_RESTART_HELPER_CMD returned non-zero (see $OUT_DIR/restart-helper.log)"; return 1; }
@@ -729,19 +740,50 @@ phase_restart_helper() {
 		&& pass "all $count_before Pods recovered to Ready after helper restart (bounded recreate)" \
 		|| fail "only $ready/$count_before Pods Ready after helper restart (record the failure handling as the next blocker; see $OUT_DIR/restart-helper.log)"
 
-	# Every current Pod must be genuinely usable, not stale Running-but-dead.
-	local pods; pods="$(pod_names)"
-	local exec_bad=0 pod out
-	while IFS= read -r pod; do
-		[ -n "$pod" ] || continue
-		out="$(kn exec "$pod" -c app -- sh -c 'cat /www-rw/index.html 2>/dev/null; echo; cat /shared/sidecar-localhost 2>/dev/null' 2>>"$OUT_DIR/restart-helper-exec.err" || true)"
-		{ printf '%s' "$out" | grep -q "$MARKER" && printf '%s' "$out" | grep -q "$SIDECAR_LOCALHOST_MARKER"; } \
-			|| { exec_bad=$((exec_bad+1)); echo "$pod" >>"$OUT_DIR/restart-helper-exec-fail.txt"; }
-	done <<EOF
+	# Every current Pod must be genuinely usable, not stale Running-but-dead. A
+	# helper restart drives bounded recreate, so give kubelet time to publish the
+	# replacement container IDs before asking the streaming server to exec.
+	: >"$OUT_DIR/restart-helper-exec.err"
+	: >"$OUT_DIR/restart-helper-exec-fail.txt"
+	: >"$OUT_DIR/restart-helper-containerids-after.txt"
+	local usable=0 exec_bad=0 _ pod out cid pods
+	for _ in $(seq 1 120); do
+		pods="$(pod_names)"
+		usable=0
+		exec_bad=0
+		: >"$OUT_DIR/restart-helper-exec-fail.txt.tmp"
+		: >"$OUT_DIR/restart-helper-containerids-after.txt.tmp"
+		while IFS= read -r pod; do
+			[ -n "$pod" ] || continue
+			cid="$(pod_app_container_id "$pod")"
+			printf '%s %s\n' "$pod" "$cid" >>"$OUT_DIR/restart-helper-containerids-after.txt.tmp"
+			if [ -z "$cid" ]; then
+				exec_bad=$((exec_bad+1))
+				printf '%s missing-app-container-id\n' "$pod" >>"$OUT_DIR/restart-helper-exec-fail.txt.tmp"
+				continue
+			fi
+			out="$(kn exec "$pod" -c app -- sh -c 'cat /www-rw/index.html 2>/dev/null; echo; cat /shared/sidecar-localhost 2>/dev/null' 2>>"$OUT_DIR/restart-helper-exec.err" || true)"
+			if printf '%s' "$out" | grep -q "$MARKER" && printf '%s' "$out" | grep -q "$SIDECAR_LOCALHOST_MARKER"; then
+				usable=$((usable+1))
+			else
+				exec_bad=$((exec_bad+1))
+				printf '%s exec-proof-failed\n' "$pod" >>"$OUT_DIR/restart-helper-exec-fail.txt.tmp"
+			fi
+		done <<EOF
 $pods
 EOF
-	[ "$exec_bad" = 0 ] && pass "exec + shared-ns proof works on every Pod after helper restart (no stale Running-but-unusable Pod)" \
-		|| fail "$exec_bad Pod(s) did not recover usable state after helper restart (see $OUT_DIR/restart-helper-exec-fail.txt)"
+		mv "$OUT_DIR/restart-helper-exec-fail.txt.tmp" "$OUT_DIR/restart-helper-exec-fail.txt"
+		mv "$OUT_DIR/restart-helper-containerids-after.txt.tmp" "$OUT_DIR/restart-helper-containerids-after.txt"
+		if [ "$usable" -ge "$count_before" ] && [ "$exec_bad" = 0 ]; then
+			break
+		fi
+		sleep 2
+	done
+	if [ "$usable" -ge "$count_before" ] && [ "$exec_bad" = 0 ]; then
+		pass "exec + shared-ns proof works on every Pod after helper restart (no stale Running-but-unusable Pod)"
+	else
+		fail "$exec_bad Pod(s) did not recover usable state after helper restart (see $OUT_DIR/restart-helper-exec-fail.txt)"
+	fi
 }
 
 phase_dup_audit() {

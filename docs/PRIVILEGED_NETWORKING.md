@@ -200,7 +200,7 @@ podNetwork:
   interface: bridge100        # the vmnet bridge apple/container attaches VMs to
   anchor: macvz/pods          # default; the only anchor the helper will touch
   enableForwarding: true      # default; flips net.inet.ip.forwarding to 1
-  vmNetCIDRs: ["192.168.64.0/22"] # default; adjust if your vmnet range differs
+  vmNetCIDRs: ["192.168.64.0/18"] # default; adjust if your vmnet range differs
 ```
 
 **Selecting the bridge.** `apple/container` attaches each micro-VM to a

@@ -96,3 +96,89 @@ restart while `macvz-cri` itself stayed alive:
   restart remains blocked by the current public Containerization API exposing
   creation but no VM lookup/reattach hook. The journal/protocol path is implemented,
   so adding true reattach later is localized to the helper's startup/adopt logic.
+
+---
+
+# CRI-L6-4 — Supervisor-backed true adoption (#139)
+
+## Why a single process cannot truly reattach
+
+#138 implemented the durable journal and the `Adopt` protocol, but the real
+`linuxpod-helper` still had to answer `Adopted:false` for a journaled Pod after its
+own restart: the vendored Apple Containerization API exposes
+`VirtualMachineManager.create(config:)` and **no public VM lookup/reattach** hook, so
+a fresh helper process has no way to reconstruct a `VZVirtualMachineInstance` handle
+for a VM a previous process booted. The blocker is API shape, not journal logic.
+
+## Ownership inversion
+
+#139 moves live VM ownership out of the main helper and into **per-Pod supervisor
+processes**, so the handle never has to be reconstructed — it is simply still held by
+a process that outlived the main helper's restart.
+
+- `linuxpod-helper serve` (default subcommand) is the **router**: it owns the public
+  CRI NDJSON socket, the durable supervisor journal, and routing. It owns no VM.
+- `linuxpod-helper supervise-pod` (hidden subcommand) is a **per-Pod supervisor**: it
+  owns exactly one `LinuxPod` / `VZVirtualMachineInstance` and serves the *same* NDJSON
+  protocol on a private socket. It is the unchanged VM-owning backend (`LinuxPodBackend`)
+  from #126–#138, now hosted in its own process. It calls `setsid()` at startup so a
+  `SIGTERM`/`SIGKILL` to the router alone leaves the Pod VM running.
+
+Bare invocation (`linuxpod-helper --socket … --kernel …`) still works: options with no
+subcommand token route to the default `serve`, so existing operators and the
+real-helper lifecycle test are unaffected.
+
+### Routing
+
+| Op | Router behavior |
+| --- | --- |
+| `CreatePod` | spawn a detached supervisor, wait for its socket, forward `CreatePod`, record the journal entry (`podID`, socket, pid, startUnix, sandbox addr/ns) |
+| pod-scoped ops (`PrepareContainerRootfs`, `CreateContainer`, `Start/Stop/Remove`, `Status`, `ContainerLogPath`, `ExecSync`, `ContainerStats`, …) | forward verbatim to that Pod's supervisor; a transport failure drops the dead client and surfaces the error, which the reconciler reads as `BackendLost` |
+| `Adopt` | reconnect to the journaled supervisor: reachable → forward (`Adopted:true` + live containers); unreachable → `Adopted:false` (no error) so the adapter falls back |
+| `Cleanup` | drive the supervisor's own `Cleanup` (VM/rootfs/interface teardown), terminate the supervisor, drop the journal entry; idempotent if the supervisor is already gone |
+| `Ping` | report the startup adoption pass (`adoption.supported`, `adoptedPods`, `lostPods`) |
+
+### Startup adoption pass
+
+`RouterBackend.init` loads `supervisor-journal.json` and probes each recorded
+supervisor with a `Ping`: a reachable supervisor still owns its live Pod VM →
+`adoptedPods++` and its live client is retained; an unreachable one (the supervisor
+died while the router was down) → `lostPods++` and its stale journal entry is dropped
+so the adapter recreates rather than wedging. The Go adapter and protocol are
+unchanged — the router speaks the exact `HelperClient` wire contract, and the real
+helper's `Adopt` now returns `Adopted:true` because a supervisor kept the VM alive.
+
+### Failure handling
+
+- Writing to a dead supervisor socket would raise `SIGPIPE` and take the router down,
+  so the helper ignores `SIGPIPE` process-wide and sets `SO_NOSIGPIPE` on each
+  supervisor connection; a dead supervisor surfaces as `EPIPE`/`EOF` → adoption
+  fallback, never a router crash.
+- A supervisor that dies while the router is alive is detected on the next routed op
+  (it fails) and by `Adopt` (returns `Adopted:false`), funneling into the same
+  `markSandboxBackendLostLocked` fallback as every other loss.
+
+## Tests
+
+`TestSwiftRouterSupervisorAdoption` (gated `MACVZ_LINUXPOD_HELPER=1`) exercises the
+whole inversion **without booting a VM** by pointing `--supervisor-command` at the
+in-memory stub: create-via-router, kill the router only, restart and confirm
+`Ping` reports `adoptedPods=1`/`lostPods=0` and `Adopt` reattaches the running
+container; then kill the supervisor and confirm `Adopt`→`adopted:false`, a routed
+`Status` fails, and `Cleanup` removes the journal entry idempotently. On hardware the
+same router spawns the real `supervise-pod` VM owner (`TestRealLinuxPodHelperLifecycle`,
+gated `MACVZ_LINUXPOD_REAL_HELPER=1`).
+
+Live smoke on `test@192.168.1.122` with the real router/supervisor helper:
+
+- deployed the new signed helper without changing `macvz-netd`, pf policy, or routes;
+- `CreatePod(pod-139-live)` through the public helper socket spawned supervisor pid
+  `15915`, returned `sandboxAddress=192.168.82.2`, and wrote
+  `supervisor-journal.json` with the private supervisor socket;
+- restarted only the public router helper. The supervisor survived with PPID `1`, and
+  the new router reported `adoption.supported=true`, `adoptedPods=1`, `lostPods=0`;
+- `Adopt(pod-139-live)` returned `Adopted:true`, and routed `PodStatus` still reported
+  the same running Pod VM;
+- `Cleanup` returned `podRemoved=true`, a second Cleanup was an idempotent no-op, the
+  supervisor journal became empty, only the public router process remained, and the
+  default route stayed `192.168.1.1` via `en0`.

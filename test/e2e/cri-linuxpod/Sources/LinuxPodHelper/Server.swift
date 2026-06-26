@@ -18,12 +18,23 @@ struct BackendError: Error {
     let message: String
 }
 
+// LineHandler is the seam the NDJSON server writes against: it consumes one framed
+// request line and returns one framed response line. Both the VM-owning
+// LinuxPodBackend (run inside a per-Pod supervisor) and the RouterBackend (the main
+// helper that forwards pod-scoped ops to supervisors) conform, so the same socket
+// server serves either role (CRI-L6-4 / #139 supervisor inversion).
+protocol LineHandler: Sendable {
+    func handle(_ line: Data) async -> Data
+}
+
+extension LinuxPodBackend: LineHandler {}
+
 final class NDJSONServer: @unchecked Sendable {
     private let socketPath: String
-    private let backend: LinuxPodBackend
+    private let backend: any LineHandler
     private let logger: Logger
 
-    init(socketPath: String, backend: LinuxPodBackend, logger: Logger) {
+    init(socketPath: String, backend: any LineHandler, logger: Logger) {
         self.socketPath = socketPath
         self.backend = backend
         self.logger = logger

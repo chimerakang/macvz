@@ -46,7 +46,8 @@ let package = Package(
                 .product(name: "ContainerizationEXT4", package: "containerization"),
                 .product(name: "ContainerizationExtras", package: "containerization"),
                 .product(name: "ContainerizationOCI", package: "containerization"),
-            ]
+            ],
+            exclude: ["CLAUDE.md"]
         ),
     ]
 )

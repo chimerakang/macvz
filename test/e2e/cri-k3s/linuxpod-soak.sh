@@ -381,8 +381,16 @@ phase_preflight() {
 	local failures_before="$FAILURES" rt hns
 	rt="$(k get node "$NODE" -o jsonpath='{.metadata.labels.node\.macvz\.io/runtime}' 2>/dev/null)"
 	hns="$(k get node "$NODE" -o jsonpath='{.metadata.labels.node\.macvz\.io/host-namespace}' 2>/dev/null)"
-	[ "$rt" = "apple-container" ] && pass "runtime label" || fail "runtime label (got '$rt')"
-	[ "$hns" = "unsupported" ] && pass "host-namespace label" || fail "host-namespace label (got '$hns')"
+	if [ "$rt" = "apple-container" ]; then
+		pass "runtime label"
+	else
+		fail "runtime label (got '$rt')"
+	fi
+	if [ "$hns" = "unsupported" ]; then
+		pass "host-namespace label"
+	else
+		fail "host-namespace label (got '$hns')"
+	fi
 
 	if k get node "$NODE" -o jsonpath="{.spec.taints[?(@.key=='$TAINT_KEY')].effect}" 2>/dev/null | grep -q NoSchedule; then
 		pass "host-namespace NoSchedule taint"
@@ -438,8 +446,11 @@ phase_deploy() {
 	local pod node; pod="$(pod_name)"
 	[ -n "$pod" ] || { fail "no fixture Pod after rollout"; return 1; }
 	node="$(kn get pod "$pod" -o jsonpath='{.spec.nodeName}' 2>/dev/null)"
-	[ "$node" = "$NODE" ] && pass "Pod $pod scheduled onto MacVz node $NODE" \
-		|| fail "Pod scheduled onto '$node', expected MacVz node '$NODE'"
+	if [ "$node" = "$NODE" ]; then
+		pass "Pod $pod scheduled onto MacVz node $NODE"
+	else
+		fail "Pod scheduled onto '$node', expected MacVz node '$NODE'"
+	fi
 
 	# Establish the steady-state LinuxPod residual baseline (one Pod's worth of
 	# state); per-iteration counts above this flag a leak/duplicate.
@@ -556,8 +567,12 @@ churn_cri() {
 		case "$n" in
 			-2) fail "cri: LinuxPod audit hook failed (see $OUT_DIR/iter-$ITER-cri-audit.log.err)" ;;
 			-1) : ;;
-			*) [ "$n" -le "$MAX_RESIDUAL" ] && pass "cri: no duplicate backend state ($n <= $MAX_RESIDUAL residual line(s))" \
-				|| fail "cri: residual LinuxPod state $n > baseline ceiling $MAX_RESIDUAL (duplicate backend state; see $OUT_DIR/iter-$ITER-cri-audit.log)" ;;
+			*)
+				if [ "$n" -le "$MAX_RESIDUAL" ]; then
+					pass "cri: no duplicate backend state ($n <= $MAX_RESIDUAL residual line(s))"
+				else
+					fail "cri: residual LinuxPod state $n > baseline ceiling $MAX_RESIDUAL (duplicate backend state; see $OUT_DIR/iter-$ITER-cri-audit.log)"
+				fi ;;
 		esac
 	fi
 }
@@ -665,8 +680,11 @@ phase_churn_loop() {
 	if [ "$HAVE_RSS" = 1 ]; then
 		local growth=$((LAST_RSS - FIRST_RSS))
 		log "adapter RSS: first=${FIRST_RSS}KB last=${LAST_RSS}KB growth=${growth}KB (limit ${RSS_GROWTH_KB}KB)"
-		[ "$growth" -le "$RSS_GROWTH_KB" ] && pass "adapter RSS growth within bound across the soak" \
-			|| fail "adapter RSS grew ${growth}KB (> ${RSS_GROWTH_KB}KB) across the soak: possible leak"
+		if [ "$growth" -le "$RSS_GROWTH_KB" ]; then
+			pass "adapter RSS growth within bound across the soak"
+		else
+			fail "adapter RSS grew ${growth}KB (> ${RSS_GROWTH_KB}KB) across the soak: possible leak"
+		fi
 	else
 		skip "adapter RSS trend (set MACVZ_ADAPTER_RSS_CMD); samples recorded with rss=0"
 	fi
@@ -678,13 +696,20 @@ phase_cleanup() {
 	k delete -f "$OUT_DIR/workload.applied.yaml" --wait=true --timeout=3m >"$OUT_DIR/cleanup.log" 2>&1 || true
 	local remaining
 	remaining="$(kn get pods -l app=linuxpod-inloop -o name 2>/dev/null | wc -l | tr -d ' ')"
-	[ "$remaining" = 0 ] && pass "no fixture Pods remain after delete" || fail "$remaining fixture Pod(s) remain after delete"
+	if [ "$remaining" = 0 ]; then
+		pass "no fixture Pods remain after delete"
+	else
+		fail "$remaining fixture Pod(s) remain after delete"
+	fi
 
 	if [ -n "${MACVZ_LINUXPOD_AUDIT_CMD:-}" ]; then
 		local n
 		if n="$(linuxpod_state_count "$OUT_DIR/cleanup-audit.log")"; then
-			[ "$n" = 0 ] && pass "LinuxPod audit: zero residual VM/container/rootfs/handoff/network state after soak" \
-				|| fail "LinuxPod audit: $n residual state line(s) remain after soak (see $OUT_DIR/cleanup-audit.log)"
+			if [ "$n" = 0 ]; then
+				pass "LinuxPod audit: zero residual VM/container/rootfs/handoff/network state after soak"
+			else
+				fail "LinuxPod audit: $n residual state line(s) remain after soak (see $OUT_DIR/cleanup-audit.log)"
+			fi
 		else
 			fail "LinuxPod audit hook failed during cleanup (see $OUT_DIR/cleanup-audit.log.err)"
 		fi

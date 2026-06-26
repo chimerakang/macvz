@@ -61,10 +61,11 @@ type LinuxPodService struct {
 	addrPollAttempts int
 	addrPollInterval time.Duration
 
-	mu           sync.Mutex
-	mountPolicy  MountPolicy
-	images       map[string]struct{} // images "pulled" through the minimal ImageService
-	streamServer StreamingServer
+	mu            sync.Mutex
+	statusProbeMu sync.Mutex
+	mountPolicy   MountPolicy
+	images        map[string]struct{} // images "pulled" through the minimal ImageService
+	streamServer  StreamingServer
 }
 
 // LinuxPodOptions configures a LinuxPodService.
@@ -957,7 +958,10 @@ func (s *LinuxPodService) reconcileSandboxBackendState(ctx context.Context, sand
 	if !ok || sb.State != store.StateReady {
 		return
 	}
-	if _, err := s.backend.PodStatus(ctx, sandboxID); err == nil {
+	s.statusProbeMu.Lock()
+	_, err := s.backend.PodStatus(ctx, sandboxID)
+	s.statusProbeMu.Unlock()
+	if err == nil {
 		return
 	} else if !linuxpodBackendMissing(err) {
 		klog.V(4).InfoS("LinuxPod backend status probe failed; retaining last known CRI state",

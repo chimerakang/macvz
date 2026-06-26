@@ -51,6 +51,12 @@ release.
   claims are skipped loudly unless the Pod is proven non-simulated. A churn mode
   whose hook is unset is dropped with a loud skip. `make cri-linuxpod-soak`.
   Gated by `MACVZ_INTEGRATION=1` + `KUBECONFIG`.
+  For the `netd` mode, prefer a policy reload through the existing helper socket
+  when validating route safety without a privileged shell:
+
+  ```sh
+  MACVZ_RESTART_NETD_CMD='ssh test@<mac> '\''printf "{\"protocol\":1,\"op\":\"reloadPolicy\"}\n" | nc -U /var/run/macvz-netd.sock'\'''
+  ```
 - `linuxpod-multipod.sh` — gated **LinuxPod multi-Pod concurrency** suite
   (CRI-L6-3 #137), the concurrency sibling of `linuxpod-inloop.sh`. It schedules
   `fixtures/linuxpod-multipod-workload.yaml` (a Deployment of N>=3 app+late-sidecar

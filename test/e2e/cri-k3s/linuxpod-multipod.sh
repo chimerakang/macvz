@@ -918,8 +918,11 @@ EOF
 	if [ "$have_rss" = 1 ]; then
 		local growth=$((last_rss - first_rss))
 		log "adapter RSS: first=${first_rss}KB last=${last_rss}KB growth=${growth}KB (limit ${RSS_GROWTH_KB}KB across $final_total Pods)"
-		[ "$growth" -le "$RSS_GROWTH_KB" ] && pass "adapter RSS growth within bound" \
-			|| fail "adapter RSS grew ${growth}KB (> ${RSS_GROWTH_KB}KB): possible leak under concurrency"
+		if [ "$growth" -le "$RSS_GROWTH_KB" ]; then
+			pass "adapter RSS growth within bound"
+		else
+			fail "adapter RSS grew ${growth}KB (> ${RSS_GROWTH_KB}KB): possible leak under concurrency"
+		fi
 	else
 		skip "adapter RSS trend (set MACVZ_ADAPTER_RSS_CMD); samples recorded with rss=0"
 	fi

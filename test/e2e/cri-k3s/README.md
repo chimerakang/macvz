@@ -55,8 +55,14 @@ release.
   when validating route safety without a privileged shell:
 
   ```sh
-  MACVZ_RESTART_NETD_CMD='ssh test@<mac> '\''printf "{\"protocol\":1,\"op\":\"reloadPolicy\"}\n" | nc -U /var/run/macvz-netd.sock'\'''
+  MACVZ_NETD_SSH_TARGET=test@<mac> \
+  MACVZ_RESTART_NETD_CMD='./test/e2e/cri-k3s/hooks/netd-reload-policy.sh'
   ```
+
+  The hook sends `reloadPolicy` and `status` to `/var/run/macvz-netd.sock` over
+  SSH as the normal user. It intentionally avoids `sudo`, `launchctl`,
+  `route`, and `pfctl`; pair it with `MACVZ_ROUTE_AUDIT_CMD` so the soak proves
+  the host default route stays unchanged.
 - `linuxpod-multipod.sh` — gated **LinuxPod multi-Pod concurrency** suite
   (CRI-L6-3 #137), the concurrency sibling of `linuxpod-inloop.sh`. It schedules
   `fixtures/linuxpod-multipod-workload.yaml` (a Deployment of N>=3 app+late-sidecar

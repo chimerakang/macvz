@@ -223,7 +223,16 @@ run_hook() {
 }
 
 # --- shared helpers ----------------------------------------------------------
-pod_name()  { kn get pods -l app=linuxpod-inloop -o jsonpath='{.items[0].metadata.name}' 2>/dev/null; }
+pod_name() {
+	local pod
+	pod="$(kn get pods -l app=linuxpod-inloop --field-selector=status.phase=Running \
+		--sort-by=.metadata.creationTimestamp -o name 2>/dev/null | tail -n 1 | sed 's#^pod/##')"
+	if [ -z "$pod" ]; then
+		pod="$(kn get pods -l app=linuxpod-inloop \
+			--sort-by=.metadata.creationTimestamp -o name 2>/dev/null | tail -n 1 | sed 's#^pod/##')"
+	fi
+	printf '%s' "$pod"
+}
 pod_uid()   { kn get pod "$1" -o jsonpath='{.metadata.uid}' 2>/dev/null; }
 pod_phase() { kn get pod "$1" -o jsonpath='{.status.phase}' 2>/dev/null; }
 pod_ip()    { kn get pod "$1" -o jsonpath='{.status.podIP}' 2>/dev/null; }
@@ -298,6 +307,30 @@ residual_for_iter() {
 			*) printf '%s' "-2" ;;
 		esac
 	fi
+}
+
+# wait_residual_at_most <output-file> <max> -> echoes the settled residual count.
+# Kubelet can leave a stopped sandbox JSON around briefly after rollout/delete
+# before it issues RemovePodSandbox. That is not duplicate live backend state, so
+# duplicate checks wait for the CRI state to converge before failing.
+wait_residual_at_most() {
+	local out_file="$1" max="$2" n _
+	for _ in $(seq 1 "$RECOVER_TRIES"); do
+		n="$(residual_for_iter "$out_file")"
+		case "$n" in
+			-2|-1)
+				printf '%s' "$n"
+				return 0 ;;
+			*)
+				if [ "$n" -le "$max" ]; then
+					printf '%s' "$n"
+					return 0
+				fi ;;
+		esac
+		sleep "$RECOVER_INTERVAL"
+	done
+	printf '%s' "$n"
+	return 1
 }
 
 # route_unchanged <label> -> 0 if the default route matches the baseline.
@@ -563,7 +596,7 @@ churn_cri() {
 	fi
 	# No duplicate backend state: residual must not exceed one Pod's baseline.
 	if [ -n "${MACVZ_LINUXPOD_AUDIT_CMD:-}" ]; then
-		local n; n="$(residual_for_iter "$OUT_DIR/iter-$ITER-cri-audit.log")"
+		local n; n="$(wait_residual_at_most "$OUT_DIR/iter-$ITER-cri-audit.log" "$MAX_RESIDUAL")"
 		case "$n" in
 			-2) fail "cri: LinuxPod audit hook failed (see $OUT_DIR/iter-$ITER-cri-audit.log.err)" ;;
 			-1) : ;;

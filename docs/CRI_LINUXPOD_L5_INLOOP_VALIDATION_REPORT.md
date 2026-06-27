@@ -1,6 +1,6 @@
 # CRI-L5 LinuxPod-Backed Kubelet/k3s In-Loop Validation Report (#130)
 
-Date: 2026-06-23; updated 2026-06-25
+Date: 2026-06-23; updated 2026-06-27
 Parent: #125 · Depends on: #127 (serving), #128 (Pod networking), #129 (logs/exec/stats)
 Outcome: **`linuxpodKubeletInLoopValidated`** — a real kubelet/kind node now
 drives the genuine (`simulated=false`) LinuxPod backend through the CRI-L5
@@ -9,9 +9,11 @@ in-loop suite: Deployment `Available`, shared localhost proof, Pod IP,
 reachability, bounded short soak, cleanup audit, and default-route preservation
 all pass on `test@192.168.1.122`. Identity, adapter RSS, `macvz-cri` restart
 recovery, and LinuxPod helper restart recovery also pass when their operator
-hooks are supplied. Helper restart uses an explicit fail-fast/recreate semantic:
-the adapter marks helper-lost sandboxes `BackendLost`/NotReady, kubelet recreates
-the Pod sandbox, and `kubectl exec` works again after recreation.
+hooks are supplied. After #139, helper-router restart no longer needs to recreate
+the Pod in the common case: the router adopts the still-running per-Pod supervisor
+(`adoptedPods=1`, `lostPods=0`), the Kubernetes Pod UID/IP/restartCount remain
+unchanged, and `kubectl exec` works against the preserved LinuxPod VM. The earlier
+`BackendLost`/recreate path remains the bounded fallback for lost supervisors.
 
 ## Summary
 
@@ -345,10 +347,12 @@ linuxpod-helper`, `go test ./...`, `go vet ./...`, and `git diff --check`.
 4. **Adapter restart recovery.** ✅ Live `MACVZ_RESTART_CRI_CMD` retest keeps the
    same Pod UID, no duplicate CRI state, and RSS remains bounded.
 5. **Helper crash/restart behavior tested or documented as next blocker.** ✅
-   Live `MACVZ_RESTART_HELPER_CMD` retest now passes via fail-fast/recreate:
-   helper-lost sandboxes become `BackendLost`/NotReady, kubelet recreates the
-   sandbox, `kubectl exec` works after recreation, restartCount remains bounded,
-   and cleanup leaves zero residual state.
+   Live `MACVZ_RESTART_HELPER_CMD` retest now passes with #139 supervisor-backed
+   adoption: restarting only the public helper router reports `adoptedPods=1` and
+   `lostPods=0`, the Pod stays Running with the same UID/IP/restartCount, `kubectl
+   exec` works after adoption, and cleanup leaves zero residual state. The older
+   `BackendLost`/recreate flow remains the fallback when a supervisor is actually
+   lost.
 6. **Report under `docs/` and `docs/MASTER_TASKS.md` updated.** ✅ This report;
    MASTER_TASKS #130 row updated.
 
@@ -358,6 +362,17 @@ on `kind-macvz61` / `test@192.168.1.122` passed all checks with
 route hooks enabled. The helper restart phase recorded `exec works after helper
 restart/recreate`; cleanup audit reported zero residual state; route-after
 matched route-before (`192.168.1.1` via `en0`).
+
+Latest #139 no-recreate adoption evidence:
+`/tmp/macvz-live-139-inloop-20260627204244/run-pass` passed the full in-loop suite
+with `MACVZ_RESTART_HELPER_CMD`, `MACVZ_RESTART_CRI_CMD`, identity, RSS, audit,
+and route hooks enabled. The helper restart phase recorded `adoptedPods=1` /
+`lostPods=0` and `exec works after helper restart/recreate`; the focused manual
+check at `/tmp/macvz-live-139-inloop-20260627204244/manual-helper-adoption`
+confirmed the same Pod UID
+`ea235936-a1a7-4af1-8c3f-621074d3187e`, Pod IP `10.244.102.2`, and restartCount
+`0` before and after restarting only the public helper router. Final cleanup audit
+was empty and the default route stayed `192.168.1.1` via `en0`.
 
 ## Blockers / next issues
 

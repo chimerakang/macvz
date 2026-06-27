@@ -81,7 +81,7 @@ restart while `macvz-cri` itself stayed alive:
 | Criterion | Status |
 | --- | --- |
 | Helper restart preserves a LinuxPod-backed Pod without recreate when adoption succeeds | ✅ proven against the modeled backend (`TestLinuxPodServiceAdoptsLiveVMAfterHelperRestart`) and Swift stub contract; the Go reconciler now also attempts adoption after a helper-only backend miss (`TestLinuxPodServiceReconcilerAdoptsAfterHelperRestart`) |
-| `exec`/logs/stats/port-forward/Service work after adoption | ✅ exec exercised post-adoption in the adapter tests; live surfaces resume because `PodStatus`/`Status` observe the reattached VM; full true-reattach live run pending |
+| `exec`/logs/stats/port-forward/Service work after adoption | ✅ adapter tests exercise exec post-adoption; #139 live kubelet/k3s validation now proves logs, exec, port-forward, ClusterIP Service, and cleanup after a true router restart with the Pod VM preserved by its supervisor |
 | Incomplete adoption never leaves stale Running-but-unusable Pod; fallback intact | ✅ `TestLinuxPodServiceAdoptionIncompleteFallsBack`, `TestLinuxPodServiceFallsBackToRecreateWhenVMLost` |
 | Live test evidence compares adoption vs fallback | ✅ at the modeled-backend level (adopt vs VM-gone vs incomplete); live real-helper probe on `test@192.168.1.122` after this change confirms `Ping` advertises `simulated=false`, `protocolVersion=6`, `capabilities.adopt=true`, `adoption.supported=true`; a journaled lost-pod fixture reports `lostPods=1` after helper restart and `Adopted:false` with the Containerization lookup/reattach diagnostic, then `Cleanup` removes the journal entry and a restart returns `lostPods=0` |
 
@@ -182,3 +182,47 @@ Live smoke on `test@192.168.1.122` with the real router/supervisor helper:
 - `Cleanup` returned `podRemoved=true`, a second Cleanup was an idempotent no-op, the
   supervisor journal became empty, only the public router process remained, and the
   default route stayed `192.168.1.1` via `en0`.
+
+## Full kubelet/k3s validation after #139
+
+On 2026-06-27 the same supervisor-backed helper was validated through the real
+`kind-macvz61` kubelet/k3s in-loop harness against the remote Mac node
+`test@192.168.1.122`:
+
+- harness output: `/tmp/macvz-live-139-inloop-20260627204244/run-pass`;
+- Pod `linuxpod-inloop-5779b6cfc-n2tnp` scheduled to `macvz-b-cri` and was served
+  by a genuine LinuxPod backend (`simulated=false`);
+- shared localhost proof, rootfs identity, Pod IP `10.244.102.2`, logs, exec,
+  port-forward, and ClusterIP Service reachability all passed;
+- `macvz-cri` restart preserved the Pod UID and bounded residual state;
+- public helper router restart reported `adoptedPods=1` and `lostPods=0`, the Pod
+  recovered to Running, and `kubectl exec` still worked;
+- six soak samples kept restartCount at `0`; adapter RSS grew only `2080KB`
+  (`25312KB -> 27392KB`, below the `65536KB` threshold);
+- cleanup left no residual LinuxPod VM/container/rootfs/handoff/network state;
+- the remote default route was unchanged before and after:
+  `192.168.1.1` via `en0`.
+
+A focused manual adoption check then deployed the fixture once more, restarted only
+the public helper router, and compared the same Kubernetes Pod before and after:
+
+```text
+before pod=linuxpod-inloop-5779b6cfc-lxjzb uid=ea235936-a1a7-4af1-8c3f-621074d3187e ip=10.244.102.2 rc=0 node=macvz-b-cri
+helper Ping: adoptedPods=1 lostPods=0 simulated=false
+after  pod=linuxpod-inloop-5779b6cfc-lxjzb uid=ea235936-a1a7-4af1-8c3f-621074d3187e ip=10.244.102.2 rc=0 phase=Running
+exec   macvz-cri-l5-inloop-ok
+exec   macvz-cri-l5-sidecar-localhost-ok
+```
+
+That manual check proves the helper-router restart was not a kubelet recreate: the
+Pod UID, Pod IP, and restartCount stayed unchanged while the router re-adopted the
+live supervisor-owned VM. The final cleanup audit was empty, the supervisor journal
+returned to `{"protocolVersion":6,"pods":{}}`, and the default route remained
+`192.168.1.1` via `en0`.
+
+A follow-up short churn run validated the same behavior under the L6 soak harness:
+`/tmp/macvz-live-139-soak-fix-20260627210044/run` passed 6 iterations over
+`rollout,cri,helper`. Both helper-router restarts recovered live with the same Pod
+UID, CRI restarts preserved the Pod UID and waited out kubelet's transient stopped
+sandbox records before duplicate-state checks, adapter RSS grew only `1344KB`, the
+final residual audit was zero, and the default route stayed unchanged.

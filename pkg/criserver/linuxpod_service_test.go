@@ -249,6 +249,67 @@ func TestLinuxPodServiceTeardownToleratesMissingBackendPod(t *testing.T) {
 	}
 }
 
+func TestLinuxPodServiceCreateContainerIdempotentForPersistedCreatedContainer(t *testing.T) {
+	backend := linuxpod.NewFakeBackend()
+	svc := newLinuxPodTestService(t, backend)
+	ctx := context.Background()
+
+	sandboxID := lpRunSandbox(t, svc)
+	req := &runtimeapi.CreateContainerRequest{
+		PodSandboxId: sandboxID,
+		Config: &runtimeapi.ContainerConfig{
+			Metadata: &runtimeapi.ContainerMetadata{Name: "app", Attempt: 1},
+			Image:    &runtimeapi.ImageSpec{Image: "docker.io/library/busybox:1.36.1"},
+			Command:  []string{"/bin/sh", "-c", "sleep 300"},
+		},
+	}
+	first, err := svc.CreateContainer(ctx, req)
+	if err != nil {
+		t.Fatalf("CreateContainer first: %v", err)
+	}
+	second, err := svc.CreateContainer(ctx, req)
+	if err != nil {
+		t.Fatalf("CreateContainer retry: %v", err)
+	}
+	if second.GetContainerId() != first.GetContainerId() {
+		t.Fatalf("CreateContainer retry id = %q, want original %q", second.GetContainerId(), first.GetContainerId())
+	}
+	if _, err := svc.StartContainer(ctx, &runtimeapi.StartContainerRequest{ContainerId: first.GetContainerId()}); err != nil {
+		t.Fatalf("StartContainer first: %v", err)
+	}
+	if _, err := svc.StartContainer(ctx, &runtimeapi.StartContainerRequest{ContainerId: first.GetContainerId()}); err != nil {
+		t.Fatalf("StartContainer retry running: %v", err)
+	}
+}
+
+func TestLinuxPodServiceCreateContainerBackendDuplicateFallsBackToRecreate(t *testing.T) {
+	backend := linuxpod.NewFakeBackend()
+	svc := newLinuxPodTestService(t, backend)
+	ctx := context.Background()
+
+	sandboxID := lpRunSandbox(t, svc)
+	appID := lpCreateStart(t, svc, sandboxID, "app")
+	if err := svc.containers.Delete(appID); err != nil {
+		t.Fatalf("delete CRI container record: %v", err)
+	}
+
+	_, err := svc.CreateContainer(ctx, &runtimeapi.CreateContainerRequest{
+		PodSandboxId: sandboxID,
+		Config: &runtimeapi.ContainerConfig{
+			Metadata: &runtimeapi.ContainerMetadata{Name: "app", Attempt: 1},
+			Image:    &runtimeapi.ImageSpec{Image: "docker.io/library/busybox:1.36.1"},
+			Command:  []string{"/bin/sh", "-c", "sleep 300"},
+		},
+	})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("CreateContainer backend duplicate = %v, want FailedPrecondition", err)
+	}
+	sb, ok := svc.sandboxes.Get(sandboxID)
+	if !ok || sb.State != store.StateNotReady {
+		t.Fatalf("sandbox after backend duplicate = %+v, want NotReady", sb)
+	}
+}
+
 func TestLinuxPodServiceReapsAgedNotReadySandbox(t *testing.T) {
 	backend := linuxpod.NewFakeBackend()
 	svc := newLinuxPodTestService(t, backend)

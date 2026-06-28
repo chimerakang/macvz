@@ -642,6 +642,11 @@ churn_cri() {
 	else
 		fail "cri: Pod UID changed ($uid_before -> $uid_after): possible duplicate/lost workload"
 	fi
+	if pod_after="$(wait_exec_logs_ok "iter-$ITER-cri")" && [ -n "$pod_after" ]; then
+		pass "cri: exec + logs work after restart"
+	else
+		fail "cri: exec/logs did not recover after restart (see $OUT_DIR/iter-$ITER-cri-exec.err and $OUT_DIR/iter-$ITER-cri-logs.err)"
+	fi
 	# No duplicate backend state: residual must not exceed one Pod's baseline.
 	if [ -n "${MACVZ_LINUXPOD_AUDIT_CMD:-}" ]; then
 		local n; n="$(wait_residual_at_most "$OUT_DIR/iter-$ITER-cri-audit.log" "$MAX_RESIDUAL")"

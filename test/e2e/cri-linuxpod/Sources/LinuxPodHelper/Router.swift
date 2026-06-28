@@ -179,7 +179,7 @@ actor RouterBackend: LineHandler {
             if let resp = try? client.call(op: "Adopt", payload: p), (resp["ok"] as? Bool) == true {
                 return resp
             }
-            clients.removeValue(forKey: podID)?.close()
+            markSupervisorLost(podID, reason: "adopt")
         }
         // Journaled but unreachable: honest fallback (adopted:false, no error) so the
         // adapter routes through BackendLost/recreate and cleans the stale entry (#136).
@@ -287,7 +287,7 @@ actor RouterBackend: LineHandler {
         } catch let e as BackendError {
             // Transport failure mid-op: the supervisor died. Drop the dead client so a
             // later Adopt/status falls back, and surface the failure to the caller.
-            clients.removeValue(forKey: podID)?.close()
+            markSupervisorLost(podID, reason: op)
             throw e
         }
     }
@@ -305,9 +305,19 @@ actor RouterBackend: LineHandler {
             clients[podID] = client
             return client
         }
-        clients.removeValue(forKey: podID)
-        client.close()
+        markSupervisorLost(podID, reason: "probe")
         return nil
+    }
+
+    private func markSupervisorLost(_ podID: String, reason: String) {
+        clients.removeValue(forKey: podID)?.close()
+        guard let entry = journal.pods.removeValue(forKey: podID) else { return }
+        terminate(pid: entry.pid)
+        try? FileManager.default.removeItem(atPath: entry.socket)
+        try? FileManager.default.removeItem(at: workRoot.appendingPathComponent("sup-\(safeShort(podID))"))
+        persistJournal()
+        logger.warning("supervisor lost; dropping journal entry",
+            metadata: ["podID": "\(podID)", "reason": "\(reason)", "pid": "\(entry.pid)"])
     }
 
     // MARK: Supervisor process management

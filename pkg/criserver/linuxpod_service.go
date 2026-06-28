@@ -288,6 +288,10 @@ func (s *LinuxPodService) CreateContainer(ctx context.Context, req *runtimeapi.C
 		if existing.Metadata.Name != name {
 			continue
 		}
+		if existing.Metadata.Attempt == cfg.GetMetadata().GetAttempt() &&
+			(existing.State == store.ContainerCreated || existing.State == store.ContainerRunning) {
+			return &runtimeapi.CreateContainerResponse{ContainerId: existing.ID}, nil
+		}
 		if existing.State != store.ContainerExited {
 			return nil, status.Errorf(codes.AlreadyExists,
 				"CreateContainer: container %q already exists in sandbox %q", name, sandboxID)
@@ -330,6 +334,13 @@ func (s *LinuxPodService) CreateContainer(ctx context.Context, req *runtimeapi.C
 		LogPath:     s.linuxpodLogPath(sb, cfg),
 	})
 	if err != nil {
+		if errors.Is(err, linuxpod.ErrInvalid) && strings.Contains(err.Error(), "already exists") {
+			s.markSandboxBackendLostLocked(ctx, sandboxID,
+				"LinuxPod helper already has container state that the CRI store cannot safely match")
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"CreateContainer: backend has conflicting container state for %q in sandbox %q; sandbox marked NotReady for recreate",
+				name, sandboxID)
+		}
 		return nil, linuxpodToCRIError("CreateContainer", err)
 	}
 
@@ -384,6 +395,9 @@ func (s *LinuxPodService) StartContainer(ctx context.Context, req *runtimeapi.St
 		return nil, status.Errorf(codes.NotFound, "StartContainer: container %q not found", id)
 	}
 	if c.State != store.ContainerCreated {
+		if c.State == store.ContainerRunning {
+			return &runtimeapi.StartContainerResponse{}, nil
+		}
 		return nil, status.Errorf(codes.FailedPrecondition, "StartContainer: container %q is %s, expected Created", id, c.State)
 	}
 

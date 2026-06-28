@@ -14,6 +14,8 @@ import Foundation
 // syscalls are acceptable here because they run inside the actor's executor and the
 // supervisor answers one line per request in order.
 final class SupervisorClient: @unchecked Sendable {
+    private static let ioTimeoutSeconds: Int = 2
+
     let socketPath: String
     private var fd: Int32 = -1
     private var readBuffer = Data()
@@ -59,6 +61,9 @@ final class SupervisorClient: @unchecked Sendable {
         // SIG_IGN set at startup.
         var on: Int32 = 1
         _ = setsockopt(s, SOL_SOCKET, SO_NOSIGPIPE, &on, socklen_t(MemoryLayout<Int32>.size))
+        var timeout = timeval(tv_sec: Self.ioTimeoutSeconds, tv_usec: 0)
+        _ = setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+        _ = setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
         fd = s
         readBuffer.removeAll(keepingCapacity: true)
     }
@@ -89,6 +94,7 @@ final class SupervisorClient: @unchecked Sendable {
             var off = 0
             let base = raw.baseAddress!
             while off < data.count {
+                try waitFD(events: Int16(POLLOUT), what: "write timeout")
                 let w = write(fd, base + off, data.count - off)
                 if w <= 0 {
                     close()
@@ -109,12 +115,30 @@ final class SupervisorClient: @unchecked Sendable {
                 return line
             }
             var chunk = [UInt8](repeating: 0, count: 8192)
+            try waitFD(events: Int16(POLLIN), what: "read timeout")
             let n = read(fd, &chunk, chunk.count)
             if n <= 0 {
                 close()
                 throw err("read")
             }
             readBuffer.append(contentsOf: chunk[0..<n])
+        }
+    }
+
+    private func waitFD(events: Int16, what: String) throws {
+        var pfd = pollfd(fd: fd, events: events, revents: 0)
+        let rc = poll(&pfd, 1, Int32(Self.ioTimeoutSeconds * 1000))
+        if rc == 0 {
+            close()
+            throw BackendError(code: "Internal", message: "supervisor \(socketPath): \(what)")
+        }
+        if rc < 0 {
+            close()
+            throw err("poll")
+        }
+        if (pfd.revents & Int16(POLLERR | POLLHUP | POLLNVAL)) != 0 {
+            close()
+            throw BackendError(code: "Internal", message: "supervisor \(socketPath): disconnected")
         }
     }
 

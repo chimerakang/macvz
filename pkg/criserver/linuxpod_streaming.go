@@ -30,14 +30,14 @@ func (s *LinuxPodService) StreamingRuntime() streaming.Runtime {
 // helper backs a synchronous in-VM exec primitive (#133), so the streaming callback
 // runs the command to completion and writes the captured stdout/stderr to the
 // client. Interactive stdin/TTY byte plumbing remains a future transport concern.
-func (s *LinuxPodService) Exec(_ context.Context, req *runtimeapi.ExecRequest) (*runtimeapi.ExecResponse, error) {
+func (s *LinuxPodService) Exec(ctx context.Context, req *runtimeapi.ExecRequest) (*runtimeapi.ExecResponse, error) {
 	if s.streamServer == nil {
 		return nil, errStreamingNotConfigured("Exec")
 	}
 	if len(req.GetCmd()) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Exec: command is required")
 	}
-	if _, err := s.linuxpodRunningContainer(req.GetContainerId(), "Exec"); err != nil {
+	if _, err := s.linuxpodRunningContainer(ctx, req.GetContainerId(), "Exec"); err != nil {
 		return nil, err
 	}
 	return s.streamServer.GetExec(req)
@@ -78,7 +78,7 @@ func (r *linuxpodStreamingRuntime) Exec(ctx context.Context, containerID string,
 	if resize != nil {
 		go drainResize(ctx, resize)
 	}
-	c, err := r.s.linuxpodRunningContainer(containerID, "Exec")
+	c, err := r.s.linuxpodRunningContainer(ctx, containerID, "Exec")
 	if err != nil {
 		return err
 	}

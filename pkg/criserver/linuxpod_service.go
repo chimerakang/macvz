@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -66,6 +67,7 @@ type LinuxPodService struct {
 	mountPolicy   MountPolicy
 	images        map[string]struct{} // images "pulled" through the minimal ImageService
 	streamServer  StreamingServer
+	logRoot       string
 }
 
 // LinuxPodOptions configures a LinuxPodService.
@@ -83,6 +85,10 @@ type LinuxPodOptions struct {
 	Mounts     MountPolicy
 	// Now is injectable for deterministic tests; defaults to time.Now.
 	Now func() time.Time
+	// LogRoot overrides kubelet's sandbox log directory for LinuxPod CRI log files.
+	// It is intended for rootless/remote CRI test topologies where the helper cannot
+	// write kubelet's /var/log/pods path but kubelet can read a shared/synced path.
+	LogRoot string
 }
 
 // NewLinuxPodService builds a LinuxPod-backed CRI service. Backend is required.
@@ -118,6 +124,7 @@ func NewLinuxPodService(opts LinuxPodOptions) (*LinuxPodService, error) {
 		addrPollAttempts: defaultVMIPPollAttempts,
 		addrPollInterval: defaultVMIPPollInterval,
 		images:           map[string]struct{}{},
+		logRoot:          opts.LogRoot,
 	}, nil
 }
 
@@ -136,6 +143,8 @@ const linuxpodRuntimeName = "macvz-cri-linuxpod"
 // kubelet stop before CreateContainer with ImageInspectError. Keep this visibly
 // non-authoritative until the helper grows a real image-status surface.
 const linuxpodUnknownImageSize uint64 = 1
+
+const linuxpodNotReadyReapGrace = 2 * time.Minute
 
 // Version reports the CRI runtime identity for the LinuxPod path.
 func (s *LinuxPodService) Version(_ context.Context, req *runtimeapi.VersionRequest) (*runtimeapi.VersionResponse, error) {
@@ -318,7 +327,7 @@ func (s *LinuxPodService) CreateContainer(ctx context.Context, req *runtimeapi.C
 		Args:        cfg.GetArgs(),
 		Env:         kvToMap(cfg.GetEnvs()),
 		Mounts:      linuxpodMounts(rtMounts),
-		LogPath:     linuxpodLogPath(sb, cfg),
+		LogPath:     s.linuxpodLogPath(sb, cfg),
 	})
 	if err != nil {
 		return nil, linuxpodToCRIError("CreateContainer", err)
@@ -481,13 +490,14 @@ func (s *LinuxPodService) ContainerStatus(ctx context.Context, req *runtimeapi.C
 		return nil, status.Errorf(codes.NotFound, "ContainerStatus: container %q not found", id)
 	}
 	s.reconcileSandboxBackendState(ctx, c.SandboxID)
+	s.reconcileContainerBackendState(ctx, id)
 	c, ok = s.containers.Get(id)
 	if !ok {
 		return nil, status.Errorf(codes.NotFound, "ContainerStatus: container %q not found", id)
 	}
 	var logPathAbs string
 	if sb, ok := s.sandboxes.Get(c.SandboxID); ok {
-		logPathAbs = linuxpodStoredLogPath(sb, c)
+		logPathAbs = s.linuxpodStoredLogPath(sb, c)
 	}
 	resp := &runtimeapi.ContainerStatusResponse{Status: toCRIContainerStatus(&c, logPathAbs)}
 	if req.GetVerbose() {
@@ -508,6 +518,11 @@ func (s *LinuxPodService) ContainerStatus(ctx context.Context, req *runtimeapi.C
 // ListContainers returns containers matching the filter.
 func (s *LinuxPodService) ListContainers(ctx context.Context, req *runtimeapi.ListContainersRequest) (*runtimeapi.ListContainersResponse, error) {
 	s.reconcileAllSandboxBackendState(ctx)
+	for _, c := range s.containers.List() {
+		if c.State == store.ContainerRunning && c.LinuxPod != nil {
+			s.reconcileContainerBackendState(ctx, c.ID)
+		}
+	}
 	var items []*runtimeapi.Container
 	for _, c := range s.containers.List() {
 		c := c
@@ -921,6 +936,10 @@ func (s *LinuxPodService) StartBackendReconciler(ctx context.Context, interval t
 }
 
 func (s *LinuxPodService) discardNotReadySandboxForRecreate(ctx context.Context, sb *store.Sandbox) error {
+	return s.discardNotReadySandbox(ctx, sb, "RunPodSandbox")
+}
+
+func (s *LinuxPodService) discardNotReadySandbox(ctx context.Context, sb *store.Sandbox, op string) error {
 	if sb == nil || sb.State != store.StateNotReady {
 		return nil
 	}
@@ -929,20 +948,20 @@ func (s *LinuxPodService) discardNotReadySandboxForRecreate(ctx context.Context,
 	}
 	for _, c := range s.containers.ListBySandbox(sb.ID) {
 		if err := s.containers.Delete(c.ID); err != nil {
-			return status.Errorf(codes.Internal, "RunPodSandbox: discard stale container %q: %v", c.ID, err)
+			return status.Errorf(codes.Internal, "%s: discard stale container %q: %v", op, c.ID, err)
 		}
 	}
 	if rep, err := s.backend.Cleanup(ctx, sb.ID); err != nil {
 		if !linuxpodBackendMissing(err) {
-			return linuxpodToCRIError("RunPodSandbox: discard stale sandbox", err)
+			return linuxpodToCRIError(op+": discard stale sandbox", err)
 		}
 	} else if rep.StaleState {
-		klog.ErrorS(errors.New("backend reported stale state"), "RunPodSandbox: stale sandbox cleanup left residual state", "sandbox", sb.ID)
+		klog.ErrorS(errors.New("backend reported stale state"), op+": stale sandbox cleanup left residual state", "sandbox", sb.ID)
 	}
 	if err := s.sandboxes.Delete(sb.ID); err != nil {
-		return status.Errorf(codes.Internal, "RunPodSandbox: discard stale sandbox %q: %v", sb.ID, err)
+		return status.Errorf(codes.Internal, "%s: discard stale sandbox %q: %v", op, sb.ID, err)
 	}
-	klog.InfoS("discarded NotReady LinuxPod sandbox before recreation",
+	klog.InfoS("discarded NotReady LinuxPod sandbox",
 		"sandbox", sb.ID, "namespace", sb.Metadata.Namespace, "name", sb.Metadata.Name)
 	return nil
 }
@@ -951,6 +970,43 @@ func (s *LinuxPodService) reconcileAllSandboxBackendState(ctx context.Context) {
 	for _, sb := range s.sandboxes.List() {
 		s.reconcileSandboxBackendState(ctx, sb.ID)
 	}
+	s.reapDiscardableNotReadySandboxes(ctx)
+}
+
+func (s *LinuxPodService) reapDiscardableNotReadySandboxes(ctx context.Context) {
+	now := s.now().UnixNano()
+	for _, sb := range s.sandboxes.List() {
+		if sb.State != store.StateNotReady {
+			continue
+		}
+		containers := s.containers.ListBySandbox(sb.ID)
+		staleSince, ok := linuxpodNotReadyStaleSince(sb, containers)
+		if !ok || now-staleSince < int64(linuxpodNotReadyReapGrace) {
+			continue
+		}
+		if err := s.discardNotReadySandbox(ctx, &sb, "LinuxPodNotReadyReaper"); err != nil {
+			klog.ErrorS(err, "failed to reap NotReady LinuxPod sandbox", "sandbox", sb.ID)
+		}
+	}
+}
+
+func linuxpodNotReadyStaleSince(sb store.Sandbox, containers []store.Container) (int64, bool) {
+	staleSince := sb.CreatedAt
+	for _, c := range containers {
+		if c.State != store.ContainerExited {
+			return 0, false
+		}
+		if c.FinishedAt == 0 {
+			return 0, false
+		}
+		if c.FinishedAt > staleSince {
+			staleSince = c.FinishedAt
+		}
+	}
+	if staleSince == 0 {
+		return 0, false
+	}
+	return staleSince, true
 }
 
 func (s *LinuxPodService) reconcileSandboxBackendState(ctx context.Context, sandboxID string) {
@@ -980,6 +1036,52 @@ func (s *LinuxPodService) reconcileSandboxBackendState(ctx context.Context, sand
 	}
 	s.markSandboxBackendLostLocked(ctx, sandboxID,
 		"LinuxPod helper no longer has live backend state for this sandbox")
+}
+
+func (s *LinuxPodService) reconcileContainerBackendState(ctx context.Context, containerID string) {
+	c, ok := s.containers.Get(containerID)
+	if !ok || c.State != store.ContainerRunning || c.LinuxPod == nil {
+		return
+	}
+
+	s.statusProbeMu.Lock()
+	st, err := s.backend.Status(ctx, linuxpod.Ref{PodID: c.SandboxID, ContainerID: c.LinuxPod.BackendContainerID})
+	s.statusProbeMu.Unlock()
+	if err == nil {
+		if st.Phase != runtime.PhaseRunning {
+			s.mu.Lock()
+			if cur, ok := s.containers.Get(containerID); ok && cur.State == store.ContainerRunning {
+				cur.State = store.ContainerExited
+				cur.FinishedAt = s.now().UnixNano()
+				cur.ExitCode = int32(st.ExitCode)
+				cur.Reason = "Exited"
+				cur.Message = st.Message
+				if perr := s.containers.Put(&cur); perr != nil {
+					klog.ErrorS(perr, "failed to persist LinuxPod container state after backend status probe",
+						"containerID", containerID, "backendContainerID", c.LinuxPod.BackendContainerID)
+				}
+			}
+			s.mu.Unlock()
+		}
+		return
+	}
+	if !linuxpodBackendMissing(err) {
+		klog.V(4).InfoS("LinuxPod backend container status probe failed; retaining last known CRI state",
+			"containerID", containerID, "sandbox", c.SandboxID, "err", err)
+		return
+	}
+
+	if s.tryAdoptSandboxAfterBackendMiss(ctx, c.SandboxID) {
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if cur, ok := s.containers.Get(containerID); !ok || cur.State != store.ContainerRunning {
+		return
+	}
+	s.markSandboxBackendLostLocked(ctx, c.SandboxID,
+		"LinuxPod helper no longer has live backend state for a running container")
 }
 
 // tryAdoptSandboxAfterBackendMiss gives a helper with the #138 adoption capability
@@ -1083,18 +1185,48 @@ func linuxpodToCRIError(op string, err error) error {
 	}
 }
 
-func linuxpodLogPath(sb store.Sandbox, cfg *runtimeapi.ContainerConfig) string {
-	if cfg == nil || cfg.GetLogPath() == "" || sb.LogDirectory == "" {
+func (s *LinuxPodService) linuxpodLogPath(sb store.Sandbox, cfg *runtimeapi.ContainerConfig) string {
+	if cfg == nil || cfg.GetLogPath() == "" {
+		return ""
+	}
+	if s.logRoot != "" {
+		return filepath.Join(s.logRoot, linuxpodLogPodDir(sb), cleanRelativeLogPath(cfg.GetLogPath()))
+	}
+	if sb.LogDirectory == "" {
 		return ""
 	}
 	return filepath.Join(sb.LogDirectory, cfg.GetLogPath())
 }
 
-func linuxpodStoredLogPath(sb store.Sandbox, c store.Container) string {
-	if c.LogPath == "" || sb.LogDirectory == "" {
+func (s *LinuxPodService) linuxpodStoredLogPath(sb store.Sandbox, c store.Container) string {
+	if c.LogPath == "" {
+		return ""
+	}
+	if s.logRoot != "" {
+		return filepath.Join(s.logRoot, linuxpodLogPodDir(sb), cleanRelativeLogPath(c.LogPath))
+	}
+	if sb.LogDirectory == "" {
 		return ""
 	}
 	return filepath.Join(sb.LogDirectory, c.LogPath)
+}
+
+func linuxpodLogPodDir(sb store.Sandbox) string {
+	return sb.Metadata.Namespace + "_" + sb.Metadata.Name + "_" + sb.Metadata.UID
+}
+
+func cleanRelativeLogPath(p string) string {
+	p = filepath.Clean(p)
+	p = strings.TrimPrefix(p, string(filepath.Separator))
+	for p == ".." || strings.HasPrefix(p, ".."+string(filepath.Separator)) {
+		p = strings.TrimPrefix(p, "..")
+		p = strings.TrimPrefix(p, string(filepath.Separator))
+		p = filepath.Clean(p)
+	}
+	if p == "." {
+		return ""
+	}
+	return p
 }
 
 func kvToMap(kvs []*runtimeapi.KeyValue) map[string]string {

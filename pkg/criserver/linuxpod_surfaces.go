@@ -40,7 +40,7 @@ func (s *LinuxPodService) ExecSync(ctx context.Context, req *runtimeapi.ExecSync
 	if len(req.GetCmd()) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "ExecSync: command is required")
 	}
-	c, err := s.linuxpodRunningContainer(req.GetContainerId(), "ExecSync")
+	c, err := s.linuxpodRunningContainer(ctx, req.GetContainerId(), "ExecSync")
 	if err != nil {
 		return nil, err
 	}
@@ -131,8 +131,17 @@ func (s *LinuxPodService) linuxpodContainer(id, method string) (store.Container,
 	return c, nil
 }
 
-func (s *LinuxPodService) linuxpodRunningContainer(id, method string) (store.Container, error) {
+func (s *LinuxPodService) linuxpodRunningContainer(ctx context.Context, id, method string) (store.Container, error) {
 	c, err := s.linuxpodContainer(id, method)
+	if err != nil {
+		return store.Container{}, err
+	}
+	if c.State != store.ContainerRunning {
+		return store.Container{}, status.Errorf(codes.FailedPrecondition,
+			"%s: container %q is %s, expected Running", method, id, c.State)
+	}
+	s.reconcileContainerBackendState(ctx, id)
+	c, err = s.linuxpodContainer(id, method)
 	if err != nil {
 		return store.Container{}, err
 	}

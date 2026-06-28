@@ -111,6 +111,7 @@ func main() {
 		handoffRoot     string
 		linuxpodBackend bool
 		linuxpodSocket  string
+		linuxpodLogRoot string
 		linuxpodDiag    bool
 		pn              podNetConfig
 	)
@@ -152,6 +153,8 @@ func main() {
 		"opt into the experimental LinuxPod late-rootfs runtime backend prototype (CRI-R17, #124): connect to a LinuxPod helper over --linuxpod-helper-socket and verify the backend contract at startup; off by default, experimental (not production-ready), and does not replace the shipped apple/container CRI serving path (docs/CRI_RUNTIME_R17_LINUXPOD_BACKEND_REPORT.md)")
 	flag.StringVar(&linuxpodSocket, "linuxpod-helper-socket", "",
 		"unix socket of the LinuxPod helper that speaks the pkg/runtime/linuxpod NDJSON contract (required with --experimental-linuxpod-backend)")
+	flag.StringVar(&linuxpodLogRoot, "linuxpod-log-root", "",
+		"override LinuxPod CRI container log root for rootless/remote test topologies where /var/log/pods is not writable/readable by both helper and kubelet (empty uses kubelet's log_directory)")
 	flag.BoolVar(&linuxpodDiag, "diagnose-linuxpod", false,
 		"scan persisted LinuxPod CRI state for residual/stale records (CRI-L6-2, #136), print a machine-readable JSON report to stdout, and exit without serving; read-only (never mutates records, IP reservations, or host routes). Pass --linuxpod-helper-socket to probe the live helper backend, otherwise sandbox liveness is reported as unprobed")
 	flag.BoolVar(&showVersion, "version", false, "print version and exit")
@@ -168,7 +171,7 @@ func main() {
 	hc := handoffConfig{enabled: handoff, root: handoffRoot}
 
 	if linuxpodDiag {
-		lc := linuxpodConfig{enabled: linuxpodBackend, helperSocket: linuxpodSocket}
+		lc := linuxpodConfig{enabled: linuxpodBackend, helperSocket: linuxpodSocket, logRoot: linuxpodLogRoot}
 		if err := runLinuxPodDiagnose(context.Background(), os.Stdout, stateDir, lc); err != nil {
 			klog.ErrorS(err, "macvz-cri LinuxPod diagnostic failed")
 			klog.Flush()
@@ -200,7 +203,7 @@ func main() {
 	// Experimental LinuxPod backend gate (CRI-R17): when enabled, handshake with the
 	// helper before serving so an unreachable/misconfigured helper fails loudly here
 	// rather than mid-Pod. The shipped apple/container serving path is unchanged.
-	lc := linuxpodConfig{enabled: linuxpodBackend, helperSocket: linuxpodSocket}
+	lc := linuxpodConfig{enabled: linuxpodBackend, helperSocket: linuxpodSocket, logRoot: linuxpodLogRoot}
 	if info, ok, err := lc.handshake(ctx); err != nil {
 		klog.ErrorS(err, "macvz-cri exited with error")
 		klog.Flush()

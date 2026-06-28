@@ -28,6 +28,7 @@ import (
 type linuxpodConfig struct {
 	enabled      bool
 	helperSocket string
+	logRoot      string
 }
 
 // linuxpodHandshakeTimeout bounds the startup Ping so an unresponsive helper
@@ -99,6 +100,7 @@ func serveLinuxPod(ctx context.Context, lis net.Listener, socketPath string, san
 		RuntimeVersion: version.Version,
 		PodNetwork:     podNet,
 		IPAM:           ipam,
+		LogRoot:        lc.logRoot,
 		Mounts: criserver.MountPolicy{
 			KubeletPodsDir:          mc.kubeletPodsDir,
 			HostPathAllowedPrefixes: mc.hostPathAllowed,

@@ -289,7 +289,10 @@ default apple/container path, run a LinuxPod helper and start the adapter with
 
    ```sh
    MACVZ_INTEGRATION=1 KUBECONFIG=/path/to/k3s.yaml \
-     MACVZ_RESTART_CRI_CMD="…" MACVZ_RESTART_HELPER_CMD="…" \
+     MACVZ_CRI_SSH_TARGET=test@192.168.1.122 \
+     MACVZ_RESTART_CRI_CMD="./test/e2e/cri-k3s/hooks/linuxpod-cri-restart.sh" \
+     MACVZ_HELPER_SSH_TARGET=test@192.168.1.122 \
+     MACVZ_RESTART_HELPER_CMD="./test/e2e/cri-k3s/hooks/linuxpod-helper-restart.sh" \
      MACVZ_ADAPTER_RSS_CMD="…" MACVZ_LINUXPOD_AUDIT_CMD="…" MACVZ_ROUTE_AUDIT_CMD="…" \
      ./test/e2e/cri-k3s/linuxpod-inloop.sh
    ```
@@ -312,7 +315,10 @@ default apple/container path, run a LinuxPod helper and start the adapter with
    ```sh
    MACVZ_INTEGRATION=1 KUBECONFIG=/path/to/k3s.yaml \
      MACVZ_MULTIPOD_REPLICAS=3 \
-     MACVZ_RESTART_CRI_CMD="…" MACVZ_RESTART_HELPER_CMD="…" \
+     MACVZ_CRI_SSH_TARGET=test@192.168.1.122 \
+     MACVZ_RESTART_CRI_CMD="./test/e2e/cri-k3s/hooks/linuxpod-cri-restart.sh" \
+     MACVZ_HELPER_SSH_TARGET=test@192.168.1.122 \
+     MACVZ_RESTART_HELPER_CMD="./test/e2e/cri-k3s/hooks/linuxpod-helper-restart.sh" \
      MACVZ_ADAPTER_RSS_CMD="…" MACVZ_LINUXPOD_HELPER_PROC_CMD="…" \
      MACVZ_LINUXPOD_AUDIT_CMD="…" MACVZ_LINUXPOD_DUP_AUDIT_CMD="…" \
      MACVZ_ROUTE_AUDIT_CMD="…" \

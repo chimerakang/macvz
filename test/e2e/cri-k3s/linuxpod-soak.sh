@@ -222,6 +222,27 @@ run_hook() {
 	sh -c "$cmd"
 }
 
+run_bounded() {
+	local stdout="$1" stderr="$2" timeout="$3"; shift 3
+	: >"$stdout"
+	: >"$stderr"
+	"$@" >"$stdout" 2>"$stderr" &
+	local pid=$! deadline=$((SECONDS + timeout)) rc=0
+	while kill -0 "$pid" 2>/dev/null; do
+		if [ "$SECONDS" -ge "$deadline" ]; then
+			kill "$pid" 2>/dev/null || true
+			sleep 1
+			kill -9 "$pid" 2>/dev/null || true
+			wait "$pid" 2>/dev/null || true
+			printf 'command timed out after %ss\n' "$timeout" >>"$stderr"
+			return 124
+		fi
+		sleep 1
+	done
+	wait "$pid" || rc=$?
+	return "$rc"
+}
+
 # --- shared helpers ----------------------------------------------------------
 pod_name() {
 	local pod
@@ -366,10 +387,12 @@ reachable() {
 # markers (proves the Pod is genuinely usable, not Running-but-dead).
 exec_logs_ok() {
 	local pod="$1" tag="$2" out
-	out="$(kn exec "$pod" -c app -- sh -c 'cat /www/index.html 2>/dev/null' 2>"$OUT_DIR/$tag-exec.err" || true)"
-	echo "$out" >"$OUT_DIR/$tag-exec.out"
+	run_bounded "$OUT_DIR/$tag-exec.out" "$OUT_DIR/$tag-exec.err" 20 \
+		kn exec "$pod" -c app -- sh -c 'cat /www/index.html 2>/dev/null' || return 1
+	out="$(cat "$OUT_DIR/$tag-exec.out")"
 	printf '%s' "$out" | grep -q "$MARKER" || return 1
-	kn logs "$pod" -c app >"$OUT_DIR/$tag-logs.out" 2>"$OUT_DIR/$tag-logs.err" || true
+	run_bounded "$OUT_DIR/$tag-logs.out" "$OUT_DIR/$tag-logs.err" 20 \
+		kn logs "$pod" -c app || return 1
 	grep -q "$APP_BOOT_MARKER" "$OUT_DIR/$tag-logs.out" || return 1
 	return 0
 }
@@ -564,20 +587,18 @@ resolve_modes() {
 # common per-iteration record (UID/IP/RSS/residual/route).
 
 churn_rollout() {
-	local uid_before pod; pod="$(pod_name)"
-	uid_before="$(pod_uid "$pod")"
+	local pod; pod="$(pod_name)"
 	kn rollout restart "deploy/$DEPLOY" >"$OUT_DIR/iter-$ITER-rollout.log" 2>&1 \
 		|| { fail "rollout restart returned non-zero (see $OUT_DIR/iter-$ITER-rollout.log)"; return 1; }
 	if ! kn rollout status "deploy/$DEPLOY" --timeout=5m >>"$OUT_DIR/iter-$ITER-rollout.log" 2>&1; then
 		fail "rollout did not complete (see $OUT_DIR/iter-$ITER-rollout.log)"
 		return 1
 	fi
-	local pod_after; pod_after="$(wait_running "rollout-$ITER")"
-	[ -n "$pod_after" ] || { fail "no Running Pod after rollout restart"; return 1; }
-	if exec_logs_ok "$pod_after" "iter-$ITER-rollout"; then
+	local pod_after
+	if pod_after="$(wait_exec_logs_ok "iter-$ITER-rollout")" && [ -n "$pod_after" ]; then
 		pass "rollout: fresh Pod $pod_after healthy (exec+logs serve the marker)"
 	else
-		fail "rollout: new Pod not usable after restart (see $OUT_DIR/iter-$ITER-rollout-exec.err)"
+		fail "rollout: new Pod not usable after restart (see $OUT_DIR/iter-$ITER-rollout-exec.err and $OUT_DIR/iter-$ITER-rollout-logs.err)"
 	fi
 }
 
@@ -737,7 +758,7 @@ phase_cleanup() {
 
 	if [ -n "${MACVZ_LINUXPOD_AUDIT_CMD:-}" ]; then
 		local n
-		if n="$(linuxpod_state_count "$OUT_DIR/cleanup-audit.log")"; then
+		if n="$(wait_residual_at_most "$OUT_DIR/cleanup-audit.log" 0)"; then
 			if [ "$n" = 0 ]; then
 				pass "LinuxPod audit: zero residual VM/container/rootfs/handoff/network state after soak"
 			else

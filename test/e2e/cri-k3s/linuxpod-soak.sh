@@ -354,6 +354,33 @@ wait_residual_at_most() {
 	return 1
 }
 
+# linuxpod_residual_baseline <output-file> -> echoes the expected live-Pod
+# footprint. The #139 helper-router model publishes supervisor state in a few
+# pieces (journal, supervisor socket/workdir/process, sandbox/container records),
+# so a single immediate audit can undercount the healthy steady state and make a
+# later CRI restart look like a duplicate. Sample briefly and use the max; cleanup
+# still requires zero residual.
+linuxpod_residual_baseline() {
+	local out_file="$1" max=0 n i sample_file
+	for i in $(seq 1 10); do
+		sample_file="${out_file}.${i}"
+		if n="$(linuxpod_state_count "$sample_file")"; then
+			case "$n" in
+				''|*[!0-9]*) ;;
+				*) [ "$n" -gt "$max" ] && max="$n" ;;
+			esac
+			cp "$sample_file" "$out_file" 2>/dev/null || true
+			cp "$sample_file.err" "$out_file.err" 2>/dev/null || true
+		else
+			cp "$sample_file" "$out_file" 2>/dev/null || true
+			cp "$sample_file.err" "$out_file.err" 2>/dev/null || true
+			return 1
+		fi
+		sleep 1
+	done
+	printf '%s' "$max"
+}
+
 # route_unchanged <label> -> 0 if the default route matches the baseline.
 route_unchanged() {
 	local label="$1"
@@ -512,7 +539,7 @@ phase_deploy() {
 	# state); per-iteration counts above this flag a leak/duplicate.
 	if [ -n "${MACVZ_LINUXPOD_AUDIT_CMD:-}" ]; then
 		local n
-		if n="$(linuxpod_state_count "$OUT_DIR/residual-baseline.log")"; then
+		if n="$(linuxpod_residual_baseline "$OUT_DIR/residual-baseline.log")"; then
 			BASELINE_RESIDUAL="$n"
 			[ -n "$MAX_RESIDUAL" ] || MAX_RESIDUAL="$n"
 			pass "LinuxPod residual baseline: $BASELINE_RESIDUAL line(s) (per-iter ceiling $MAX_RESIDUAL)"

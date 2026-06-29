@@ -21,6 +21,8 @@ containerization_root="${MACVZ_LINUXPOD_CONTAINERIZATION_ROOT:-}"
 initfs_reference="${MACVZ_LINUXPOD_INITFS_REFERENCE:-}"
 image="${MACVZ_LINUXPOD_IMAGE:-}"
 vmnet="${MACVZ_LINUXPOD_HELPER_VMNET:-1}"
+codesign_binary="${MACVZ_LINUXPOD_HELPER_CODESIGN:-1}"
+entitlements="${MACVZ_LINUXPOD_HELPER_ENTITLEMENTS:-}"
 timeout="${MACVZ_LINUXPOD_HELPER_READY_TIMEOUT:-60}"
 default_token="__MACVZ_DEFAULT__"
 
@@ -37,7 +39,9 @@ containerization_root="$8"
 initfs_reference="$9"
 image="${10}"
 vmnet="${11}"
-timeout="${12}"
+codesign_binary="${12}"
+entitlements="${13}"
+timeout="${14}"
 
 [ "$live_root" != "__MACVZ_DEFAULT__" ] || live_root=""
 [ "$service_dir" != "__MACVZ_DEFAULT__" ] || service_dir=""
@@ -49,6 +53,7 @@ timeout="${12}"
 [ "$containerization_root" != "__MACVZ_DEFAULT__" ] || containerization_root=""
 [ "$initfs_reference" != "__MACVZ_DEFAULT__" ] || initfs_reference=""
 [ "$image" != "__MACVZ_DEFAULT__" ] || image=""
+[ "$entitlements" != "__MACVZ_DEFAULT__" ] || entitlements=""
 
 [ -n "$live_root" ] || live_root="$HOME/macvz-cri-live-b99e050"
 [ -n "$service_dir" ] || service_dir="$live_root/service-linuxpod"
@@ -60,6 +65,7 @@ timeout="${12}"
 [ -n "$containerization_root" ] || containerization_root="$live_root/test/e2e/cri-linuxpod/containerization/bin"
 [ -n "$initfs_reference" ] || initfs_reference="vminit:latest"
 [ -n "$image" ] || image="docker.io/library/busybox:1.36.1"
+[ -n "$entitlements" ] || entitlements="$live_root/test/e2e/cri-linuxpod/linuxpod-helper.entitlements"
 
 log_file="$service_dir/linuxpod-helper.log"
 
@@ -94,6 +100,17 @@ fi
 
 rm -f "$socket"
 cd "$live_root"
+if [ "$codesign_binary" = 1 ] || [ "$codesign_binary" = true ]; then
+	if [ ! -f "$entitlements" ]; then
+		printf "linuxpod helper entitlements file missing: %s\n" "$entitlements" >&2
+		exit 1
+	fi
+	codesign --force --sign - --timestamp=none --entitlements "$entitlements" "$helper_bin" >/dev/null
+	if ! codesign -d --entitlements :- "$helper_bin" 2>/dev/null | grep -q "com.apple.security.virtualization"; then
+		printf "linuxpod helper is missing com.apple.security.virtualization entitlement after signing\n" >&2
+		exit 1
+	fi
+fi
 if [ "$vmnet" = 1 ] || [ "$vmnet" = true ]; then
 	nohup "$helper_bin" \
 		--socket "$socket" \
@@ -155,13 +172,16 @@ arg_kernel="${kernel:-$default_token}"
 arg_containerization_root="${containerization_root:-$default_token}"
 arg_initfs_reference="${initfs_reference:-$default_token}"
 arg_image="${image:-$default_token}"
+arg_entitlements="${entitlements:-$default_token}"
 
 if [ -n "$target" ]; then
 	printf '%s\n' "$remote_script" | ssh "$target" /bin/sh -s -- \
 		"$arg_live_root" "$arg_service_dir" "$arg_socket" "$arg_pid_file" "$arg_helper_bin" "$arg_work_dir" \
-		"$arg_kernel" "$arg_containerization_root" "$arg_initfs_reference" "$arg_image" "$vmnet" "$timeout"
+		"$arg_kernel" "$arg_containerization_root" "$arg_initfs_reference" "$arg_image" "$vmnet" "$codesign_binary" \
+		"$arg_entitlements" "$timeout"
 else
 	printf '%s\n' "$remote_script" | /bin/sh -s -- \
 		"$arg_live_root" "$arg_service_dir" "$arg_socket" "$arg_pid_file" "$arg_helper_bin" "$arg_work_dir" \
-		"$arg_kernel" "$arg_containerization_root" "$arg_initfs_reference" "$arg_image" "$vmnet" "$timeout"
+		"$arg_kernel" "$arg_containerization_root" "$arg_initfs_reference" "$arg_image" "$vmnet" "$codesign_binary" \
+		"$arg_entitlements" "$timeout"
 fi

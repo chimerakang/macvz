@@ -83,12 +83,89 @@ release.
   requires `MACVZ_LINUXPOD_BACKEND_EVIDENCE_CMD` to prove **every** Pod is a
   genuine, non-simulated LinuxPod backend or the LinuxPod acceptances skip loudly.
   `make cri-linuxpod-multipod`. Gated by `MACVZ_INTEGRATION=1` + `KUBECONFIG`.
+- `linuxpod-dns.sh` — gated **LinuxPod k3s DNS + Service-discovery** suite
+  (CRI-L8-2 #142), the DNS sibling of `linuxpod-inloop.sh`. Where inloop proves
+  the Pod lifecycle, shared namespace, and a *manually probed* ClusterIP curl,
+  this harness proves the **normal k3s DNS path** works from inside a LinuxPod
+  Pod by `kubectl exec`-ing `nslookup`/`wget` in the app container: CoreDNS
+  reachability, `*.svc` and `*.svc.cluster.local` resolution, a headless Service
+  returning the Pod's A record, and same-namespace vs other-namespace
+  (`kubernetes.default`, `kube-dns.kube-system`) lookups. Its central discipline
+  is to **distinguish a DNS failure from a Pod-networking or Service-routing
+  failure**: it checks resolver config (kubelet dnsPolicy) apart from resolution,
+  uses a known-good name for CoreDNS reachability and a known-bad name for an
+  authoritative-NXDOMAIN control (NXDOMAIN vs timeout = CoreDNS unreachable), and
+  curls the Service **both** by name and by the resolved ClusterIP so a DNS-layer
+  fault (by-IP-ok/by-name-fail) is never confused with a Service-routing fault
+  (by-IP-fail). It re-runs the DNS core after **rollout-restart**, **macvz-cri
+  restart**, **LinuxPod helper restart**, and **netd reload**, and asserts the
+  host default route is unchanged across the run and across the netd reload. It
+  inherits the #130 **honesty gate**: the DNS checks run on either backend, but
+  the LinuxPod-specific framing is only asserted when
+  `MACVZ_LINUXPOD_BACKEND_EVIDENCE_CMD` proves a non-simulated LinuxPod Pod;
+  absent that the result is reported against the apple/container path, never
+  silently claimed as a LinuxPod result. `make cri-linuxpod-dns`. Gated by
+  `MACVZ_INTEGRATION=1` + `KUBECONFIG`. Report:
+  `docs/CRI_LINUXPOD_L8_2_DNS_SERVICE_REPORT.md`.
 - `fixtures/linuxpod-workload.yaml` — the #130 two-container fixture (app + late
   sidecar) for the LinuxPod backend; the multi-container shared-namespace shape
   the default apple/container path excludes (#82/#86).
 - `fixtures/linuxpod-multipod-workload.yaml` — the #137 multi-replica fixture: N>=3
   app+late-sidecar Pods plus one ClusterIP Service, each app serving a per-Pod
   `/whoami` identity so the Service phase can prove it reached distinct backends.
+- `fixtures/linuxpod-dns-workload.yaml` — the #142 DNS fixture: the app+late-sidecar
+  LinuxPod shape plus a ClusterIP Service and a headless Service, where the late
+  sidecar performs a boot-time `nslookup` of its own Service as boot-time DNS
+  evidence to complement `linuxpod-dns.sh`'s exec-time probes.
+- `node-reboot-recovery.sh` — gated **node reboot / bootstrap recovery** check
+  (CRI-L8-5 #144), the recovery sibling of `linuxpod-soak.sh`. Where the soak
+  loops service-level churn while the rest of the stack stays up, this proves a
+  *full restart of the node stack* — a remote Mac reboot (`MACVZ_REBOOT_CMD`) or
+  an ordered service-stack restart (`MACVZ_BOOTSTRAP_CMD`) over
+  `MACVZ_RECOVERY_SCENARIOS` (`services,reboot`) — returns the LinuxPod-backed
+  k3s node to a known-good `Ready` state without manual cleanup. It documents the
+  expected startup order (apple/container → macvz-netd → linuxpod-helper →
+  macvz-cri → kubelet/k3s → kind socket forward) and, with
+  `MACVZ_STARTUP_PROBE_CMD`, asserts each component is ready in order. Per
+  scenario it asserts the node returns `Ready`, the workload Pod is usable
+  (exec+logs serve the marker; a reboot expects a *fresh* Pod since VMs do not
+  survive reboot), `MACVZ_STALE_STATE_CMD` settles to zero (no leftover helper
+  sockets / supervisor journals / VM state / kubelet sandbox records), and the
+  default route is unchanged AND still the expected gateway/interface
+  (`MACVZ_EXPECTED_DEFAULT_GW` via `MACVZ_EXPECTED_DEFAULT_IF`, default
+  `192.168.1.1` via `en0`) before and after recovery. It inherits the #130
+  **honesty gate**: the LinuxPod-VM portion of the stale-state claim is only
+  enforced when `MACVZ_LINUXPOD_BACKEND_EVIDENCE_CMD` proves a non-simulated
+  LinuxPod Pod; the kubelet/CRI-visible recovery runs either way. A scenario
+  whose required hook is unset is dropped with a loud skip. `hooks/node-bootstrap.sh`
+  is a route-preserving reference bring-up that delegates to the existing
+  helper/cri restart hooks. `make cri-linuxpod-reboot`. Gated by
+  `MACVZ_INTEGRATION=1` + `KUBECONFIG`. Report:
+  `docs/CRI_LINUXPOD_L8_5_REBOOT_RECOVERY.md`.
+- `conformance-smoke.sh` — gated **k3s conformance smoke subset** (CRI-L8-6 #147),
+  the "ordinary workload compatibility" sibling of `linuxpod-inloop.sh`. Where the
+  in-loop/soak/multipod suites prove the LinuxPod-specific surface (shared
+  namespace, identity, recovery, concurrency), this runs a small, repeatable
+  subset of the everyday k3s behaviors a real chart relies on, in **one** apply:
+  Deployments, ClusterIP + headless Services, DNS, ConfigMaps, Secrets, a
+  multi-source projected volume, readiness/liveness probes, `restartPolicy:
+  Always` recovery (a crash-once container), logs, exec, port-forward, cleanup,
+  and node readiness. It is explicitly a **curated subset, NOT full upstream
+  conformance**, and records what it does not cover (StatefulSets/Jobs/CSI/etc.,
+  and the deeper matrices owned by sibling issues #142/#143/#144/#145/#146) so the
+  support claim stays honest. It inherits the #130 **honesty gate**: the ordinary
+  checks run on either backend, but *LinuxPod-backed conformance* is only claimed
+  when `MACVZ_LINUXPOD_BACKEND_EVIDENCE_CMD` proves a non-simulated LinuxPod Pod;
+  otherwise the result is reported against the apple/container path. Each phase
+  writes layer-tagged diagnostics (kubelet/CRI/helper/network/workload) and the
+  run asserts the host default route is unchanged. `make cri-conformance-smoke`.
+  Gated by `MACVZ_INTEGRATION=1` + `KUBECONFIG`. Report:
+  `docs/CRI_LINUXPOD_L8_6_CONFORMANCE_SMOKE.md`.
+- `fixtures/conformance-smoke.yaml` — the #147 conformance-smoke fixture: an
+  app+late-sidecar Deployment (ConfigMap, Secret, projected volume, probes,
+  ClusterIP + headless Service) bundled with a separate crash-once
+  `restartPolicy: Always` Deployment, so a single apply exercises the whole
+  subset.
 
 `run.sh`/`soak.sh` are gated by `MACVZ_INTEGRATION=1`; `k3s-inloop.sh`
 additionally needs a reachable `KUBECONFIG`. Without their gates each prints its

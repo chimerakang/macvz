@@ -56,6 +56,18 @@ cri-linuxpod-multipod: ## Run the CRI-L6-3 LinuxPod-backed multi-Pod concurrency
 cri-linuxpod-soak: ## Run the CRI-L6-1 LinuxPod soak/churn harness (set MACVZ_INTEGRATION=1 + KUBECONFIG to run live)
 	./test/e2e/cri-k3s/linuxpod-soak.sh
 
+.PHONY: cri-linuxpod-dns
+cri-linuxpod-dns: ## Run the CRI-L8-2 LinuxPod k3s DNS/Service-discovery suite (set MACVZ_INTEGRATION=1 + KUBECONFIG to run live)
+	./test/e2e/cri-k3s/linuxpod-dns.sh
+
+.PHONY: cri-linuxpod-reboot
+cri-linuxpod-reboot: ## Run the CRI-L8-5 LinuxPod node reboot/bootstrap recovery check (set MACVZ_INTEGRATION=1 + KUBECONFIG to run live)
+	./test/e2e/cri-k3s/node-reboot-recovery.sh
+
+.PHONY: cri-conformance-smoke
+cri-conformance-smoke: ## Run the CRI-L8-6 k3s conformance smoke subset (set MACVZ_INTEGRATION=1 + KUBECONFIG to run live)
+	./test/e2e/cri-k3s/conformance-smoke.sh
+
 .PHONY: cri-handoff
 cri-handoff: cri ## Run the CRI-I4-1 handoff-lifecycle crictl fixture (set MACVZ_INTEGRATION=1 to run live)
 	./test/e2e/cri-handoff/run.sh

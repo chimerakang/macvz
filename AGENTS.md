@@ -4,32 +4,52 @@ Durable instructions for coding agents working in this repository.
 
 ## Project Direction
 
-MacVz is an Apple Silicon Kubernetes node provider. It does not implement a new
-control plane. A standard Kubernetes cluster remains responsible for the API
-server, scheduler, etcd, Services, RBAC, and declarative APIs.
+MacVz turns Apple Silicon Macs into Kubernetes nodes that run OCI workloads as
+isolated Linux micro-VMs. It does not implement a new control plane: a standard
+Kubernetes/k3s cluster remains responsible for the API server, scheduler, etcd,
+Services, RBAC, and declarative APIs.
 
-The `macvz-kubelet` process runs on each Mac and presents that host as a
-Virtual Kubelet node. Workloads scheduled to the node are launched as isolated
-Linux micro-VMs through Apple's `apple/container` runtime.
+There are two integration paths:
+
+1. **Primary (strategic) direction — k3s-compatible CRI node.** The Mac runs a
+   real kubelet (a k3s agent) that drives `macvz-cri` as its CRI runtime, and
+   each Pod becomes a **LinuxPod** micro-VM via Apple Containerization. The
+   primary CRI backend is the LinuxPod backend
+   (`macvz-cri --experimental-linuxpod-backend`); the apple/container CRI backend
+   is retained as an alternative. This path is validated end-to-end on real
+   micro-VMs with an in-loop k3s kubelet on the test host and is still hardening
+   (CRI-L8).
+2. **Secondary (compatibility) direction — Virtual Kubelet provider.** The
+   `macvz-kubelet` process presents the Mac as a Virtual Kubelet node, launching
+   workloads as micro-VMs through `apple/container`. It is the more mature,
+   signed/notarized path today and remains fully supported.
 
 ## Architecture Boundaries
 
-- `cmd/macvz-kubelet`: resident node process entrypoint.
+- `cmd/macvz-cri`: k3s/CRI runtime adapter entrypoint (primary direction).
+- `cmd/macvz-kubelet`: Virtual Kubelet node process entrypoint (secondary path).
 - `pkg/runtime`: single-host `apple/container` integration and runtime
-  abstraction.
+  abstraction shared by both paths.
+- `pkg/runtime/linuxpod`: LinuxPod backend (Apple Containerization helper
+  protocol) — the primary CRI backend.
+- `pkg/criserver`: CRI RuntimeService/ImageService adapter and store.
 - `pkg/provider`: Virtual Kubelet provider implementation.
 - `pkg/network`: WireGuard mesh, Pod IPAM, and Pod IP reporting.
 - `pkg/metrics`: node and pod resource reporting.
 - `pkg/config`: YAML configuration loading and validation.
 - `internal/types`: small shared value types that avoid package cycles.
 
-Do not add a custom scheduler, API server, `mvz-master`, `mvz-agent`, CRI
-runtime, or `github.com/Code-Hex/vz` virtualization path unless the roadmap is
-explicitly changed first.
+Do not add a custom scheduler, API server, `mvz-master`, `mvz-agent`, or
+`github.com/Code-Hex/vz` virtualization path unless the roadmap is explicitly
+changed first. (The CRI runtime path is now an explicit project direction, not a
+prohibited one — see above.)
 
 ## Phasing
 
 Use `docs/MASTER_TASKS.md` as the roadmap source of truth.
+
+The Virtual Kubelet phases (the secondary/compatibility path) are complete
+through P4:
 
 - P0: scaffolding, CLI/config/logging, package boundaries, CI, build tooling.
 - P1: single-Mac runtime integration over `apple/container`.
@@ -37,8 +57,18 @@ Use `docs/MASTER_TASKS.md` as the roadmap source of truth.
 - P3: cross-host Pod networking and Service reachability.
 - P4: hardening, metrics, volumes, image-arch handling, signing, e2e.
 
-Prefer proving runtime behavior on one Mac before implementing Kubernetes
-provider behavior, and prove provider behavior before cross-host networking.
+The strategic primary direction is the k3s-compatible CRI track:
+
+- CRI-P0..P9: CRI feasibility, sandbox/container/image/networking/streaming
+  surfaces, and the route decision — complete.
+- CRI-L1..L8: LinuxPod-backed kubelet/k3s hardening — real-helper lifecycle,
+  Pod networking, kubelet surfaces, in-loop validation, recovery/adoption, and
+  k3s compatibility (DNS/Services, volume projection, image lifecycle, reboot
+  recovery, conformance smoke, soak) — in progress.
+
+Prefer proving runtime behavior on one Mac before wiring it into kubelet/CRI or
+the Virtual Kubelet provider, and keep default tests hermetic with live runs
+gated behind explicit environment variables.
 
 ## Runtime Integration Rules
 

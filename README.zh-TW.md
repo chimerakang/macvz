@@ -1,56 +1,82 @@
-# MacVz — Apple Silicon Kubernetes 節點供應器
+# MacVz — Apple Silicon Kubernetes 節點（k3s 相容 CRI）
 
 *[English](README.md) | 繁體中文*
 
 **MacVz 讓 Apple Silicon (M 系列) Mac 成為一等公民的 Kubernetes 節點，並以原生 micro-VM 形式執行 OCI 工作負載。**
 
-我們不打算再造一個編排器，而是透過 [Virtual Kubelet](https://github.com/virtual-kubelet/virtual-kubelet) 介面，直接接上**標準的 Kubernetes 控制平面**。每台 Mac mini 以一個虛擬節點 (virtual node) 的身分加入叢集；每個被排程到該節點的 Pod，都會經由 Apple 原生的 **Virtualization.framework** 啟動成一個獨立的 Linux micro-VM——底層運行時採用 [`apple/container`](https://github.com/apple/container)。最終達成：強隔離、秒級啟動、低功耗，並完全釋放統一記憶體頻寬，且不必背負 Docker Desktop 那套巨型 Linux VM。
+我們不打算再造一個編排器，而是直接接上**標準的 Kubernetes／k3s 控制平面**，讓 Mac 成為一個真正的節點。每個被排程到該節點的 Pod，都會經由 Apple 原生的 **Virtualization.framework** 啟動成一個獨立的 Linux micro-VM。最終達成：強隔離、秒級啟動、低功耗，並完全釋放統一記憶體頻寬，且不必背負 Docker Desktop 那套巨型 Linux VM。
 
-> **定位：** MacVz **不是**一個新的控制平面，而是一個**節點層 (node-layer)** 專案。你自備（或自行架設）一套正常的 Kubernetes 叢集；MacVz 負責讓 Apple Silicon 主機可被當成節點使用。所有價值都集中在「運行時整合」與「跨主機網路」這兩塊——也正是目前生態系尚未提供的部分。
+MacVz 提供兩條整合路線：
+
+- **主要（策略）方向 —— k3s 相容 CRI 節點。** Mac 上跑一個真正的 kubelet（**k3s** agent），以 `macvz-cri` 作為其 **CRI runtime**；每個 Pod 透過 **Apple Containerization** 啟動成一個 **LinuxPod** micro-VM。這是專案正在邁進的方向。它已在測試主機上以 in-loop k3s kubelet 對真實 micro-VM 做過端到端驗證，仍在朝正式可用（GA）強化中。
+- **次要（相容）方向 —— Virtual Kubelet 供應器。** `macvz-kubelet` 透過 [Virtual Kubelet](https://github.com/virtual-kubelet/virtual-kubelet) 把 Mac 呈現為節點（macOS 上不跑真正的 kubelet/CRI），以 [`apple/container`](https://github.com/apple/container) 啟動 Pod 成 micro-VM。它是目前較成熟、已簽章／notarize 的路徑，並持續完整支援。
+
+> **定位：** MacVz **不是**一個新的控制平面，而是一個**節點層 (node-layer)** 專案。你自備（或自行架設）一套正常的 Kubernetes／k3s 叢集；MacVz 負責讓 Apple Silicon 主機可被當成節點使用。所有價值都集中在「運行時整合」與「跨主機網路」這兩塊——也正是目前生態系尚未提供的部分。
 
 ---
 
 ## 1. 核心設計原則
 
-- **站在 Kubernetes 之上，而非取代它。** 透過 Virtual Kubelet 直接繼承 `kubectl`、調度器、宣告式 API、Service、RBAC 與整個生態系。不自建控制平面，Mac 上也不需營運 etcd。
+- **站在 Kubernetes 之上，而非取代它。** 直接繼承 `kubectl`、調度器、宣告式 API、Service、RBAC 與整個生態系——主路線透過真正的 kubelet/CRI，相容路線透過 Virtual Kubelet。不自建控制平面，Mac 上也不需營運 etcd。
 - **Micro-VM 隔離。** 一 Pod = 一個獨立、極簡的 Linux micro-VM，工作負載之間不共享 guest kernel。
-- **善用 Apple 的運行時。** 直接採用 `apple/container` 處理映像拉取、guest kernel、RootFS 與 VM 內 init shim，不重複實作最困難的底層虛擬化工程。
-- **Go 原生黏合層。** Provider、runtime driver 與網路層皆以 Go 撰寫；唯一的非 Go 依賴是 Apple 的運行時，透過其 CLI／服務 API 驅動。
+- **善用 Apple 的運行時。** 採用 Apple Containerization（LinuxPod backend）／ `apple/container` 處理映像拉取、guest kernel、RootFS 與 VM 內 init shim，不重複實作最困難的底層虛擬化工程。
+- **Go 原生黏合層。** CRI 轉接器、Virtual Kubelet provider、runtime driver 與網路層皆以 Go 撰寫；唯一的非 Go 依賴是 Apple 的運行時（透過其 CLI／服務 API，或 LinuxPod helper 協定驅動）。
 - **扁平化跨主機網路。** 以 WireGuard 網格提供跨 Mac 的 Pod 之間直接、加密的 L3 連通性。
 
 ---
 
 ## 2. 系統架構
 
+### 主路線 —— k3s 相容 CRI 節點
+
 ```
         ┌────────────────────────────────────────────┐
-        │           標準 Kubernetes 控制平面            │
+        │         標準 k3s／Kubernetes 伺服器           │
         │  (api-server / scheduler / etcd — 單台主機)  │   ← 由你架設，原封不動
         └───────────────┬──────────────────────────────┘
-                        │ kubelet API (Virtual Kubelet)
+                        │ k3s agent ↔ server
       ┌─────────────────┼──────────────────────┐
       ▼                 ▼                       ▼
 ┌───────────┐    ┌───────────┐           ┌───────────┐
-│ Mac mini  │    │ Mac mini  │   ...     │ Mac mini  │   ← 每台 = 一個虛擬節點
-│ macvz-    │    │ macvz-    │           │ macvz-    │
-│ kubelet   │    │ kubelet   │           │ kubelet   │
-│  ├ provider (Virtual Kubelet)          │           │
-│  ├ runtime  (apple/container 驅動)      │           │
-│  └ network  (WireGuard 網格)            │           │
+│ Mac mini  │    │ Mac mini  │   ...     │ Mac mini  │   ← 每台 = 一個真正的 k3s 節點
+│ kubelet   │    │ kubelet   │           │ kubelet   │   (k3s agent)
+│   │ CRI    │    │   │ CRI    │           │   │ CRI    │
+│   ▼        │    │   ▼        │           │   ▼        │
+│ macvz-cri  │    │ macvz-cri  │           │ macvz-cri  │   ← CRI runtime（LinuxPod backend）
+│  └ LinuxPod helper（Apple Containerization）           │
 │   micro-VM  micro-VM  micro-VM          │  micro-VM │
 └───────────┘    └───────────┘           └───────────┘
         └──────── WireGuard 加密網格 ────────────────┘
 ```
 
+### 次路線 —— Virtual Kubelet 供應器（相容）
+
+```
+   標準 Kubernetes 控制平面
+        │ kubelet API (Virtual Kubelet)
+        ▼
+   macvz-kubelet  ├ provider (Virtual Kubelet)
+                  ├ runtime  (apple/container 驅動)
+                  └ network  (WireGuard 網格)
+```
+
 ### 你「不需要」自己做的部分
 
-- **Kubernetes 控制平面** —— 採用任何標準發行版即可（單節點 `k3s`、`k0s`，或完整 `kubeadm` 叢集皆可）。etcd、調度器與 API server 全部原樣沿用，且可集中跑在一台機器上（Mac 或 Linux 皆可）。
+- **Kubernetes 控制平面** —— 採用任何標準發行版即可（單節點 `k3s`、`k0s`，或完整 `kubeadm` 叢集皆可）。etcd、調度器與 API server 全部原樣沿用，且可集中跑在一台機器上（Mac 或 Linux 皆可）。在主路線上，Mac 以一個正常的 **k3s agent** 節點身分加入。
 
-### MacVz 提供的部分（`macvz-kubelet`，每台 Mac 常駐一個行程）
+### MacVz 提供的部分
 
-- **Provider（Virtual Kubelet）** —— 將 Mac 註冊為節點，向調度器回報 CPU/RAM 容量，並實作 Pod 生命週期：`CreatePod`、`UpdatePod`、`DeletePod`、`GetPod(s)`、`GetPodStatus`，以及 `GetContainerLogs`、`RunInContainer`（exec）與 metrics。
-- **Runtime 驅動層** —— 將 Kubernetes Pod spec 翻譯成 `apple/container` 操作（拉取 OCI 映像 → 啟動 micro-VM → 設定 env／command／掛載 → 串流日誌）。這是核心黏合層。
-- **網路層** —— 為每個 Pod 分配叢集 IP，並透過 WireGuard 網格讓跨 Mac 的 Pod 直接互通；同時把 Pod IP 回報給 Kubernetes，讓 Service／Endpoints 正常運作。
+**主路線 —— `macvz-cri`（CRI runtime，每台 Mac 一個），由節點上真正的 kubelet 驅動：**
+
+- **CRI RuntimeService／ImageService** —— 實作 kubelet CRI 契約：Pod sandbox 生命週期、容器 create/start/stop/remove/status、映像 pull/list/status/remove、logs、exec、attach、port-forward 與 stats。
+- **LinuxPod backend** —— 透過 Apple Containerization 把每個 Pod 啟動成一個 LinuxPod micro-VM（映像 staging、guest kernel、RootFS、late-rootfs 身分 handoff、共享 Pod namespace）；apple/container CRI backend 保留作為替代。
+- **網路層** —— 把每個 Pod sandbox 接上 MacVz Pod 網路（Pod IPAM + WireGuard 網格），讓跨 Mac 的 Pod 與 ClusterIP Service 正常運作，同時不動到主機預設路由。
+
+**次路線 —— `macvz-kubelet`（Virtual Kubelet 供應器，每台 Mac 一個）：**
+
+- **Provider（Virtual Kubelet）** —— 將 Mac 註冊為節點，回報 CPU/RAM 容量，並實作 Pod 生命週期（`CreatePod`／`UpdatePod`／`DeletePod`／`GetPod(s)`／`GetPodStatus`、`GetContainerLogs`、`RunInContainer`、metrics）。
+- **Runtime 驅動層** —— 將 Pod spec 翻譯成 `apple/container` 操作（拉取 → 啟動 micro-VM → env／command／掛載 → 日誌）。
+- **網路層** —— Pod IPAM + WireGuard 網格 + Pod IP 回報，讓 Service／Endpoints 正常運作。
 
 ---
 
@@ -58,15 +84,17 @@
 
 | 分層 | 採用技術 / 開源庫 | 說明 |
 | --- | --- | --- |
-| 核心語言 | Go (Golang) | Provider、runtime 驅動與網路層；與 `client-go` 整合順暢。 |
-| 節點整合 | `virtual-kubelet/virtual-kubelet` | 無須在 macOS 上跑真正的 kubelet/CRI，即可把 Mac 呈現為 Kubernetes 節點。 |
-| 容器運行時 | [`apple/container`](https://github.com/apple/container) | Apache-2.0 的 Apple 運行時：OCI 映像拉取、guest kernel、RootFS、VM 內 init (`vminitd`)、Apple Silicon 上秒級 micro-VM 啟動。 |
-| macOS 虛擬化 | Virtualization.framework（經由 `apple/container`） | Apple Silicon 原生 hypervisor，不依賴第三方 VMM。 |
-| Kubernetes 客戶端 | `k8s.io/client-go` | 與 API server 溝通、watch Pod、回報 node/Pod 狀態。 |
+| 核心語言 | Go (Golang) | CRI 轉接器、Virtual Kubelet provider、runtime 驅動與網路層；與 `client-go` 整合順暢。 |
+| 節點整合（主） | k3s agent kubelet + CRI（`macvz-cri`） | Mac 是真正的 k3s 節點；`macvz-cri` 實作 kubelet CRI 契約。 |
+| Pod 運行時（主） | LinuxPod backend（經由 Apple Containerization） | 把每個 Pod 啟動成一個 LinuxPod micro-VM（映像 staging、guest kernel、RootFS、共享 Pod namespace、late-rootfs 身分 handoff）。 |
+| 節點整合（次） | `virtual-kubelet/virtual-kubelet` | 無須在 macOS 上跑真正的 kubelet/CRI，即可把 Mac 呈現為 Kubernetes 節點。 |
+| 容器運行時（次） | [`apple/container`](https://github.com/apple/container) | Apache-2.0 的 Apple 運行時：OCI 映像拉取、guest kernel、RootFS、VM 內 init (`vminitd`)、Apple Silicon 上秒級 micro-VM 啟動。 |
+| macOS 虛擬化 | Virtualization.framework（經由 Apple Containerization／`apple/container`） | Apple Silicon 原生 hypervisor，不依賴第三方 VMM。 |
+| Kubernetes 客戶端 / CRI | `k8s.io/client-go`, `k8s.io/cri-api` | 與 API server 溝通、watch Pod、回報 node/Pod 狀態，並實作 CRI RuntimeService/ImageService。 |
 | 跨主機網路 | WireGuard（Go 原生實現） | 加密 P2P 網格，提供跨 Mac 的 Pod 扁平化 L3 連通性（CNI 對應層）。 |
 | 組態解析 | go-yaml | Provider／節點組態。 |
 
-> **參考專案：** [`agoda-com/macOS-vz-kubelet`](https://github.com/agoda-com/macOS-vz-kubelet) 是 macOS 上 Virtual Kubelet 路線最接近的前行者。[`abiosoft/colima`](https://github.com/abiosoft/colima) 在 CLI/UX 設計，以及「Go 程式如何驅動 Apple `vz` 後端」上具參考價值——但**不要**參考它的 Kubernetes 模型（它是在單一大型 VM 內跑 k3s，與本設計理念完全相反）。
+> **參考專案：** [`agoda-com/macOS-vz-kubelet`](https://github.com/agoda-com/macOS-vz-kubelet) 是 macOS 上 Virtual Kubelet 路線最接近的前行者。[`abiosoft/colima`](https://github.com/abiosoft/colima) 在 CLI/UX 設計，以及「Go 程式如何驅動 Apple `vz` 後端」上具參考價值——但**不要**參考它的 Kubernetes 模型（它在單一大型 VM 內跑 k3s；MacVz 則是讓 Mac 成為真正的 k3s 節點，並為每個 Pod 跑一個 micro-VM）。
 
 ---
 
@@ -75,14 +103,19 @@
 ```
 macvz/
 ├── cmd/
-│   └── macvz-kubelet/        # Virtual Kubelet provider 主程式（每台 Mac 一個）
+│   ├── macvz-cri/            # CRI runtime 轉接器主程式 —— 主路線（每台 Mac 一個）
+│   │   └── main.go
+│   └── macvz-kubelet/        # Virtual Kubelet provider 主程式 —— 次／相容路線
 │       └── main.go
 ├── pkg/
-│   ├── provider/             # Virtual Kubelet PodLifecycleHandler 實作
+│   ├── criserver/            # CRI RuntimeService/ImageService 轉接器 + store
 │   ├── runtime/              # apple/container 整合（CLI／服務 API 驅動）
+│   │   └── linuxpod/         # LinuxPod backend（Apple Containerization helper 協定）
+│   ├── provider/             # Virtual Kubelet PodLifecycleHandler 實作
 │   ├── network/              # WireGuard 網格 + Pod IPAM + IP 回報
 │   ├── config/               # YAML 組態解析
 │   └── metrics/              # 向 Kubernetes 回報 node 與 pod 資源
+├── test/e2e/cri-k3s/         # k3s in-loop／soak／conformance-smoke 測試框架
 ├── deployments/              # 範例 k8s manifest、RBAC、節點啟動腳本
 ├── go.mod
 └── README.md
@@ -90,20 +123,36 @@ macvz/
 
 ---
 
-### 實驗性路線（非正式出貨的 runtime）
+### 主路線 —— k3s 相容 CRI 節點（`macvz-cri`）
 
-另有一個獨立的**實驗性 CRI 可行性轉接器**（`cmd/macvz-cri`），用來探索讓 Mac 直接以
-kubelet/CRI 節點的形式運作。它**不是**上述的 MacVz 產品介面——正式出貨路線仍是 Virtual
-Kubelet provider（`macvz-kubelet`）。該轉接器的 LinuxPod **runtime-handoff** 路徑
-**預設關閉**，需以 `macvz-cri --experimental-handoff` 明確開啟，屬實驗性質、尚未達生產可用。
-功能開關、支援／不支援的行為，以及操作者的安裝／執行／清理流程，詳見
-[docs/CRI_EXPERIMENTAL_HANDOFF_OPERATOR.md](docs/CRI_EXPERIMENTAL_HANDOFF_OPERATOR.md)。
+`macvz-cri` 是 Mac 上真正的 kubelet（k3s agent）所對接的 **CRI runtime**。每個 Pod 透過
+Apple Containerization 啟動成一個 **LinuxPod** micro-VM。LinuxPod backend 為主 backend，以
+`macvz-cri --experimental-linuxpod-backend` 啟用（apple/container CRI backend 為替代）。旗標
+仍帶 `experimental-` 前綴，反映此路線仍在朝正式可用（GA）強化中——它已在專案測試主機上以
+in-loop k3s kubelet 對真實 micro-VM 做過端到端驗證，但**尚未**在生產用途上取代已簽章／notarize
+的 Virtual Kubelet 路線。
+
+- LinuxPod-backed CRI：見 [docs/CRI_LINUXPOD_FEASIBILITY.md](docs/CRI_LINUXPOD_FEASIBILITY.md) 與 [docs/](docs/) 下的 CRI-L 系列報告。
+- k3s in-loop／soak／conformance-smoke 測試框架：[test/e2e/cri-k3s/](test/e2e/cri-k3s/)。
+- runtime-handoff 操作指南（功能開關、支援／不支援行為、安裝／執行／清理）：[docs/CRI_EXPERIMENTAL_HANDOFF_OPERATOR.md](docs/CRI_EXPERIMENTAL_HANDOFF_OPERATOR.md)。
 
 ---
 
 ## 5. 漸進式開發階段規劃
 
-> **設計心法：** 先在單台 Mac 上把 runtime 層玩通，再讓它成為 Kubernetes 節點，最後串起跨機網路。
+> **設計心法：** 先在單台 Mac 上把 runtime 層玩通，再讓它成為 Kubernetes 節點，最後串起跨機網路。同一套 runtime 層同時供應兩條整合路線。
+
+### 主軌 —— k3s 相容 CRI 節點（`macvz-cri`，進行中）
+
+**目標：** Mac 是一個真正的 k3s 節點，其 kubelet 驅動 `macvz-cri`，把每個 Pod 啟動成一個 LinuxPod micro-VM，並讓常見 k3s 工作負載（Deployment、Service、DNS、ConfigMap／Secret、volume、probe）原樣運作。
+
+- **CRI-P0…P9（已完成）：** 把 `apple/container`／MacVz 介面對映到 CRI；sandbox／container／image／networking／streaming／stats 介面；volumes／probes／重啟復原；k3s 相容、安裝、清理、soak；以及路線決策（**已修訂為 GO，作為主要方向**）。
+- **CRI-L1…L8（進行中）：** **LinuxPod backend** —— 真正的 Apple Containerization helper，為每個 Pod 啟動一個 LinuxPod micro-VM、late-rootfs 身分 handoff、Pod 網路、logs/exec/stats、kubelet/k3s in-loop 驗證、重啟後的復原／adoption，以及 k3s 相容性強化（DNS/Service、volume projection、image 生命週期、節點重開復原、conformance smoke、長時間 soak）。
+- **驗收：** 真正的 kubelet/k3s 端到端驅動 LinuxPod backend（`simulated=false`）跑在真實 micro-VM 上 —— Deployment Available、Pod IP + ClusterIP Service 可達、`kubectl logs`／`exec`／`port-forward`、清理後零殘留狀態，且主機預設路由保持不變。
+
+### 次軌 —— Virtual Kubelet 供應器（已完成至 P4）
+
+> 原本「單機 → provider → 跨主機」的演進路徑，奠定了共用的 runtime、provider 與網路層。已完成至 P4（簽章／notarize、多節點 e2e）；保留作為相容路線。
 
 ### 階段一：Runtime 整合（單機，先不接 Kubernetes）
 
@@ -140,9 +189,9 @@ Kubelet provider（`macvz-kubelet`）。該轉接器的 LinuxPod **runtime-hando
 - **`apple/container` 是硬依賴**（Apache-2.0，pre-1.0）。1.0 前 API 可能變動；請鎖定版本，並把所有呼叫隔離在 `pkg/runtime` 內。
 - **密度受限於 RAM，而非容器式的 kernel 共享。** 每個 micro-VM 自帶 kernel 與固定記憶體下限。請在階段一就驗證單機實際的並發 VM 上限與每 VM 開銷——這決定專案的實用容量。
 - **映像架構。** Guest 為 arm64。拉取 amd64 映像需使用 arm64 variant 或 Rosetta-for-Linux 支援；應向使用者明確說明。
-- **安全。** `macvz-kubelet` ↔ API server 的通道必須使用叢集既有的 mTLS/RBAC。不要對外公開 runtime 服務或節點埠口。映像倉庫憑證與任何機密均來自 Kubernetes Secrets／環境變數，絕不硬編碼。
+- **安全。** 節點 ↔ API server 的通道（CRI 主路線上的 `k3s` kubelet、Virtual Kubelet 相容路線上的 `macvz-kubelet`）必須使用叢集既有的 mTLS/RBAC。不要對外公開 runtime／helper socket 或節點埠口。映像倉庫憑證與任何機密均來自 Kubernetes Secrets／環境變數，絕不硬編碼。
 - **Pod `securityContext` 模型。** 每個 Pod 都是獨立 micro-VM（自己的 kernel、硬體隔離），邊界比共享 kernel 的容器更強。MacVz 會把 runtime 能強制執行的欄位映射到 `apple/container`（`runAsUser`／`runAsGroup` → `--user`、`readOnlyRootFilesystem` → `--read-only`、`capabilities` → `--cap-add`／`--cap-drop`），接受已由 VM 邊界滿足的欄位（例如 `allowPrivilegeEscalation`、`seccomp`／`appArmor` 的 `RuntimeDefault`、`fsGroup`），並對無法履行的欄位回報終止性的 `Failed` 狀態，而不是靜默略過（`privileged: true`、`seLinuxOptions`、`Localhost` seccomp／appArmor、`procMount`、`sysctls`）。`runAsNonRoot` 只有搭配 `runAsUser` 時才會被明確驗證。完整表格見 [docs/WORKLOADS.md](docs/WORKLOADS.md#securitycontext-52)。
-- **特權網路需要 root 工具，但 kubelet 以你的使用者身分執行。** 跨 Mac 資料平面（WireGuard 網格 + pf／route／sysctl）需要 root，但 `apple/container` 拒絕以 root 執行——因此 `macvz-kubelet` 以使用者身分執行，並透過 unix socket 將特權命令委派給 `macvz-netd` 輔助常駐程式。輔助程式只需用 `sudo` 安裝一次；日常啟動 kubelet 不需提權。完整的安裝與復原手冊見 [docs/PRIVILEGED_NETWORKING.md](docs/PRIVILEGED_NETWORKING.md)。
+- **特權網路需要 root 工具，但 runtime 路徑以你的使用者身分執行。** 跨 Mac 資料平面（WireGuard 網格 + pf／route／sysctl）需要 root，但 Apple runtime 拒絕以 root 執行——因此 `macvz-cri`／`macvz-kubelet` 以使用者身分執行，並透過 unix socket 將特權命令委派給 `macvz-netd` 輔助常駐程式。輔助程式只需用 `sudo` 安裝一次；日常啟動節點不需提權。完整的安裝與復原手冊見 [docs/PRIVILEGED_NETWORKING.md](docs/PRIVILEGED_NETWORKING.md)。
 - **營運多節點叢集。** 將一台 Mac 節點加入、驗證、drain、移除、升級、排錯與清理，統整為單一生命週期手冊：[docs/MULTI_NODE_OPS.md](docs/MULTI_NODE_OPS.md)。這份文件是操作順序索引，把節點加入、WireGuard 網格、特權網路復原程序，以及即時 `/healthz/diagnostics` 健康報告串接在一起。
 - **Kubernetes 管理 UI。** MacVz 可執行管理介面：[Headlamp](https://headlamp.dev) 以單一 arm64 容器部署，使用 projected ServiceAccount token 與叢集內 ClusterIP 路由，並透過 `kubectl port-forward` 從瀏覽器存取（虛擬節點沒有 kube-proxy，因此不使用 NodePort／LoadBalancer）。評估、相容性分析與 RBAC 限權 fixture 見 [docs/MANAGEMENT_UI.md](docs/MANAGEMENT_UI.md)（fixture：[test/e2e/headlamp-ui/](test/e2e/headlamp-ui/)）。
 - **長時間可靠性驗收。** P9 soak 測試會循環執行多節點 e2e 與真實應用 fixture，同時重啟 kubelet／helper、對節點做 cordon／uncordon churn、檢查 orphan cleanup，並取樣資源使用。入口是 `make soak` / [test/e2e/soak/run.sh](test/e2e/soak/run.sh)；設定與報告格式見 [docs/SOAK_TESTS.md](docs/SOAK_TESTS.md)。

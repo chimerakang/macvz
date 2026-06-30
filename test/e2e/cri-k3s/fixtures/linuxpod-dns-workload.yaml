@@ -1,0 +1,165 @@
+# CRI-L8-2 (#142) LinuxPod k3s DNS + Service discovery fixture.
+#
+# A two-container app+late-sidecar Pod (the LinuxPod backend's shared-namespace
+# shape, like fixtures/linuxpod-workload.yaml) scheduled by a real Linux
+# k3s/kubelet control plane onto a macOS MacVz CRI node running
+# `macvz-cri --experimental-linuxpod-backend` (CRI-L, #125..#129).
+#
+# Where linuxpod-workload.yaml proves the Pod lifecycle, shared namespace, and
+# *manually probed* ClusterIP reachability, THIS fixture proves the normal k3s
+# DNS path works from inside a LinuxPod-backed Pod: CoreDNS reachability,
+# `*.svc` / `*.svc.cluster.local` resolution, a headless Service returning Pod
+# A records, and same-namespace vs other-namespace lookups — not just a hard
+# coded ClusterIP curl.
+#
+# linuxpod-dns.sh drives the DNS assertions by `kubectl exec`-ing nslookup/wget
+# inside the app container, so DNS failures are distinguished from Pod
+# networking or Service routing failures. The same honesty gate as
+# linuxpod-inloop.sh applies: the LinuxPod-specific framing only holds when a
+# backend-evidence hook proves the Pod is genuinely (non-simulated) LinuxPod
+# backed; otherwise the DNS checks still run but are reported against the
+# apple/container path.
+#
+# Objects:
+#   - app:      httpd serving the projected ConfigMap marker on :8080. It is the
+#               exec target for the DNS probes and a real Service backend.
+#   - sidecar:  declared after the app (ordinary late-container order). At boot
+#               it resolves its own ClusterIP Service by name via nslookup and
+#               records a proof file into the shared emptyDir — boot-time DNS
+#               evidence to complement the exec-time probes.
+#   - linuxpod-dns          ClusterIP Service (for `*.svc` resolution).
+#   - linuxpod-dns-headless headless Service (clusterIP: None) for Pod A records.
+#
+# Other-namespace lookups reuse the always-present `kubernetes.default.svc` and
+# `kube-dns.kube-system.svc` so the fixture stays lean (no second app to deploy).
+#
+# #84 scheduling-exclusion opt-in is unchanged: select the MacVz runtime label
+# and tolerate the host-namespace taint. Keys mirror pkg/criserver/nodescheme.go.
+#
+# Image: an arm64 busybox providing sh + httpd + wget + an nslookup applet. NOTE
+# the stock busybox image ships the nslookup applet in the binary but does NOT
+# symlink `/bin/nslookup`, so probes invoke `busybox nslookup` when the bare
+# command is absent (linuxpod-dns.sh and the sidecar both fall back). linuxpod-dns.sh
+# substitutes MACVZ_CRI_IMAGE at apply time.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: macvz-cri-linuxpod-dns-e2e
+  labels:
+    app.kubernetes.io/part-of: macvz-cri-linuxpod-dns
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dns-app-config
+  namespace: macvz-cri-linuxpod-dns-e2e
+data:
+  index.html: |
+    macvz-cri-l8-dns-ok
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: linuxpod-dns
+  namespace: macvz-cri-linuxpod-dns-e2e
+  labels:
+    app: linuxpod-dns
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: linuxpod-dns
+  template:
+    metadata:
+      labels:
+        app: linuxpod-dns
+    spec:
+      nodeSelector:
+        node.macvz.io/runtime: apple-container
+      tolerations:
+        - key: node.macvz.io/host-namespace-unsupported
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      containers:
+        - name: app
+          image: busybox:1.36.1
+          command:
+            - sh
+            - -c
+            - >-
+              echo macvz-cri-l8-dns-app-boot;
+              httpd -f -p 8080 -h /www
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /index.html
+              port: 8080
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            failureThreshold: 12
+          volumeMounts:
+            - name: web
+              mountPath: /www
+              readOnly: true
+            - name: shared
+              mountPath: /shared
+        - name: sidecar
+          image: busybox:1.36.1
+          # Boot-time DNS self-check: resolve our own ClusterIP Service by its
+          # `*.svc` name through the cluster DNS, and record proof into the
+          # shared emptyDir (readable from either container). This is the
+          # boot-time complement to linuxpod-dns.sh's exec-time DNS probes.
+          command:
+            - sh
+            - -c
+            - >-
+              for i in $(seq 1 60); do
+                if (command -v nslookup >/dev/null 2>&1 && nslookup linuxpod-dns.macvz-cri-linuxpod-dns-e2e.svc.cluster.local || busybox nslookup linuxpod-dns.macvz-cri-linuxpod-dns-e2e.svc.cluster.local) 2>/dev/null | grep -q 'Address'; then
+                  echo macvz-cri-l8-dns-sidecar-resolve-ok > /shared/sidecar-dns;
+                  echo macvz-cri-l8-dns-sidecar-boot;
+                  break;
+                fi;
+                sleep 1;
+              done;
+              tail -f /dev/null
+          volumeMounts:
+            - name: shared
+              mountPath: /shared
+      volumes:
+        - name: web
+          configMap:
+            name: dns-app-config
+        - name: shared
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: linuxpod-dns
+  namespace: macvz-cri-linuxpod-dns-e2e
+spec:
+  type: ClusterIP
+  selector:
+    app: linuxpod-dns
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: linuxpod-dns-headless
+  namespace: macvz-cri-linuxpod-dns-e2e
+spec:
+  clusterIP: None
+  selector:
+    app: linuxpod-dns
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080

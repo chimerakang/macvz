@@ -47,6 +47,20 @@ func lpRunSandbox(t *testing.T, svc *LinuxPodService) string {
 	return resp.GetPodSandboxId()
 }
 
+func lpRunSandboxWithDNS(t *testing.T, svc *LinuxPodService, dns *runtimeapi.DNSConfig) string {
+	t.Helper()
+	resp, err := svc.RunPodSandbox(context.Background(), &runtimeapi.RunPodSandboxRequest{
+		Config: &runtimeapi.PodSandboxConfig{
+			Metadata:  &runtimeapi.PodSandboxMetadata{Name: "pod", Namespace: "default", Uid: "uid-1"},
+			DnsConfig: dns,
+		},
+	})
+	if err != nil {
+		t.Fatalf("RunPodSandbox: %v", err)
+	}
+	return resp.GetPodSandboxId()
+}
+
 func lpCreateStart(t *testing.T, svc *LinuxPodService, sandboxID, name string) string {
 	t.Helper()
 	ctx := context.Background()
@@ -127,6 +141,32 @@ func TestLinuxPodServiceKubeletOrdering(t *testing.T) {
 	if sbStatus.GetInfo()["sandboxNamespace"] != appInfo["sandboxNamespace"] {
 		t.Errorf("sandbox namespace mismatch: status=%q container=%q",
 			sbStatus.GetInfo()["sandboxNamespace"], appInfo["sandboxNamespace"])
+	}
+}
+
+func TestLinuxPodServicePassesSandboxDNSToRootfsPrepare(t *testing.T) {
+	backend := linuxpod.NewFakeBackend()
+	svc := newLinuxPodTestService(t, backend)
+
+	sandboxID := lpRunSandboxWithDNS(t, svc, &runtimeapi.DNSConfig{
+		Servers:  []string{"10.96.0.10"},
+		Searches: []string{"default.svc.cluster.local", "svc.cluster.local", "cluster.local"},
+		Options:  []string{"ndots:5"},
+	})
+	_ = lpCreateStart(t, svc, sandboxID, "app")
+
+	got, ok := backend.RootfsDNS(sandboxID, "app")
+	if !ok {
+		t.Fatalf("RootfsDNS(app) not recorded")
+	}
+	if strings.Join(got.Servers, ",") != "10.96.0.10" {
+		t.Errorf("DNS servers = %v", got.Servers)
+	}
+	if strings.Join(got.Searches, ",") != "default.svc.cluster.local,svc.cluster.local,cluster.local" {
+		t.Errorf("DNS searches = %v", got.Searches)
+	}
+	if strings.Join(got.Options, ",") != "ndots:5" {
+		t.Errorf("DNS options = %v", got.Options)
 	}
 }
 

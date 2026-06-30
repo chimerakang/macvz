@@ -316,10 +316,22 @@ type RootfsRequest struct {
 	PodID         string `json:"podID"`
 	ContainerName string `json:"containerName"`
 	Image         string `json:"image"`
+	// DNS is the kubelet-provided per-sandbox DNS configuration to materialize in
+	// the prepared rootfs (typically /etc/resolv.conf) before the late container is
+	// created. Empty means leave the image/default resolver unchanged.
+	DNS DNSConfig `json:"dns,omitempty"`
 	// ExpectedIdentity is the rootfs identity the late process must report back to
 	// pass StartContainer verification (CRI-R16). It is staged into the prepared
 	// rootfs at this step and is the single source of truth for verification.
 	ExpectedIdentity string `json:"expectedIdentity"`
+}
+
+// DNSConfig is the subset of CRI DNSConfig the helper needs to render a
+// resolv.conf inside the prepared LinuxPod rootfs (CRI-L8-2, #142).
+type DNSConfig struct {
+	Servers  []string `json:"servers,omitempty"`
+	Searches []string `json:"searches,omitempty"`
+	Options  []string `json:"options,omitempty"`
 }
 
 // RootfsHandle is the result of PrepareContainerRootfs.
@@ -500,4 +512,6 @@ type CleanupReport struct {
 // follow-up #131) and ExecStream (CRI-L4 follow-up #132). v6 added the adoption op
 // + capability (Adopt) and HelperInfo.Adoption so a restarted helper can either
 // reattach to existing Pod VM state or report an immediate recreate fallback (#138).
-const ProtocolVersion = 6
+// v7 added RootfsRequest.DNS so the helper can materialize kubelet's sandbox DNS
+// config into LinuxPod prepared rootfs files (#142).
+const ProtocolVersion = 7

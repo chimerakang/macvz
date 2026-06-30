@@ -85,6 +85,7 @@ type fakeRootfs struct {
 	podID            string
 	name             string
 	image            string
+	dns              DNSConfig
 	expectedIdentity string
 	path             string
 	bound            bool // a container has been created against this token
@@ -318,6 +319,7 @@ func (f *FakeBackend) PrepareContainerRootfs(_ context.Context, req RootfsReques
 		podID:            req.PodID,
 		name:             req.ContainerName,
 		image:            req.Image,
+		dns:              cloneDNSConfig(req.DNS),
 		expectedIdentity: req.ExpectedIdentity,
 		path:             "/run/macvz/containers/" + token + "/rootfs",
 	}
@@ -615,6 +617,28 @@ func (f *FakeBackend) ContainerMounts(podID, name string) ([]Mount, bool) {
 		}
 	}
 	return nil, false
+}
+
+// RootfsDNS returns the DNS config recorded at PrepareContainerRootfs for the
+// named container. It exists so CRI service tests can assert kubelet sandbox DNS
+// reached the LinuxPod backend before the helper writes /etc/resolv.conf.
+func (f *FakeBackend) RootfsDNS(podID, name string) (DNSConfig, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, rf := range f.rootfs {
+		if rf.podID == podID && rf.name == name {
+			return cloneDNSConfig(rf.dns), true
+		}
+	}
+	return DNSConfig{}, false
+}
+
+func cloneDNSConfig(in DNSConfig) DNSConfig {
+	return DNSConfig{
+		Servers:  append([]string(nil), in.Servers...),
+		Searches: append([]string(nil), in.Searches...),
+		Options:  append([]string(nil), in.Options...),
+	}
 }
 
 // lookupLocked resolves a ref to its pod and container. Caller holds mu.

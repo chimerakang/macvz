@@ -14,7 +14,7 @@ import Logging
 
 // helperProtocolVersion is the NDJSON wire-protocol version this helper speaks; it
 // must equal pkg/runtime/linuxpod ProtocolVersion.
-let helperProtocolVersion = 6
+let helperProtocolVersion = 7
 
 // parseEvidenceText extracts the observed identity and net-namespace inode the late
 // process wrote into the handoff evidence channel. Free (nonisolated) so the
@@ -79,6 +79,14 @@ final class RootfsState {
         self.hostPreparedRootfs = hostPreparedRootfs
         self.hostEvidenceDir = hostEvidenceDir
     }
+}
+
+struct DNSState: Sendable {
+    let servers: [String]
+    let searches: [String]
+    let options: [String]
+
+    var isEmpty: Bool { servers.isEmpty && searches.isEmpty && options.isEmpty }
 }
 
 final class ContainerState {
@@ -449,6 +457,7 @@ actor LinuxPodBackend {
 
         try await stagePreparedRootfs(
             pod: pod, expectedIdentity: expected,
+            dns: parseDNSConfig(p["dns"]),
             hostPreparedRootfs: hostPreparedRootfs, hostEvidenceDir: hostEvidenceDir,
             guestRootfsPath: guestRootfsPath, guestEvidencePath: guestEvidencePath)
 
@@ -466,6 +475,7 @@ actor LinuxPodBackend {
     // evidence directory into the running Pod VM via the R9 Copy primitive.
     private func stagePreparedRootfs(
         pod: PodState, expectedIdentity: String,
+        dns: DNSState,
         hostPreparedRootfs: URL, hostEvidenceDir: URL,
         guestRootfsPath: String, guestEvidencePath: String
     ) async throws {
@@ -506,6 +516,10 @@ actor LinuxPodBackend {
         }
         try "\(expectedIdentity)\n".write(
             to: etcDir.appendingPathComponent("macvz-container-identity"), atomically: true, encoding: .utf8)
+        if !dns.isEmpty {
+            try renderResolvConf(dns).write(
+                to: etcDir.appendingPathComponent("resolv.conf"), atomically: true, encoding: .utf8)
+        }
 
         try fm.createDirectory(at: hostEvidenceDir, withIntermediateDirectories: true)
         try fm.setAttributes([.posixPermissions: 0o777], ofItemAtPath: hostEvidenceDir.path)
@@ -522,9 +536,40 @@ actor LinuxPodBackend {
                 vm: vm, vminitd: vminitd, source: hostEvidenceDir, guestPath: guestEvidencePath)
             _ = try await vminitd.stat(path: URL(fileURLWithPath: "\(guestRootfsPath)/bin/sh"))
             _ = try await vminitd.stat(path: URL(fileURLWithPath: "\(guestRootfsPath)/etc/macvz-container-identity"))
+            if !dns.isEmpty {
+                _ = try await vminitd.stat(path: URL(fileURLWithPath: "\(guestRootfsPath)/etc/resolv.conf"))
+            }
             try await vminitd.sync()
             try? await vminitd.close()
         }
+    }
+
+    private func parseDNSConfig(_ raw: Any?) -> DNSState {
+        guard let p = raw as? [String: Any] else {
+            return DNSState(servers: [], searches: [], options: [])
+        }
+        return DNSState(
+            servers: stringArray(p["servers"]),
+            searches: stringArray(p["searches"]),
+            options: stringArray(p["options"]))
+    }
+
+    private func stringArray(_ raw: Any?) -> [String] {
+        (raw as? [Any] ?? []).compactMap { $0 as? String }.filter { !$0.isEmpty }
+    }
+
+    private func renderResolvConf(_ dns: DNSState) -> String {
+        var lines: [String] = []
+        for server in dns.servers {
+            lines.append("nameserver \(server)")
+        }
+        if !dns.searches.isEmpty {
+            lines.append("search \(dns.searches.joined(separator: " "))")
+        }
+        if !dns.options.isEmpty {
+            lines.append("options \(dns.options.joined(separator: " "))")
+        }
+        return lines.joined(separator: "\n") + "\n"
     }
 
     // MARK: Container lifecycle

@@ -243,6 +243,11 @@ func (s *LinuxPodService) RunPodSandbox(ctx context.Context, req *runtimeapi.Run
 	sb.Metadata.UID = md.GetUid()
 	sb.Metadata.Namespace = md.GetNamespace()
 	sb.Metadata.Attempt = md.GetAttempt()
+	if dns := cfg.GetDnsConfig(); dns != nil {
+		sb.DNS.Servers = dns.GetServers()
+		sb.DNS.Searches = dns.GetSearches()
+		sb.DNS.Options = dns.GetOptions()
+	}
 	if err := s.sandboxes.Put(sb); err != nil {
 		// The record did not persist, so reclaim the just-created Pod VM.
 		if _, cerr := s.backend.Cleanup(context.WithoutCancel(ctx), id); cerr != nil {
@@ -318,7 +323,8 @@ func (s *LinuxPodService) CreateContainer(ctx context.Context, req *runtimeapi.C
 	}
 
 	rootfs, err := s.backend.PrepareContainerRootfs(ctx, linuxpod.RootfsRequest{
-		PodID: sandboxID, ContainerName: name, Image: image, ExpectedIdentity: expectedIdentity,
+		PodID: sandboxID, ContainerName: name, Image: image,
+		DNS: linuxpodDNSConfig(sb), ExpectedIdentity: expectedIdentity,
 	})
 	if err != nil {
 		return nil, linuxpodToCRIError("CreateContainer: prepare rootfs", err)
@@ -768,6 +774,14 @@ func linuxpodMounts(mounts []types.Mount) []linuxpod.Mount {
 		})
 	}
 	return out
+}
+
+func linuxpodDNSConfig(sb store.Sandbox) linuxpod.DNSConfig {
+	return linuxpod.DNSConfig{
+		Servers:  append([]string(nil), sb.DNS.Servers...),
+		Searches: append([]string(nil), sb.DNS.Searches...),
+		Options:  append([]string(nil), sb.DNS.Options...),
+	}
 }
 
 // ImageFsInfo returns image-filesystem usage. crictl and the kubelet call it

@@ -79,7 +79,7 @@ the helper restart recovered the Pod to Running, the `macvz-netd` reload left th
 default route unchanged, and the run-wide route audit confirmed `192.168.1.1` via
 `en0` before and after. Every DNS *resolution* check was uniformly blocked on a
 single precise finding (below), reported as a loud **blocked-skip**, not a faked
-pass — so the suite flips to hard PASS/FAIL the moment DNS injection lands.
+pass.
 
 The node is a genuine LinuxPod serving path: a **two-container** Pod
 (`dnsPolicy: ClusterFirst`) deployed and reached rollout-available — a shape the
@@ -103,6 +103,23 @@ the LinuxPod backend does not yet plumb it into the guest rootfs. Consequently
 LinuxPod CRI path. This is a **DNS-config-injection gap** (overlapping the #128
 networking surface), *not* a missing DNS record and *not* a CoreDNS outage — the
 exact distinction this task exists to make.
+
+**Implementation update (2026-07-01): DNS injection is now wired.**
+
+- `pkg/criserver/linuxpod_service.go` persists the CRI
+  `PodSandboxConfig.DnsConfig` on the LinuxPod sandbox record and passes it to
+  `PrepareContainerRootfs`.
+- `pkg/runtime/linuxpod.RootfsRequest` now carries `DNSConfig`
+  (`servers`/`searches`/`options`); protocol version is bumped to 7 so the Go
+  adapter and Swift helper negotiate the same wire shape.
+- `linuxpod-helper` renders the kubelet-provided config into
+  `<prepared-rootfs>/etc/resolv.conf` before copying the rootfs into the running
+  LinuxPod VM.
+- Hermetic regression coverage:
+  `TestLinuxPodServicePassesSandboxDNSToRootfsPrepare` proves the sandbox DNS
+  reaches the backend; `go test ./pkg/runtime/linuxpod ./pkg/criserver` passes.
+- Helper validation: `swift build --package-path test/e2e/cri-linuxpod --product
+  linuxpod-helper` passes.
 
 **Secondary findings:**
 
@@ -128,27 +145,26 @@ API and isolated test namespaces, which were cleaned up.
 
 ## Outcome
 
-`linuxpodDNSDiscoveryBlocked` — the repeatable, gated harness and fixture are
-landed and the live run **precisely identifies the blocker**: DNS/Service
-discovery by name is not yet functional on the LinuxPod CRI path because the
-backend does not inject the kubelet-provided `/etc/resolv.conf` into the guest.
-This mirrors the #119 `kubeletHandoffSmokeBlocked` discipline — the code/harness
-blocker is removed and the precise runtime gap is named, rather than a false
-pass.
+`linuxpodDNSInjectionWiredAwaitingLiveRerun` — the repeatable, gated harness and
+fixture are landed; the live run precisely identified the missing
+`/etc/resolv.conf`; and the Go CRI service + Swift helper now materialize the
+kubelet-provided DNS config into each prepared LinuxPod rootfs. The remaining
+work is an operator live rerun to prove the full DNS/Service-discovery matrix on
+`test@192.168.1.122`.
 
 ### Remaining work to close #142
 
-1. **Inject the cluster resolver** into the LinuxPod guest rootfs at container
-   create (the kubelet-provided `resolv.conf` from the CRI `DNSConfig`), so
-   `/etc/resolv.conf` carries the cluster nameserver + search list. This is the
-   blocking change; it most naturally lands alongside the #128 networking path.
-2. **Stabilize the LinuxPod exec path** under repeated/blocking queries so the
+1. **Re-run** `make cri-linuxpod-dns` live on `test@192.168.1.122` with the
+   backend-evidence and churn hooks set, using the protocol-v7 helper/adapter.
+   This should convert the resolver-config blocked-skips into hard PASS/FAIL
+   DNS matrix results.
+2. **Stabilize the LinuxPod exec path** if repeated/blocking queries still expose
+   supervisor read timeouts, so the
    live suite can run the full resolution matrix (coredns-reach, nxdomain-control,
    svc-discovery, headless, cross-namespace, dns-vs-route) and the
    rollout/cri/helper/netd re-checks to a green PASS.
-3. **Re-run** `make cri-linuxpod-dns` live on `test@192.168.1.122` with the
-   backend-evidence and churn hooks set, and update this report + the
-   `docs/MASTER_TASKS.md` row to ✅ with the passing evidence.
+3. Update this report + the `docs/MASTER_TASKS.md` row to ✅ with the passing
+   evidence once the live matrix is green.
 
 ## Non-goals honored
 

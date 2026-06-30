@@ -4,6 +4,11 @@ Date: 2026-06-27
 Outcome: **PASS** for the 60-iteration acceptance path, including follow-up
 `netd` policy-reload churn.
 
+Latest rerun: 2026-06-30, after fixing the soak reachability helper to retry
+against the current Running Pod instead of keeping a stale port-forward target.
+Outcome remained **PASS** for the 60-iteration `rollout,cri,helper,netd`
+acceptance path.
+
 ## Summary
 
 This run extended the post-#139 LinuxPod CRI validation from a short smoke to a
@@ -26,6 +31,12 @@ follow-up run added `test/e2e/cri-k3s/hooks/netd-reload-policy.sh` and repeated
 the 60-iteration soak with `rollout,cri,helper,netd`; it passed with 15 `netd`
 policy reloads, 15/15 route guards, and 15/15 reachability checks.
 
+On 2026-06-30, the netd-inclusive 60-iteration path was rerun after
+`linuxpod-soak.sh` was tightened to re-resolve the latest Running Pod for each
+reachability attempt. This covers the previous false negative where kubelet had
+already replaced the Pod and `kubectl port-forward` failed with `pod not found`
+against the stale target.
+
 ## Environment
 
 - Local repo: commit `3872514 Record LinuxPod adoption validation`
@@ -46,6 +57,8 @@ Diagnostics:
 - Netd follow-up log: `/tmp/macvz-live-140-soak-netd-20260627225201/soak-live.log`
 - Netd follow-up samples:
   `/tmp/macvz-live-140-soak-netd-20260627225201/run/soak-samples.csv`
+- 2026-06-30 rerun output:
+  `/var/folders/0v/kl23hnt5017297mrg62rqwqc0000gn/T/macvz-cri-linuxpod-soak.wwSEH5J8an/out`
 
 ## Command
 
@@ -147,6 +160,29 @@ PASS CRI-L6-1 LinuxPod soak: all checks passed over 60 iterations
 | Helper RSS min/max | 14816KB / 16176KB |
 | Max per-iteration residual before GC convergence | 8 lines |
 
+2026-06-30 netd-inclusive rerun after reachability retry:
+
+```text
+PASS CRI-L6-1 LinuxPod soak: all checks passed over 60 iterations
+```
+
+| Metric | Value |
+| --- | --- |
+| Total iterations | 60 |
+| Rollout churn | 15 |
+| CRI restart churn | 15 |
+| Helper-router restart churn | 15 |
+| Netd policy reload churn | 15 |
+| Netd default-route guard passes | 15/15 |
+| Netd reachability passes | 15/15 |
+| Max container restartCount | 0 |
+| Route guard failures | 0 |
+| Final cleanup residual | 0 |
+| Adapter RSS min/max | 26752KB / 30704KB |
+| Adapter RSS first/last growth | 29984KB -> 28480KB (`-1504KB`) |
+| Helper RSS min/max | 15664KB / 16224KB |
+| Helper RSS first/last growth | 16208KB -> 15744KB (`-464KB`) |
+
 ## Notable Observations
 
 - Rollout churn briefly produced 8 residual audit lines while kubelet still held
@@ -161,6 +197,9 @@ PASS CRI-L6-1 LinuxPod soak: all checks passed over 60 iterations
   sample.
 - The remote route guard passed on every iteration and at final route-after,
   including all 15 `netd` policy reloads in the follow-up run.
+- The 2026-06-30 rerun confirmed the harness fix: the reachability probe no
+  longer treats a stale replaced Pod name as a backend failure, while still
+  requiring actual Service/Pod reachability before the iteration passes.
 
 ## Final State
 

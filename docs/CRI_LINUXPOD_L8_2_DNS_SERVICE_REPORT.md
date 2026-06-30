@@ -2,7 +2,7 @@
 
 Parent: #141 (CRI-L8 k3s compatibility hardening). Sibling of the L8 matrix:
 #143 image lifecycle (L8-4), #144 reboot recovery (L8-5), #145 volume projection
-(L8-3), #146 soak (L8-6 conformance subset, #147).
+(L8-3), #146 soak (L8-1), and #147 conformance subset (L8-6).
 
 ## Goal
 
@@ -71,10 +71,21 @@ Virtual Kubelet and apple/container paths are untouched.
 
 ## Live findings (2026-06-30, `kind-macvz61` + `test@192.168.1.122`, node `macvz-b-cri`)
 
-The harness and ad-hoc probes were run against the real LinuxPod CRI node. The
-node is a genuine LinuxPod serving path: a **two-container** Pod
+The hardened harness was run live against the real LinuxPod CRI node (genuine
+non-simulated LinuxPod backend, protocol 6). The canonical run
+(`/tmp/macvz-live-142-dns-run2/run`) ended **0 failures / 26 skips**: the honesty
+gate passed, scheduling was clean, the `macvz-cri` restart preserved the Pod UID,
+the helper restart recovered the Pod to Running, the `macvz-netd` reload left the
+default route unchanged, and the run-wide route audit confirmed `192.168.1.1` via
+`en0` before and after. Every DNS *resolution* check was uniformly blocked on a
+single precise finding (below), reported as a loud **blocked-skip**, not a faked
+pass — so the suite flips to hard PASS/FAIL the moment DNS injection lands.
+
+The node is a genuine LinuxPod serving path: a **two-container** Pod
 (`dnsPolicy: ClusterFirst`) deployed and reached rollout-available — a shape the
 apple/container path excludes (#82/#86) — confirming the Pod is LinuxPod-backed.
+The finding below was independently reproduced on **two** fresh LinuxPod Pods in
+isolated namespaces during follow-up probing.
 
 **The precise blocker — DNS config is not injected into the LinuxPod guest.**
 On two independent freshly-Running LinuxPod Pods, the container had **no

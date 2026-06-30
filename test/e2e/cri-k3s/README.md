@@ -107,6 +107,33 @@ release.
   silently claimed as a LinuxPod result. `make cri-linuxpod-dns`. Gated by
   `MACVZ_INTEGRATION=1` + `KUBECONFIG`. Report:
   `docs/CRI_LINUXPOD_L8_2_DNS_SERVICE_REPORT.md`.
+- `linuxpod-volumes.sh` — gated **LinuxPod k3s volume-projection matrix** suite
+  (CRI-L8-3 #145), the volume sibling of `linuxpod-inloop.sh`. Where inloop proves
+  the Pod lifecycle and `linuxpod-dns.sh` proves the resolver path, this harness
+  proves the **kubelet-managed Kubernetes volume matrix** an ordinary k3s workload
+  depends on is honored on a LinuxPod Pod by `kubectl exec`-ing inside the
+  containers: `configMap`, `secret`, downward API, the projected service-account
+  token (`/var/run/secrets/kubernetes.io/serviceaccount`: token + ca.crt +
+  namespace), a disk `emptyDir` **shared** across the app and the late sidecar,
+  and a Memory-medium `emptyDir`. Its central discipline is to **distinguish a
+  volume fault from a Pod-networking/Service fault, and a policy outcome from a
+  plumbing one**: every read-only mount is proven read-only by a *failed* write
+  probe (a writable RO mount is a translation bug), read-write scratch is proven
+  writable, content is matched against exact markers, the shared `emptyDir` is
+  verified visible **both** ways across containers, and a ConfigMap patch is
+  asserted to **propagate** into the running Pod (kubelet projected-volume update
+  behavior). Arbitrary `hostPath` is denied by the macOS default mount policy, so
+  allow/deny is covered hermetically (`pkg/criserver` `TestLinuxPodVolumePolicyErrors`
+  / `TestLinuxPodVolumeProjectionMatrix`); an allowlisted-hostPath live probe runs
+  only with `MACVZ_VOLUME_HOSTPATH_PROBE_CMD`. It re-runs the core matrix after
+  **rollout-restart**, **macvz-cri restart** (Pod UID preserved), and **LinuxPod
+  helper restart**, asserts cleanup leaves **no residual** materialized
+  mount/rootfs state (`MACVZ_LINUXPOD_RESIDUAL_CMD`), and keeps the host default
+  route unchanged. It inherits the #130 **honesty gate**: the volume checks run on
+  either backend, but the LinuxPod-specific framing is only asserted when
+  `MACVZ_LINUXPOD_BACKEND_EVIDENCE_CMD` proves a non-simulated LinuxPod Pod.
+  `make cri-linuxpod-volumes`. Gated by `MACVZ_INTEGRATION=1` + `KUBECONFIG`.
+  Report: `docs/CRI_LINUXPOD_L8_3_VOLUME_MATRIX.md`.
 - `fixtures/linuxpod-workload.yaml` — the #130 two-container fixture (app + late
   sidecar) for the LinuxPod backend; the multi-container shared-namespace shape
   the default apple/container path excludes (#82/#86).
@@ -117,6 +144,11 @@ release.
   LinuxPod shape plus a ClusterIP Service and a headless Service, where the late
   sidecar performs a boot-time `nslookup` of its own Service as boot-time DNS
   evidence to complement `linuxpod-dns.sh`'s exec-time probes.
+- `fixtures/linuxpod-volumes-workload.yaml` — the #145 volume-matrix fixture: the
+  app+late-sidecar LinuxPod shape mounting `configMap`/`secret`/downward API
+  (read-only), a disk `emptyDir` shared with the sidecar, and a Memory `emptyDir`;
+  the app records a marker into the shared volume and the sidecar records one back,
+  so `linuxpod-volumes.sh` can prove cross-container sharing in both directions.
 - `node-reboot-recovery.sh` — gated **node reboot / bootstrap recovery** check
   (CRI-L8-5 #144), the recovery sibling of `linuxpod-soak.sh`. Where the soak
   loops service-level churn while the rest of the stack stays up, this proves a
@@ -149,22 +181,26 @@ release.
   subset of the everyday k3s behaviors a real chart relies on, in **one** apply:
   Deployments, ClusterIP + headless Services, DNS, ConfigMaps, Secrets, a
   multi-source projected volume, readiness/liveness probes, `restartPolicy:
-  Always` recovery (a crash-once container), logs, exec, port-forward, cleanup,
-  and node readiness. It is explicitly a **curated subset, NOT full upstream
-  conformance**, and records what it does not cover (StatefulSets/Jobs/CSI/etc.,
-  and the deeper matrices owned by sibling issues #142/#143/#144/#145/#146) so the
-  support claim stays honest. It inherits the #130 **honesty gate**: the ordinary
-  checks run on either backend, but *LinuxPod-backed conformance* is only claimed
-  when `MACVZ_LINUXPOD_BACKEND_EVIDENCE_CMD` proves a non-simulated LinuxPod Pod;
-  otherwise the result is reported against the apple/container path. Each phase
-  writes layer-tagged diagnostics (kubelet/CRI/helper/network/workload) and the
-  run asserts the host default route is unchanged. `make cri-conformance-smoke`.
-  Gated by `MACVZ_INTEGRATION=1` + `KUBECONFIG`. Report:
+  Always` (a backend-agnostic cycling container), logs, exec, port-forward,
+  cleanup, and node readiness. It is explicitly a **curated subset, NOT full
+  upstream conformance**, and records what it does not cover
+  (StatefulSets/Jobs/CSI/etc., and the deeper matrices owned by sibling issues
+  #142/#143/#144/#145/#146) so the support claim stays honest. It inherits the
+  #130 **honesty gate**: universal control-plane behaviors run on either backend,
+  but the LinuxPod-path surfaces (CRI log streaming, in-Pod cluster DNS, CRI
+  restart surfacing) are **gated** — a hard FAIL on a proven LinuxPod-backed node
+  (`MACVZ_LINUXPOD_BACKEND_EVIDENCE_CMD`), a loud known-limitation SKIP otherwise,
+  so a surface is never silently claimed. Each phase writes layer-tagged
+  diagnostics (kubelet/CRI/helper/network/workload) and the run asserts the host
+  default route is unchanged. `make cri-conformance-smoke`. Gated by
+  `MACVZ_INTEGRATION=1` + `KUBECONFIG`. Ran repeatably on `test@192.168.1.122`
+  (apple/container path, `0 FAIL`). Report:
   `docs/CRI_LINUXPOD_L8_6_CONFORMANCE_SMOKE.md`.
 - `fixtures/conformance-smoke.yaml` — the #147 conformance-smoke fixture: an
   app+late-sidecar Deployment (ConfigMap, Secret, projected volume, probes,
-  ClusterIP + headless Service) bundled with a separate crash-once
-  `restartPolicy: Always` Deployment, so a single apply exercises the whole
+  ClusterIP + headless Service) bundled with a separate cycling-container
+  `restartPolicy: Always` Deployment (exits 0 on a loop so `restartCount` climbs
+  with no reliance on volume persistence), so a single apply exercises the whole
   subset.
 
 `run.sh`/`soak.sh` are gated by `MACVZ_INTEGRATION=1`; `k3s-inloop.sh`

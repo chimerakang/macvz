@@ -1,0 +1,174 @@
+# CRI-L8-3 (#145) LinuxPod k3s volume-projection matrix fixture.
+#
+# A two-container app+late-sidecar Pod (the LinuxPod backend's shared-namespace
+# shape, like fixtures/linuxpod-workload.yaml) scheduled by a real Linux
+# k3s/kubelet control plane onto a macOS MacVz CRI node running
+# `macvz-cri --experimental-linuxpod-backend` (CRI-L, #125..#129).
+#
+# Where linuxpod-workload.yaml proves the Pod lifecycle and linuxpod-dns-workload
+# proves DNS, THIS fixture proves the kubelet-managed Kubernetes volume matrix an
+# ordinary k3s workload depends on is honored end to end on the LinuxPod path:
+#
+#   - configMap        projected read-only at /etc/config (+ httpd docroot /www).
+#   - secret           projected read-only at /etc/secret.
+#   - downward API     pod metadata projected read-only at /etc/podinfo.
+#   - projected SA tok  the default service-account token projection auto-mounted
+#                       at /var/run/secrets/kubernetes.io/serviceaccount
+#                       (token + ca.crt + namespace).
+#   - emptyDir (disk)  read-write scratch at /shared, SHARED with the sidecar.
+#   - emptyDir (Memory) guest-local tmpfs at /cache (no host backing).
+#   - hostPath         intentionally omitted from the default fixture: the macOS
+#                       default mount policy denies arbitrary hostPath, so a
+#                       hostPath case is validated hermetically + by the harness'
+#                       allowlist phase rather than baked into the deployed Pod.
+#
+# linuxpod-volumes.sh drives the assertions by `kubectl exec` inside the
+# containers (RO enforcement, content, shared-volume cross-visibility, SA-token
+# presence, projected-update propagation). The same honesty gate as
+# linuxpod-inloop.sh applies: the LinuxPod-specific framing only holds when a
+# backend-evidence hook proves the Pod is genuinely (non-simulated) LinuxPod
+# backed; otherwise the checks still run but are reported against the
+# apple/container path.
+#
+# #84 scheduling-exclusion opt-in is unchanged: select the MacVz runtime label
+# and tolerate the host-namespace taint. Keys mirror pkg/criserver/nodescheme.go.
+#
+# Image: an arm64 busybox providing sh + httpd. linuxpod-volumes.sh substitutes
+# MACVZ_CRI_IMAGE at apply time.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: macvz-cri-linuxpod-vol-e2e
+  labels:
+    app.kubernetes.io/part-of: macvz-cri-linuxpod-vol
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vol-app-config
+  namespace: macvz-cri-linuxpod-vol-e2e
+data:
+  index.html: |
+    macvz-cri-l8-vol-ok
+  app.conf: |
+    marker=macvz-cri-l8-vol-configmap-v1
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: vol-app-secret
+  namespace: macvz-cri-linuxpod-vol-e2e
+type: Opaque
+stringData:
+  token: macvz-cri-l8-vol-secret-ok
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: linuxpod-vol
+  namespace: macvz-cri-linuxpod-vol-e2e
+  labels:
+    app: linuxpod-vol
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: linuxpod-vol
+  template:
+    metadata:
+      labels:
+        app: linuxpod-vol
+    spec:
+      nodeSelector:
+        node.macvz.io/runtime: apple-container
+      tolerations:
+        - key: node.macvz.io/host-namespace-unsupported
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      containers:
+        - name: app
+          image: busybox:1.36.1
+          # Boot-time: record an app marker into the shared emptyDir (readable
+          # from the sidecar) and serve the configMap docroot. The harness does
+          # the RO/RW/content assertions via exec so failures stay classifiable.
+          command:
+            - sh
+            - -c
+            - >-
+              echo macvz-cri-l8-vol-app-boot;
+              echo macvz-cri-l8-vol-app-shared > /shared/app-marker;
+              httpd -f -p 8080 -h /www
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /index.html
+              port: 8080
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            failureThreshold: 12
+          volumeMounts:
+            - name: web
+              mountPath: /www
+              readOnly: true
+            - name: config
+              mountPath: /etc/config
+              readOnly: true
+            - name: secret
+              mountPath: /etc/secret
+              readOnly: true
+            - name: podinfo
+              mountPath: /etc/podinfo
+              readOnly: true
+            - name: shared
+              mountPath: /shared
+            - name: cache
+              mountPath: /cache
+        - name: sidecar
+          image: busybox:1.36.1
+          # Late container sharing the emptyDir: wait for the app marker, then
+          # write its own marker back so the harness can prove cross-container
+          # sharing in both directions.
+          command:
+            - sh
+            - -c
+            - >-
+              for i in $(seq 1 60); do
+                if [ -f /shared/app-marker ]; then
+                  echo macvz-cri-l8-vol-sidecar-shared > /shared/sidecar-marker;
+                  echo macvz-cri-l8-vol-sidecar-boot;
+                  break;
+                fi;
+                sleep 1;
+              done;
+              tail -f /dev/null
+          volumeMounts:
+            - name: shared
+              mountPath: /shared
+      volumes:
+        - name: web
+          configMap:
+            name: vol-app-config
+        - name: config
+          configMap:
+            name: vol-app-config
+        - name: secret
+          secret:
+            secretName: vol-app-secret
+        - name: podinfo
+          downwardAPI:
+            items:
+              - path: labels
+                fieldRef:
+                  fieldPath: metadata.labels
+              - path: name
+                fieldRef:
+                  fieldPath: metadata.name
+        - name: shared
+          emptyDir: {}
+        - name: cache
+          emptyDir:
+            medium: Memory

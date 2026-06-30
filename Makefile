@@ -60,6 +60,10 @@ cri-linuxpod-soak: ## Run the CRI-L6-1 LinuxPod soak/churn harness (set MACVZ_IN
 cri-linuxpod-dns: ## Run the CRI-L8-2 LinuxPod k3s DNS/Service-discovery suite (set MACVZ_INTEGRATION=1 + KUBECONFIG to run live)
 	./test/e2e/cri-k3s/linuxpod-dns.sh
 
+.PHONY: cri-linuxpod-volumes
+cri-linuxpod-volumes: ## Run the CRI-L8-3 LinuxPod k3s volume-projection matrix suite (set MACVZ_INTEGRATION=1 + KUBECONFIG to run live)
+	./test/e2e/cri-k3s/linuxpod-volumes.sh
+
 .PHONY: cri-linuxpod-reboot
 cri-linuxpod-reboot: ## Run the CRI-L8-5 LinuxPod node reboot/bootstrap recovery check (set MACVZ_INTEGRATION=1 + KUBECONFIG to run live)
 	./test/e2e/cri-k3s/node-reboot-recovery.sh

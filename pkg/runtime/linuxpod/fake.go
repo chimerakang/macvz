@@ -103,6 +103,13 @@ type fakeContainer struct {
 	observedIdentity       string
 	identityVerified       bool
 	createdAfterPodRunning bool
+	// mounts is the kubelet-provided mount set the backend was asked to realize in
+	// this container's rootfs namespace (CreateRequest.Mounts). The fake does not
+	// materialize them — the kubelet already wrote the content on the host — but it
+	// records them verbatim so tests can prove the CRI-side volume-projection
+	// translation reaches the backend per container (incl. a shared emptyDir
+	// appearing in every container that mounts it).
+	mounts []Mount
 }
 
 // journalPod is one pod's durable record (#138): everything a restarted helper
@@ -349,6 +356,7 @@ func (f *FakeBackend) CreateContainer(_ context.Context, req CreateRequest) (Con
 		phase:                  runtime.PhaseCreated,
 		expectedIdentity:       rf.expectedIdentity,
 		createdAfterPodRunning: f.podHasRunningLocked(p),
+		mounts:                 append([]Mount(nil), req.Mounts...),
 	}
 	p.containers[c.id] = c
 	// Best-effort: stamp the CRI log file at creation. A log-write failure must not
@@ -587,6 +595,26 @@ func (f *FakeBackend) PortForward(_ context.Context, req PortForwardRequest) (Po
 		Simulated: true,
 		Message:   "simulated port-forward negotiation (no real byte streams)",
 	}, nil
+}
+
+// ContainerMounts returns the mount set the backend recorded for the named
+// container in podID (the verbatim CreateRequest.Mounts), and whether such a
+// container exists. It lets a hermetic test assert the CRI-side volume-projection
+// translation reached the backend per container — including a shared volume that
+// must appear in every container that mounts it. The returned slice is a copy.
+func (f *FakeBackend) ContainerMounts(podID, name string) ([]Mount, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	p, ok := f.pods[podID]
+	if !ok {
+		return nil, false
+	}
+	for _, c := range p.containers {
+		if c.name == name {
+			return append([]Mount(nil), c.mounts...), true
+		}
+	}
+	return nil, false
 }
 
 // lookupLocked resolves a ref to its pod and container. Caller holds mu.

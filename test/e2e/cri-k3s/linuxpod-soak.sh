@@ -396,18 +396,42 @@ route_unchanged() {
 	return 1
 }
 
-# reachable -> 0 if the served marker is reachable via port-forward.
+# reachable -> 0 if the served marker is reachable via port-forward. Kubelet may
+# replace the Pod while a churn action is still settling, so retry with a freshly
+# resolved Running Pod instead of treating one stale port-forward target as a
+# network failure.
 reachable() {
-	local pod lport=18091 ok=0 _; pod="$(pod_name)"
-	[ -n "$pod" ] || return 1
-	kn port-forward "pod/$pod" "$lport:8080" >"$OUT_DIR/pf-$1.log" 2>&1 &
-	PF_PID="$!"
-	for _ in $(seq 1 30); do
-		if curl -fsS "http://127.0.0.1:$lport/index.html" 2>/dev/null | grep -q "$MARKER"; then ok=1; break; fi
-		sleep 0.5
+	local tag="$1" pod lport=18091 ok=0 attempt curl_try log_file="$OUT_DIR/pf-$1.log"
+	: >"$log_file"
+	for attempt in $(seq 1 "$RECOVER_TRIES"); do
+		pod="$(pod_name)"
+		if [ -z "$pod" ] || [ "$(pod_phase "$pod")" != "Running" ]; then
+			printf 'attempt %s: no Running Pod yet\n' "$attempt" >>"$log_file"
+			sleep "$RECOVER_INTERVAL"
+			continue
+		fi
+
+		printf 'attempt %s: port-forward pod/%s\n' "$attempt" "$pod" >>"$log_file"
+		kn port-forward "pod/$pod" "$lport:8080" >>"$log_file" 2>&1 &
+		PF_PID="$!"
+		for curl_try in $(seq 1 30); do
+			if curl -fsS "http://127.0.0.1:$lport/index.html" 2>/dev/null | grep -q "$MARKER"; then
+				ok=1
+				break
+			fi
+			if ! kill -0 "$PF_PID" 2>/dev/null; then
+				printf 'attempt %s: port-forward exited before marker was reachable\n' "$attempt" >>"$log_file"
+				break
+			fi
+			sleep 0.5
+		done
+		kill "$PF_PID" 2>/dev/null || true
+		wait "$PF_PID" 2>/dev/null || true
+		PF_PID=""
+		[ "$ok" = 1 ] && return 0
+		sleep "$RECOVER_INTERVAL"
 	done
-	kill "$PF_PID" 2>/dev/null || true; wait "$PF_PID" 2>/dev/null || true; PF_PID=""
-	[ "$ok" = 1 ]
+	return 1
 }
 
 # exec_logs_ok <pod> <tag> -> 0 if exec serves the marker and logs show the boot

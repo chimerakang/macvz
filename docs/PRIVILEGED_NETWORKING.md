@@ -219,6 +219,14 @@ If the runtime uses a different bridge, set `podNetwork.interface` to match
 before starting the kubelet. A wrong interface produces `binat`/`rdr` rules that
 never match traffic — see [Recovery](#stale-pf-rules).
 
+**Narrow `vmNetCIDRs` on real deployments.** The `192.168.64.0/18` default
+exists because macOS assigns the vmnet subnet dynamically (live nodes have
+received `192.168.81.x`), but the same set is the allowlist `macvz-netd` uses
+to validate `rdr`/`binat`/route targets, and `/18` overlaps common home-LAN
+ranges (`192.168.64.0`–`192.168.127.255`). Once you know the subnet your vmnet
+bridge actually uses (`ifconfig bridge100`), set `vmNetCIDRs` to that /24 so
+the privileged helper rejects redirects to anything else on your LAN.
+
 To make cluster DNS resolve from inside micro-VMs, also set `node.clusterDNS` to
 the CoreDNS ClusterIP (see
 [NETWORKING.md → ClusterIP Services and DNS](NETWORKING.md#clusterip-services-and-dns)).

@@ -8,8 +8,12 @@ import (
 	"github.com/chimerakang/macvz/pkg/network/podnet"
 )
 
-// DefaultVMNetCIDR is apple/container's usual host-only vmnet range. Operators
-// with a different vmnet range should set podNetwork.vmNetCIDRs explicitly.
+// DefaultVMNetCIDR is apple/container's usual host-only vmnet range. It was
+// widened from /22 after Apple vmnet assigned 192.168.81.x on a live node
+// (#137 evidence). The set doubles as macvz-netd's pf redirect-target
+// allowlist, and /18 overlaps common home-LAN ranges (192.168.64-127.x), so
+// operators should narrow podNetwork.vmNetCIDRs to the subnet their vmnet
+// actually allocates (see docs/PRIVILEGED_NETWORKING.md).
 const DefaultVMNetCIDR = "192.168.64.0/18"
 
 // PodNetworkConfig configures the host Pod network path that makes each

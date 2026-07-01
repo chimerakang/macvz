@@ -387,6 +387,50 @@ func TestLinuxPodServiceReapsAgedNotReadySandbox(t *testing.T) {
 	}
 }
 
+// TestLinuxPodServiceReapGraceAnchoredOnNotReadyTransition proves the reap
+// grace is measured from the NotReady transition, not from how long ago the
+// containers exited: a pod whose container finished well before StopPodSandbox
+// still gets the full grace for kubelet to observe the stopped sandbox.
+func TestLinuxPodServiceReapGraceAnchoredOnNotReadyTransition(t *testing.T) {
+	backend := linuxpod.NewFakeBackend()
+	svc := newLinuxPodTestService(t, backend)
+	ctx := context.Background()
+
+	sandboxID := lpRunSandbox(t, svc)
+	appID := lpCreateStart(t, svc, sandboxID, "app")
+
+	// The container exited long before the sandbox is stopped (completed Job
+	// whose Pod object lingers). StopPodSandbox skips already-Exited containers,
+	// preserving the old FinishedAt.
+	c, ok := svc.containers.Get(appID)
+	if !ok {
+		t.Fatalf("container %q missing", appID)
+	}
+	c.State = store.ContainerExited
+	c.FinishedAt = time.Now().Add(-3 * linuxpodNotReadyReapGrace).UnixNano()
+	if err := svc.containers.Put(&c); err != nil {
+		t.Fatalf("persist exited container: %v", err)
+	}
+
+	if _, err := svc.StopPodSandbox(ctx, &runtimeapi.StopPodSandboxRequest{PodSandboxId: sandboxID}); err != nil {
+		t.Fatalf("StopPodSandbox: %v", err)
+	}
+	if _, err := svc.ListPodSandbox(ctx, &runtimeapi.ListPodSandboxRequest{}); err != nil {
+		t.Fatalf("ListPodSandbox: %v", err)
+	}
+	if _, ok := svc.sandboxes.Get(sandboxID); !ok {
+		t.Fatalf("sandbox reaped immediately after StopPodSandbox; grace must anchor on the NotReady transition, not FinishedAt")
+	}
+
+	svc.now = func() time.Time { return time.Now().Add(linuxpodNotReadyReapGrace + time.Second) }
+	if _, err := svc.ListPodSandbox(ctx, &runtimeapi.ListPodSandboxRequest{}); err != nil {
+		t.Fatalf("ListPodSandbox after grace: %v", err)
+	}
+	if _, ok := svc.sandboxes.Get(sandboxID); ok {
+		t.Fatalf("aged NotReady sandbox was not reaped after the full grace")
+	}
+}
+
 func TestLinuxPodServiceStatusMarksBackendLostSandboxNotReady(t *testing.T) {
 	backend := linuxpod.NewFakeBackend()
 	svc := newLinuxPodTestService(t, backend)

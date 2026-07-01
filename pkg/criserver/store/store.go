@@ -43,8 +43,13 @@ type Sandbox struct {
 		Namespace string `json:"namespace"`
 		Attempt   uint32 `json:"attempt"`
 	} `json:"metadata"`
-	State          State             `json:"state"`
-	CreatedAt      int64             `json:"createdAt"` // unix nanoseconds
+	State     State `json:"state"`
+	CreatedAt int64 `json:"createdAt"` // unix nanoseconds
+	// NotReadyAt records when the sandbox transitioned to StateNotReady (unix
+	// nanoseconds, zero if never). The LinuxPod NotReady reaper anchors its
+	// retention grace on it so a freshly stopped sandbox always gets the full
+	// grace regardless of how long ago it was created or its containers exited.
+	NotReadyAt     int64             `json:"notReadyAt,omitempty"`
 	Hostname       string            `json:"hostname,omitempty"`
 	LogDirectory   string            `json:"logDirectory,omitempty"`
 	RuntimeHandler string            `json:"runtimeHandler,omitempty"`
@@ -185,16 +190,29 @@ func (s *Store) Get(id string) (Sandbox, bool) {
 // false if the sandbox is absent; callers decide whether that is an error (it is
 // not for the idempotent Stop path).
 func (s *Store) SetState(id string, state State) (bool, error) {
+	return s.SetStateAt(id, state, 0)
+}
+
+// SetStateAt is SetState with a transition timestamp: when the target state is
+// StateNotReady and nowNano is non-zero, it stamps NotReadyAt (first transition
+// wins — retries and repeated stops keep the original instant) so retention
+// grace can be measured from the transition rather than record creation.
+func (s *Store) SetStateAt(id string, state State, nowNano int64) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	sb, ok := s.m[id]
 	if !ok {
 		return false, nil
 	}
-	if sb.State == state {
+	changed := sb.State != state
+	sb.State = state
+	if state == StateNotReady && nowNano != 0 && sb.NotReadyAt == 0 {
+		sb.NotReadyAt = nowNano
+		changed = true
+	}
+	if !changed {
 		return true, nil
 	}
-	sb.State = state
 	if err := s.persist(sb); err != nil {
 		return true, err
 	}

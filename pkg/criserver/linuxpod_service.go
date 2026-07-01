@@ -607,7 +607,7 @@ func (s *LinuxPodService) StopPodSandbox(ctx context.Context, req *runtimeapi.St
 	if rep.StaleState {
 		klog.ErrorS(errors.New("backend reported stale state"), "StopPodSandbox: cleanup left residual state", "sandbox", sandboxID)
 	}
-	if _, err := s.sandboxes.SetState(sandboxID, store.StateNotReady); err != nil {
+	if _, err := s.sandboxes.SetStateAt(sandboxID, store.StateNotReady, s.now().UnixNano()); err != nil {
 		return nil, status.Errorf(codes.Internal, "StopPodSandbox: %v", err)
 	}
 	return &runtimeapi.StopPodSandboxResponse{}, nil
@@ -967,6 +967,9 @@ func (s *LinuxPodService) discardNotReadySandboxForRecreate(ctx context.Context,
 	return s.discardNotReadySandbox(ctx, sb, "RunPodSandbox")
 }
 
+// discardNotReadySandbox deletes a NotReady sandbox record together with its
+// container records, backend state, network path, and Pod IP reservation.
+// Callers hold s.mu.
 func (s *LinuxPodService) discardNotReadySandbox(ctx context.Context, sb *store.Sandbox, op string) error {
 	if sb == nil || sb.State != store.StateNotReady {
 		return nil
@@ -1003,23 +1006,58 @@ func (s *LinuxPodService) reconcileAllSandboxBackendState(ctx context.Context) {
 
 func (s *LinuxPodService) reapDiscardableNotReadySandboxes(ctx context.Context) {
 	now := s.now().UnixNano()
-	for _, sb := range s.sandboxes.List() {
-		if sb.State != store.StateNotReady {
+	for _, candidate := range s.sandboxes.List() {
+		if candidate.State != store.StateNotReady {
+			continue
+		}
+		// The discard mutates both stores, the backend, and IPAM, so it must be
+		// serialized against RunPodSandbox/StopPodSandbox/RemovePodSandbox under
+		// s.mu; re-check the record after acquiring in case one of them raced.
+		s.mu.Lock()
+		sb, ok := s.sandboxes.Get(candidate.ID)
+		if !ok || sb.State != store.StateNotReady {
+			s.mu.Unlock()
+			continue
+		}
+		if sb.NotReadyAt == 0 {
+			// Record persisted before NotReadyAt existed: start its grace from
+			// first observation instead of reaping a just-recovered store dump.
+			if _, err := s.sandboxes.SetStateAt(sb.ID, store.StateNotReady, now); err != nil {
+				klog.ErrorS(err, "failed to stamp NotReadyAt on legacy sandbox record", "sandbox", sb.ID)
+			}
+			s.mu.Unlock()
 			continue
 		}
 		containers := s.containers.ListBySandbox(sb.ID)
-		staleSince, ok := linuxpodNotReadyStaleSince(sb, containers)
-		if !ok || now-staleSince < int64(linuxpodNotReadyReapGrace) {
+		staleSince, reapable := linuxpodNotReadyStaleSince(sb, containers)
+		if !reapable || now-staleSince < int64(linuxpodNotReadyReapGrace) {
+			s.mu.Unlock()
 			continue
 		}
 		if err := s.discardNotReadySandbox(ctx, &sb, "LinuxPodNotReadyReaper"); err != nil {
 			klog.ErrorS(err, "failed to reap NotReady LinuxPod sandbox", "sandbox", sb.ID)
+		} else {
+			// Only the reaper releases the Pod IP: kubelet's eventual
+			// RemovePodSandbox will miss the deleted record and skip its release,
+			// which would leak the namespace/name-keyed reservation for the life
+			// of the process. The recreate path deliberately keeps the
+			// reservation so the replacement sandbox reuses the same stable IP.
+			s.releaseSandboxIP(&sb)
 		}
+		s.mu.Unlock()
 	}
 }
 
+// linuxpodNotReadyStaleSince returns the instant the reap grace is measured
+// from. A sandbox is reapable only once every container record is Exited with
+// a recorded finish time, and the grace is anchored on the NotReady transition
+// (never CreatedAt/FinishedAt), so kubelet always gets the full grace to
+// observe a freshly stopped sandbox before its records are discarded.
 func linuxpodNotReadyStaleSince(sb store.Sandbox, containers []store.Container) (int64, bool) {
-	staleSince := sb.CreatedAt
+	if sb.NotReadyAt == 0 {
+		return 0, false
+	}
+	staleSince := sb.NotReadyAt
 	for _, c := range containers {
 		if c.State != store.ContainerExited {
 			return 0, false
@@ -1030,9 +1068,6 @@ func linuxpodNotReadyStaleSince(sb store.Sandbox, containers []store.Container) 
 		if c.FinishedAt > staleSince {
 			staleSince = c.FinishedAt
 		}
-	}
-	if staleSince == 0 {
-		return 0, false
 	}
 	return staleSince, true
 }
@@ -1176,7 +1211,7 @@ func (s *LinuxPodService) markSandboxBackendLostLocked(ctx context.Context, sand
 			klog.ErrorS(err, "failed to persist LinuxPod container backend-loss state", "containerID", c.ID, "sandbox", sandboxID)
 		}
 	}
-	if _, err := s.sandboxes.SetState(sandboxID, store.StateNotReady); err != nil {
+	if _, err := s.sandboxes.SetStateAt(sandboxID, store.StateNotReady, s.now().UnixNano()); err != nil {
 		klog.ErrorS(err, "failed to persist LinuxPod sandbox backend-loss state", "sandbox", sandboxID)
 		return
 	}

@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/chimerakang/macvz/pkg/criserver/store"
 	"github.com/chimerakang/macvz/pkg/network"
@@ -309,6 +310,50 @@ func TestLinuxPodDiagnoseReconcileDetachesOnlyLostSandbox(t *testing.T) {
 	}
 	if sb, _ := svc.sandboxes.Get(lose.GetPodSandboxId()); sb.State != store.StateNotReady {
 		t.Errorf("lost sandbox state = %q, want NotReady", sb.State)
+	}
+}
+
+// TestLinuxPodReaperReleasesPodIP proves the NotReady reaper releases the Pod
+// IP reservation when it discards a sandbox record: kubelet's eventual
+// RemovePodSandbox misses the deleted record and skips its release, so unique
+// pod names (Job churn) would otherwise exhaust the pool.
+func TestLinuxPodReaperReleasesPodIP(t *testing.T) {
+	ipam, err := network.NewPodIPAM(testPodCIDR)
+	if err != nil {
+		t.Fatalf("NewPodIPAM: %v", err)
+	}
+	pnet := newFakePodNet()
+	backend := linuxpod.NewFakeBackend()
+	svc := newLinuxPodNetService(t, backend, ipam, pnet)
+	ctx := context.Background()
+
+	resp, err := svc.RunPodSandbox(ctx, &runtimeapi.RunPodSandboxRequest{
+		Config: &runtimeapi.PodSandboxConfig{Metadata: &runtimeapi.PodSandboxMetadata{Name: "oneshot", Namespace: "default", Uid: "uid-1"}},
+	})
+	if err != nil {
+		t.Fatalf("RunPodSandbox: %v", err)
+	}
+	key := "default/oneshot"
+	if ipam.IP(key) == "" {
+		t.Fatal("precondition: sandbox should hold a Pod IP")
+	}
+	if _, err := svc.StopPodSandbox(ctx, &runtimeapi.StopPodSandboxRequest{PodSandboxId: resp.GetPodSandboxId()}); err != nil {
+		t.Fatalf("StopPodSandbox: %v", err)
+	}
+	// While the record survives (kubelet may still RemovePodSandbox), the
+	// reservation is retained.
+	svc.reconcileAllSandboxBackendState(ctx)
+	if ipam.IP(key) == "" {
+		t.Fatal("Pod IP released before the reap grace elapsed")
+	}
+
+	svc.now = func() time.Time { return time.Now().Add(linuxpodNotReadyReapGrace + time.Second) }
+	svc.reconcileAllSandboxBackendState(ctx)
+	if _, ok := svc.sandboxes.Get(resp.GetPodSandboxId()); ok {
+		t.Fatal("aged NotReady sandbox was not reaped")
+	}
+	if got := ipam.IP(key); got != "" {
+		t.Fatalf("reaper leaked Pod IP reservation %q for the discarded sandbox", got)
 	}
 }
 

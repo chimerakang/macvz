@@ -62,9 +62,13 @@ type LinuxPodService struct {
 	addrPollAttempts int
 	addrPollInterval time.Duration
 
-	mu            sync.Mutex
-	statusProbeMu sync.Mutex
-	mountPolicy   MountPolicy
+	mu sync.Mutex
+	// statusProbeMus serializes backend probe→adopt sequences per sandbox so two
+	// concurrent reconciles cannot interleave a miss with an Adopt for the same
+	// Pod, while probes for unrelated Pods proceed concurrently (a single slow
+	// helper reply must not head-of-line-block every other Pod's status).
+	statusProbeMus sync.Map // sandboxID -> *sync.Mutex
+	mountPolicy    MountPolicy
 	images        map[string]struct{} // images "pulled" through the minimal ImageService
 	streamServer  StreamingServer
 	logRoot       string
@@ -340,7 +344,7 @@ func (s *LinuxPodService) CreateContainer(ctx context.Context, req *runtimeapi.C
 		LogPath:     s.linuxpodLogPath(sb, cfg),
 	})
 	if err != nil {
-		if errors.Is(err, linuxpod.ErrInvalid) && strings.Contains(err.Error(), "already exists") {
+		if errors.Is(err, linuxpod.ErrAlreadyExists) {
 			s.markSandboxBackendLostLocked(ctx, sandboxID,
 				"LinuxPod helper already has container state that the CRI store cannot safely match")
 			return nil, status.Errorf(codes.FailedPrecondition,
@@ -509,7 +513,10 @@ func (s *LinuxPodService) ContainerStatus(ctx context.Context, req *runtimeapi.C
 	if !ok {
 		return nil, status.Errorf(codes.NotFound, "ContainerStatus: container %q not found", id)
 	}
-	s.reconcileSandboxBackendState(ctx, c.SandboxID)
+	// One targeted probe: a live container implies a live sandbox, and the
+	// container-miss path funnels through the same adopt/BackendLost fallback
+	// as the sandbox probe, so probing the sandbox here too would just double
+	// the helper round-trips on kubelet's per-container sync path.
 	s.reconcileContainerBackendState(ctx, id)
 	c, ok = s.containers.Get(id)
 	if !ok {
@@ -535,14 +542,14 @@ func (s *LinuxPodService) ContainerStatus(ctx context.Context, req *runtimeapi.C
 	return resp, nil
 }
 
-// ListContainers returns containers matching the filter.
+// ListContainers returns containers matching the filter. Per-container backend
+// probes are deliberately NOT run here: kubelet's PLEG calls this ~1/s, and one
+// blocking helper round-trip per Running container would put O(pods) socket
+// RPCs on that hot path. The background reconciler (StartBackendReconciler)
+// probes containers on its own interval; ContainerStatus stays accurate
+// on-demand per container.
 func (s *LinuxPodService) ListContainers(ctx context.Context, req *runtimeapi.ListContainersRequest) (*runtimeapi.ListContainersResponse, error) {
 	s.reconcileAllSandboxBackendState(ctx)
-	for _, c := range s.containers.List() {
-		if c.State == store.ContainerRunning && c.LinuxPod != nil {
-			s.reconcileContainerBackendState(ctx, c.ID)
-		}
-	}
 	var items []*runtimeapi.Container
 	for _, c := range s.containers.List() {
 		c := c
@@ -954,6 +961,13 @@ func (s *LinuxPodService) StartBackendReconciler(ctx context.Context, interval t
 				return
 			case <-ticker.C:
 				s.reconcileAllSandboxBackendState(reconcileCtx)
+				// Per-container probes live here, off the CRI hot paths: one
+				// helper round-trip per Running container per interval.
+				for _, c := range s.containers.List() {
+					if c.State == store.ContainerRunning && c.LinuxPod != nil {
+						s.reconcileContainerBackendState(reconcileCtx, c.ID)
+					}
+				}
 			}
 		}
 	}()
@@ -1072,14 +1086,24 @@ func linuxpodNotReadyStaleSince(sb store.Sandbox, containers []store.Container) 
 	return staleSince, true
 }
 
+// probeMu returns the per-sandbox mutex serializing backend probe→adopt
+// sequences for that sandbox. Entries are dropped when the sandbox record is
+// reaped/removed only implicitly (the map stays small — one pointer per
+// sandbox ever probed in this process).
+func (s *LinuxPodService) probeMu(sandboxID string) *sync.Mutex {
+	mu, _ := s.statusProbeMus.LoadOrStore(sandboxID, &sync.Mutex{})
+	return mu.(*sync.Mutex)
+}
+
 func (s *LinuxPodService) reconcileSandboxBackendState(ctx context.Context, sandboxID string) {
 	sb, ok := s.sandboxes.Get(sandboxID)
 	if !ok || sb.State != store.StateReady {
 		return
 	}
-	s.statusProbeMu.Lock()
+	probeMu := s.probeMu(sandboxID)
+	probeMu.Lock()
 	_, err := s.backend.PodStatus(ctx, sandboxID)
-	s.statusProbeMu.Unlock()
+	probeMu.Unlock()
 	if err == nil {
 		return
 	} else if !linuxpodBackendMissing(err) {
@@ -1107,9 +1131,10 @@ func (s *LinuxPodService) reconcileContainerBackendState(ctx context.Context, co
 		return
 	}
 
-	s.statusProbeMu.Lock()
+	probeMu := s.probeMu(c.SandboxID)
+	probeMu.Lock()
 	st, err := s.backend.Status(ctx, linuxpod.Ref{PodID: c.SandboxID, ContainerID: c.LinuxPod.BackendContainerID})
-	s.statusProbeMu.Unlock()
+	probeMu.Unlock()
 	if err == nil {
 		if st.Phase != runtime.PhaseRunning {
 			s.mu.Lock()
@@ -1156,9 +1181,10 @@ func (s *LinuxPodService) reconcileContainerBackendState(ctx context.Context, co
 // method already marked the sandbox BackendLost. Unsupported/unknown falls through
 // so the legacy BackendLost fallback remains unchanged.
 func (s *LinuxPodService) tryAdoptSandboxAfterBackendMiss(ctx context.Context, sandboxID string) bool {
-	s.statusProbeMu.Lock()
+	probeMu := s.probeMu(sandboxID)
+	probeMu.Lock()
 	res, err := s.backend.Adopt(ctx, sandboxID)
-	s.statusProbeMu.Unlock()
+	probeMu.Unlock()
 	if errors.Is(err, linuxpod.ErrUnsupported) || linuxpodBackendMissing(err) {
 		return false
 	}
@@ -1241,6 +1267,8 @@ func linuxpodToCRIError(op string, err error) error {
 		return status.Errorf(codes.FailedPrecondition, "%s: %v", op, err)
 	case errors.Is(err, linuxpod.ErrPodNotFound), errors.Is(err, linuxpod.ErrContainerNotFound), errors.Is(err, linuxpod.ErrRootfsNotFound):
 		return status.Errorf(codes.NotFound, "%s: %v", op, err)
+	case errors.Is(err, linuxpod.ErrAlreadyExists):
+		return status.Errorf(codes.AlreadyExists, "%s: %v", op, err)
 	case errors.Is(err, linuxpod.ErrInvalid):
 		return status.Errorf(codes.InvalidArgument, "%s: %v", op, err)
 	default:

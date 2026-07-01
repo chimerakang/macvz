@@ -256,7 +256,7 @@ func (f *FakeBackend) CreatePod(_ context.Context, spec PodSpec) (PodStatus, err
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if _, ok := f.pods[spec.ID]; ok {
-		return PodStatus{}, fmt.Errorf("%w: pod %q already exists", ErrInvalid, spec.ID)
+		return PodStatus{}, fmt.Errorf("%w: pod %q already exists", ErrAlreadyExists, spec.ID)
 	}
 	delete(f.journal, spec.ID)
 	addr := f.SandboxAddressFor[spec.ID]
@@ -345,7 +345,7 @@ func (f *FakeBackend) CreateContainer(_ context.Context, req CreateRequest) (Con
 	}
 	for _, c := range p.containers {
 		if c.name == req.Name {
-			return ContainerStatus{}, fmt.Errorf("%w: container %q already exists in pod %q", ErrInvalid, req.Name, req.PodID)
+			return ContainerStatus{}, fmt.Errorf("%w: container %q already exists in pod %q", ErrAlreadyExists, req.Name, req.PodID)
 		}
 	}
 	rf.bound = true

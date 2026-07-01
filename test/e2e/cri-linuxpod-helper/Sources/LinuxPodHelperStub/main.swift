@@ -16,7 +16,7 @@ import Foundation
 // rejects any mismatch, so a stale stub version breaks the documented
 // stub-backed adapter flow even though Go tests (which skip the handshake)
 // stay green.
-let protocolVersion = 7
+let protocolVersion = 8
 
 // Capabilities advertised in Ping. The stub backs the kubelet surfaces — logs,
 // exec, stats (CRI-L4 #129), execStream (CRI-L4 follow-up #132), and attach,
@@ -152,7 +152,7 @@ final class Model {
             throw BackendError(code: "Invalid", message: "pod id is required")
         }
         if pods[id] != nil {
-            throw BackendError(code: "Invalid", message: "pod \(id) already exists")
+            throw BackendError(code: "AlreadyExists", message: "pod \(id) already exists")
         }
         // Deterministic, plausible host-only address so a client reading it sees an
         // IP-shaped value (CRI-L3, #128). A production helper returns the VM's actual
@@ -211,7 +211,7 @@ final class Model {
             throw BackendError(code: "Invalid", message: "rootfs token \(token) already bound")
         }
         if pod.containers.values.contains(where: { $0.name == name }) {
-            throw BackendError(code: "Invalid", message: "container \(name) already exists in pod \(podID)")
+            throw BackendError(code: "AlreadyExists", message: "container \(name) already exists in pod \(podID)")
         }
         rf.bound = true
         let logPath = (p["logPath"] as? String) ?? ""

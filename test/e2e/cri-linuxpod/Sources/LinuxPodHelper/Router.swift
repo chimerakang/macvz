@@ -251,7 +251,7 @@ actor RouterBackend: LineHandler {
             throw BackendError(code: "Invalid", message: "pod id is required")
         }
         if clients[id] != nil || journal.pods[id] != nil {
-            throw BackendError(code: "Invalid", message: "pod \(id) already exists")
+            throw BackendError(code: "AlreadyExists", message: "pod \(id) already exists")
         }
 
         let socketPath = supervisorSocketPath(for: id)

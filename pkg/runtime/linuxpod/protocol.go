@@ -66,6 +66,7 @@ const (
 	codeContainerNotFound  errCode = "ContainerNotFound"
 	codeRootfsNotFound     errCode = "RootfsNotFound"
 	codeInvalid            errCode = "Invalid"
+	codeAlreadyExists      errCode = "AlreadyExists"
 	codeIdentityUnverified errCode = "IdentityUnverified"
 	codeUnsupported        errCode = "Unsupported"
 	codeInternal           errCode = "Internal"
@@ -83,6 +84,8 @@ func codeForError(err error) errCode {
 		return codeContainerNotFound
 	case errors.Is(err, ErrRootfsNotFound):
 		return codeRootfsNotFound
+	case errors.Is(err, ErrAlreadyExists):
+		return codeAlreadyExists
 	case errors.Is(err, ErrInvalid):
 		return codeInvalid
 	case errors.Is(err, ErrIdentityUnverified):
@@ -110,6 +113,8 @@ func errorForCode(code errCode, msg string) error {
 		return fmt.Errorf("%w: %s", ErrRootfsNotFound, msg)
 	case codeInvalid:
 		return fmt.Errorf("%w: %s", ErrInvalid, msg)
+	case codeAlreadyExists:
+		return fmt.Errorf("%w: %s", ErrAlreadyExists, msg)
 	case codeIdentityUnverified:
 		return fmt.Errorf("%w: %s", ErrIdentityUnverified, msg)
 	case codeUnsupported:

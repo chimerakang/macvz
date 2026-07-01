@@ -44,9 +44,15 @@ var (
 	ErrContainerNotFound = errors.New("linuxpod: container not found")
 	// ErrRootfsNotFound means no prepared rootfs is known for the given token.
 	ErrRootfsNotFound = errors.New("linuxpod: prepared rootfs token not found")
-	// ErrInvalid means the request was malformed (missing required field, duplicate
-	// id, or a state-machine violation such as creating a container before its Pod).
+	// ErrInvalid means the request was malformed (missing required field, or a
+	// state-machine violation such as creating a container before its Pod).
 	ErrInvalid = errors.New("linuxpod: invalid request")
+	// ErrAlreadyExists means the pod or container the request would create is
+	// already live in the backend. The adapter branches on it to reconcile CRI
+	// records against surviving backend state (v8; previously carried as
+	// ErrInvalid with "already exists" message text, which the adapter had to
+	// string-match).
+	ErrAlreadyExists = errors.New("linuxpod: already exists")
 	// ErrIdentityUnverified means StartContainer ran the late process but the rootfs
 	// identity it reported did not match the expected identity staged at prepare
 	// time. The container is left non-Running, mirroring CRI-R16 StartContainer.
@@ -513,5 +519,7 @@ type CleanupReport struct {
 // + capability (Adopt) and HelperInfo.Adoption so a restarted helper can either
 // reattach to existing Pod VM state or report an immediate recreate fallback (#138).
 // v7 added RootfsRequest.DNS so the helper can materialize kubelet's sandbox DNS
-// config into LinuxPod prepared rootfs files (#142).
-const ProtocolVersion = 7
+// config into LinuxPod prepared rootfs files (#142). v8 added the AlreadyExists
+// error code so the adapter reconciles duplicate-create conflicts against
+// surviving backend state without matching error message text (#159).
+const ProtocolVersion = 8

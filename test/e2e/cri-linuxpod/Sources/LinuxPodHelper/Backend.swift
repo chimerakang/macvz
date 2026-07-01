@@ -14,7 +14,7 @@ import Logging
 
 // helperProtocolVersion is the NDJSON wire-protocol version this helper speaks; it
 // must equal pkg/runtime/linuxpod ProtocolVersion.
-let helperProtocolVersion = 7
+let helperProtocolVersion = 8
 
 // parseEvidenceText extracts the observed identity and net-namespace inode the late
 // process wrote into the handoff evidence channel. Free (nonisolated) so the
@@ -353,7 +353,7 @@ actor LinuxPodBackend {
             throw BackendError(code: "Invalid", message: "pod id is required")
         }
         if pods[id] != nil {
-            throw BackendError(code: "Invalid", message: "pod \(id) already exists")
+            throw BackendError(code: "AlreadyExists", message: "pod \(id) already exists")
         }
         let cpus = (p["cpus"] as? Int) ?? 2
         let memoryBytes = (p["memoryBytes"] as? Int).map { UInt64($0) } ?? (1024 * 1024 * 1024)
@@ -587,7 +587,7 @@ actor LinuxPodBackend {
         }
         if rf.bound { throw BackendError(code: "Invalid", message: "rootfs token \(token) already bound") }
         if pod.containers.values.contains(where: { $0.name == name }) {
-            throw BackendError(code: "Invalid", message: "container \(name) already exists in pod \(podID)")
+            throw BackendError(code: "AlreadyExists", message: "container \(name) already exists in pod \(podID)")
         }
 
         let command = (p["command"] as? [String]) ?? []

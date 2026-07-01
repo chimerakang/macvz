@@ -86,6 +86,8 @@
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
+# Shared helper functions (see lib.sh header before adding more).
+. "$HERE/lib.sh"
 FIXTURE="$HERE/fixtures/linuxpod-workload.yaml"
 NS="macvz-cri-linuxpod-e2e"
 DEPLOY="linuxpod-inloop"
@@ -209,12 +211,6 @@ cleanup_trap() {
 }
 trap cleanup_trap EXIT
 
-run_hook() {
-	local cmd="$1"; shift
-	[ -n "$cmd" ] || return 3
-	sh -c "$cmd"
-}
-
 # --- phases ------------------------------------------------------------------
 phase_preflight() {
 	log "Phase: preflight (locate + validate the MacVz CRI node)"
@@ -253,19 +249,6 @@ phase_preflight() {
 		fail "node $NODE is not Ready"
 	fi
 	[ "$FAILURES" = "$failures_before" ]
-}
-
-phase_route_before() {
-	log "Phase: default-route audit (before)"
-	if [ -z "${MACVZ_ROUTE_AUDIT_CMD:-}" ]; then
-		skip "route-before (set MACVZ_ROUTE_AUDIT_CMD to capture/compare the node default route)"
-		return 0
-	fi
-	if run_hook "$MACVZ_ROUTE_AUDIT_CMD" >"$OUT_DIR/route-before.txt" 2>"$OUT_DIR/route-before.err"; then
-		pass "captured node default route(s) ($OUT_DIR/route-before.txt)"
-	else
-		fail "MACVZ_ROUTE_AUDIT_CMD failed before run (see $OUT_DIR/route-before.err)"
-	fi
 }
 
 apply_fixture() {
@@ -342,15 +325,6 @@ phase_backend_evidence() {
 	else
 		skip "backend-evidence did not prove a non-simulated LinuxPod-backed Pod (got neither simulated=false nor a LinuxPod sandbox/VM); LinuxPod acceptances blocked on #127/#128/#129 (see $OUT_DIR/backend-evidence.txt)"
 	fi
-}
-
-# linuxpod_gate <human-phase-name> -> 0 if LinuxPod-backed, else skip+return 1.
-linuxpod_gate() {
-	if [ "$LINUXPOD_BACKED" = 1 ]; then
-		return 0
-	fi
-	skip "$1: not proven LinuxPod-backed (blocked on CRI-L serving #127 + networking #128 + logs/exec/stats #129, and a non-simulated helper). See backend-evidence phase."
-	return 1
 }
 
 phase_shared_ns() {
@@ -493,21 +467,6 @@ phase_service() {
 }
 
 pod_uid() { kn get pod "$1" -o jsonpath='{.metadata.uid}' 2>/dev/null; }
-pod_phase() { kn get pod "$1" -o jsonpath='{.status.phase}' 2>/dev/null; }
-
-# linuxpod_state_count <output-file> -> writes raw audit; prints residual-state
-# line count (LinuxPod VMs/containers/rootfs/handoff/network). A hook failure is
-# distinct (return 2) from a clean zero.
-linuxpod_state_count() {
-	local out_file="$1" raw
-	[ -n "${MACVZ_LINUXPOD_AUDIT_CMD:-}" ] || return 3
-	if ! raw="$(run_hook "$MACVZ_LINUXPOD_AUDIT_CMD" 2>"$out_file.err")"; then
-		printf '%s\n' "$raw" >"$out_file"
-		return 2
-	fi
-	printf '%s\n' "$raw" >"$out_file"
-	printf '%s\n' "$raw" | sed '/^[[:space:]]*$/d' | wc -l | tr -d ' '
-}
 
 phase_restart_cri() {
 	log "Phase: macvz-cri restart recovery"

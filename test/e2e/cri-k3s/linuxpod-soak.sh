@@ -96,6 +96,8 @@
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
+# Shared helper functions (see lib.sh header before adding more).
+. "$HERE/lib.sh"
 FIXTURE="$HERE/fixtures/linuxpod-workload.yaml"
 NS="macvz-cri-linuxpod-soak"
 DEPLOY="linuxpod-inloop"
@@ -216,33 +218,6 @@ cleanup_trap() {
 }
 trap cleanup_trap EXIT
 
-run_hook() {
-	local cmd="$1"; shift
-	[ -n "$cmd" ] || return 3
-	sh -c "$cmd"
-}
-
-run_bounded() {
-	local stdout="$1" stderr="$2" timeout="$3"; shift 3
-	: >"$stdout"
-	: >"$stderr"
-	"$@" >"$stdout" 2>"$stderr" &
-	local pid=$! deadline=$((SECONDS + timeout)) rc=0
-	while kill -0 "$pid" 2>/dev/null; do
-		if [ "$SECONDS" -ge "$deadline" ]; then
-			kill "$pid" 2>/dev/null || true
-			sleep 1
-			kill -9 "$pid" 2>/dev/null || true
-			wait "$pid" 2>/dev/null || true
-			printf 'command timed out after %ss\n' "$timeout" >>"$stderr"
-			return 124
-		fi
-		sleep 1
-	done
-	wait "$pid" || rc=$?
-	return "$rc"
-}
-
 # --- shared helpers ----------------------------------------------------------
 pod_name() {
 	local pod
@@ -255,7 +230,6 @@ pod_name() {
 	printf '%s' "$pod"
 }
 pod_uid()   { kn get pod "$1" -o jsonpath='{.metadata.uid}' 2>/dev/null; }
-pod_phase() { kn get pod "$1" -o jsonpath='{.status.phase}' 2>/dev/null; }
 pod_ip()    { kn get pod "$1" -o jsonpath='{.status.podIP}' 2>/dev/null; }
 pod_restart_count() {
 	local rc; rc="$(kn get pod "$1" -o jsonpath='{.status.containerStatuses[0].restartCount}' 2>/dev/null)"
@@ -302,19 +276,6 @@ helper_rss() {
 		fi
 	fi
 	printf '%s' "$rss"
-}
-
-# linuxpod_state_count <output-file> -> writes raw audit; prints residual-state
-# line count. Return 2 on hook failure (distinct from a clean zero), 3 if unset.
-linuxpod_state_count() {
-	local out_file="$1" raw
-	[ -n "${MACVZ_LINUXPOD_AUDIT_CMD:-}" ] || return 3
-	if ! raw="$(run_hook "$MACVZ_LINUXPOD_AUDIT_CMD" 2>"$out_file.err")"; then
-		printf '%s\n' "$raw" >"$out_file"
-		return 2
-	fi
-	printf '%s\n' "$raw" >"$out_file"
-	printf '%s\n' "$raw" | sed '/^[[:space:]]*$/d' | wc -l | tr -d ' '
 }
 
 # residual_for_iter <output-file> -> echoes residual count, or -1 unset / -2 fail.
@@ -431,37 +392,6 @@ reachable() {
 		[ "$ok" = 1 ] && return 0
 		sleep "$RECOVER_INTERVAL"
 	done
-	return 1
-}
-
-# exec_logs_ok <pod> <tag> -> 0 if exec serves the marker and logs show the boot
-# markers (proves the Pod is genuinely usable, not Running-but-dead).
-exec_logs_ok() {
-	local pod="$1" tag="$2" out
-	run_bounded "$OUT_DIR/$tag-exec.out" "$OUT_DIR/$tag-exec.err" 20 \
-		kn exec "$pod" -c app -- sh -c 'cat /www/index.html 2>/dev/null' || return 1
-	out="$(cat "$OUT_DIR/$tag-exec.out")"
-	printf '%s' "$out" | grep -q "$MARKER" || return 1
-	run_bounded "$OUT_DIR/$tag-logs.out" "$OUT_DIR/$tag-logs.err" 20 \
-		kn logs "$pod" -c app || return 1
-	grep -q "$APP_BOOT_MARKER" "$OUT_DIR/$tag-logs.out" || return 1
-	return 0
-}
-
-# wait_exec_logs_ok <tag> -> echoes the usable Pod name once exec/logs recover.
-# Helper restart can leave the old Pod phase as Running while kubelet is still
-# reconciling a recreated sandbox, so phase alone is not a readiness signal here.
-wait_exec_logs_ok() {
-	local tag="$1" pod="" _
-	for _ in $(seq 1 "$RECOVER_TRIES"); do
-		pod="$(pod_name)"
-		if [ -n "$pod" ] && [ "$(pod_phase "$pod")" = "Running" ] && exec_logs_ok "$pod" "$tag"; then
-			printf '%s' "$pod"
-			return 0
-		fi
-		sleep "$RECOVER_INTERVAL"
-	done
-	printf '%s' "$pod"
 	return 1
 }
 

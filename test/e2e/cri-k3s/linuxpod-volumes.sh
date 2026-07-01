@@ -69,6 +69,8 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# Shared helper functions (see lib.sh header before adding more).
+. "$SCRIPT_DIR/lib.sh"
 FIXTURE="$SCRIPT_DIR/fixtures/linuxpod-volumes-workload.yaml"
 NS="macvz-cri-linuxpod-vol-e2e"
 DEPLOY="linuxpod-vol"
@@ -199,7 +201,6 @@ pod_name() {
 		-o jsonpath='{.items[0].metadata.name}' 2>/dev/null
 }
 pod_uid()   { kn get pod "$1" -o jsonpath='{.metadata.uid}' 2>/dev/null; }
-pod_phase() { kn get pod "$1" -o jsonpath='{.status.phase}' 2>/dev/null; }
 
 # exec_in <pod> <container> <sh-command> <outfile>; never fails the exec itself so
 # the caller classifies the captured output. The trailing `true` guarantees exit 0.
@@ -284,19 +285,6 @@ phase_preflight() {
 		fail "node $NODE is not Ready"
 	fi
 	[ "$FAILURES" = "$failures_before" ]
-}
-
-phase_route_before() {
-	log "Phase: default-route audit (before)"
-	if [ -z "${MACVZ_ROUTE_AUDIT_CMD:-}" ]; then
-		skip "route-before (set MACVZ_ROUTE_AUDIT_CMD to capture/compare the node default route)"
-		return 0
-	fi
-	if run_hook "$MACVZ_ROUTE_AUDIT_CMD" >"$OUT_DIR/route-before.txt" 2>"$OUT_DIR/route-before.err"; then
-		pass "captured node default route(s) ($OUT_DIR/route-before.txt)"
-	else
-		fail "MACVZ_ROUTE_AUDIT_CMD failed before run (see $OUT_DIR/route-before.err)"
-	fi
 }
 
 apply_fixture() {

@@ -91,6 +91,8 @@
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
+# Shared helper functions (see lib.sh header before adding more).
+. "$HERE/lib.sh"
 FIXTURE="$HERE/fixtures/conformance-smoke.yaml"
 NS="macvz-cri-linuxpod-smoke-e2e"
 DEPLOY="linuxpod-smoke"
@@ -213,12 +215,6 @@ cleanup_trap() {
 }
 trap cleanup_trap EXIT
 
-run_hook() {
-	local cmd="$1"; shift
-	[ -n "$cmd" ] || return 3
-	sh -c "$cmd"
-}
-
 # --- phases ------------------------------------------------------------------
 phase_preflight() {
 	log "Phase: preflight (locate + validate the MacVz CRI node) [node-readiness]"
@@ -257,19 +253,6 @@ phase_preflight() {
 		fail "node $NODE is not Ready"
 	fi
 	[ "$FAILURES" = "$failures_before" ]
-}
-
-phase_route_before() {
-	log "Phase: default-route audit (before)"
-	if [ -z "${MACVZ_ROUTE_AUDIT_CMD:-}" ]; then
-		skip "route-before (set MACVZ_ROUTE_AUDIT_CMD to capture/compare the node default route)"
-		return 0
-	fi
-	if run_hook "$MACVZ_ROUTE_AUDIT_CMD" >"$OUT_DIR/route-before.txt" 2>"$OUT_DIR/route-before.err"; then
-		pass "captured node default route(s) ($OUT_DIR/route-before.txt)"
-	else
-		fail "MACVZ_ROUTE_AUDIT_CMD failed before run (see $OUT_DIR/route-before.err)"
-	fi
 }
 
 apply_fixture() {

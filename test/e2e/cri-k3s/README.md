@@ -4,7 +4,9 @@ Experimental MacVz CRI feasibility track (`develop`), issue #80. This directory
 documents how a k3s/kubelet points at the experimental `macvz-cri` adapter and
 runs a realistic `crictl` compatibility, restart, and soak suite. It is **not**
 the shipped Virtual Kubelet path (`test/e2e/e2e.sh`) and must not gate the VK
-release.
+release. For the operator-facing runbook distilled from this harness (wiring,
+startup order, validation, failure diagnosis), see
+[`docs/CRI_NODE_OPERATIONS.md`](../../../docs/CRI_NODE_OPERATIONS.md).
 
 ## Layout
 

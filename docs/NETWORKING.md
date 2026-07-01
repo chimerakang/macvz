@@ -14,7 +14,9 @@ For the operator runbook that ties these layers into one ordered setup +
 verification + recovery procedure (issue #44), see
 [PRIVILEGED_NETWORKING.md](PRIVILEGED_NETWORKING.md). This document explains how
 each layer works; that one is the step-by-step guide to standing it up on a fresh
-Mac and recovering it when routes, pf rules, or the helper go stale.
+Mac and recovering it when routes, pf rules, or the helper go stale. For
+operating a LinuxPod-backed k3s CRI node on top of these layers (issue #150),
+see [CRI_NODE_OPERATIONS.md](CRI_NODE_OPERATIONS.md).
 
 Together these give a Pod on one Mac an L3 path to a Pod hosted on another Mac:
 IPAM assigns the address, the mesh routes the CIDR between hosts, the network

@@ -227,7 +227,7 @@ func (s *LinuxPodService) RunPodSandbox(ctx context.Context, req *runtimeapi.Run
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "RunPodSandbox: %v", err)
 	}
-	podStatus, err := s.backend.CreatePod(ctx, linuxpod.PodSpec{ID: id, Hostname: cfg.GetHostname()})
+	podStatus, err := s.backend.CreatePod(ctx, linuxpodPodSpec(id, cfg))
 	if err != nil {
 		return nil, linuxpodToCRIError("RunPodSandbox", err)
 	}
@@ -282,6 +282,14 @@ func (s *LinuxPodService) CreateContainer(ctx context.Context, req *runtimeapi.C
 	}
 	name := cfg.GetMetadata().GetName()
 	image := cfg.GetImage().GetImage()
+	if reason, bad := unsupportedContainerShape(cfg); bad {
+		return nil, status.Errorf(codes.InvalidArgument,
+			"CreateContainer: container %q uses a shape the LinuxPod CRI adapter cannot honor: %s", name, reason)
+	}
+	for _, w := range ignoredContainerFields(cfg) {
+		klog.InfoS("LinuxPod CreateContainer: explicit request accepted but not enforced (see docs/CRI_FIELD_SUPPORT.md)",
+			"container", name, "sandbox", sandboxID, "detail", w)
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1245,6 +1253,29 @@ func (s *LinuxPodService) markSandboxBackendLostLocked(ctx context.Context, sand
 }
 
 // --- helpers ---
+
+// linuxpodPodSpec builds the helper CreatePod spec from the sandbox config:
+// identity, hostname, and — when kubelet supplied the Pod-level resource sum —
+// the VM size, so a Pod requesting 8Gi does not land in the helper's default
+// 1GiB VM (#162). CPU count is derived from the quota/period ratio (rounded
+// up); zero/unset values leave the helper defaults in place.
+func linuxpodPodSpec(id string, cfg *runtimeapi.PodSandboxConfig) linuxpod.PodSpec {
+	spec := linuxpod.PodSpec{ID: id, Hostname: cfg.GetHostname()}
+	res := cfg.GetLinux().GetResources()
+	if res == nil {
+		return spec
+	}
+	if quota, period := res.GetCpuQuota(), res.GetCpuPeriod(); quota > 0 && period > 0 {
+		spec.CPUs = int((quota + period - 1) / period)
+		if spec.CPUs < 1 {
+			spec.CPUs = 1
+		}
+	}
+	if mem := res.GetMemoryLimitInBytes(); mem > 0 {
+		spec.MemoryBytes = mem
+	}
+	return spec
+}
 
 // linuxpodExpectedIdentity is the deterministic rootfs identity for a CRI
 // container id, mirroring the apple/container handoff path's scheme so the two

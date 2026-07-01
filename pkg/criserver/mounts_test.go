@@ -196,6 +196,44 @@ func TestCreateContainerRejectsBidirectionalPropagation(t *testing.T) {
 	}
 }
 
+// TestCreateContainerRejectsImageVolumeMounts proves an OCI image-volume mount
+// (KEP-4639, empty host_path + image ref) is rejected instead of silently
+// falling into the tmpfs branch, which would present an empty directory where
+// image content was promised (#162).
+func TestCreateContainerRejectsImageVolumeMounts(t *testing.T) {
+	rt := newFakeRuntime()
+	s, sandboxID := newServerWithRuntime(t, rt)
+	ctx := context.Background()
+
+	mounts := []*runtimeapi.Mount{{
+		ContainerPath: "/data",
+		Image:         &runtimeapi.ImageSpec{Image: "docker.io/library/busybox:1.36.1"},
+	}}
+	_, err := s.CreateContainer(ctx, mountReq(sandboxID, "app", mounts))
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("image volume err = %v, want InvalidArgument", err)
+	}
+}
+
+// TestCreateContainerRejectsMountIDMappings proves UID/GID-mapped mounts
+// (user-namespaced pods) are rejected: the adapter applies no ownership
+// mapping in the VM, so honoring the mount would give wrong file ownership.
+func TestCreateContainerRejectsMountIDMappings(t *testing.T) {
+	rt := newFakeRuntime()
+	s, sandboxID := newServerWithRuntime(t, rt)
+	ctx := context.Background()
+
+	mounts := []*runtimeapi.Mount{{
+		HostPath:      "/var/lib/kubelet/pods/uid-1/volumes/kubernetes.io~empty-dir/scratch",
+		ContainerPath: "/scratch",
+		UidMappings:   []*runtimeapi.IDMapping{{HostId: 100000, ContainerId: 0, Length: 65536}},
+	}}
+	_, err := s.CreateContainer(ctx, mountReq(sandboxID, "app", mounts))
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("uid-mapped mount err = %v, want InvalidArgument", err)
+	}
+}
+
 func TestCreateContainerRejectsReservedRuntimeMountTargets(t *testing.T) {
 	// Every reserved target must be rejected even when its host source is an
 	// otherwise-allowed kubelet pods path or an allowlisted hostPath: the guard

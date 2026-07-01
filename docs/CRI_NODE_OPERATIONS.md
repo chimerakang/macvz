@@ -245,6 +245,7 @@ socket and does not need the forwarder or the MASQUERADE rule.
   the live helper).
 - `macvz-cri --support-bundle` — one-shot diagnostics bundle, being added by
   #151 (CRI-L9-3).
+- Which Pod-spec fields are supported/rejected/warned: `docs/CRI_FIELD_SUPPORT.md`.
 - Harness evidence reports: `docs/CRI_LINUXPOD_L8_2_DNS_SERVICE_REPORT.md`,
   `docs/CRI_LINUXPOD_L8_3_VOLUME_MATRIX.md`,
   `docs/CRI_LINUXPOD_L8_4_IMAGE_LIFECYCLE_REPORT.md`,

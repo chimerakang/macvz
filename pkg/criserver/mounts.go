@@ -112,6 +112,23 @@ func translateMountsWithPolicy(policy MountPolicy, mounts []*runtimeapi.Mount) (
 				target, reservedRuntimePrefix, reservedHandoffPath)
 		}
 
+		// An image-volume mount (KEP-4639) also arrives with an empty host_path;
+		// letting it fall through to the tmpfs branch would fabricate an EMPTY
+		// directory where the user was promised image content — reject it before
+		// that branch (#162).
+		if m.GetImage().GetImage() != "" || m.GetImageSubPath() != "" {
+			return nil, nil, status.Errorf(codes.InvalidArgument,
+				"CreateContainer: mount %q requests an OCI image volume (%q), which the adapter does not materialize; mounting it as anything else would present an empty directory instead of the image content",
+				target, m.GetImage().GetImage())
+		}
+		// UID/GID mappings are only sent for user-namespaced pods; the adapter
+		// applies no ownership mapping inside the VM, so honoring the mount while
+		// dropping the mapping would give the wrong file ownership.
+		if len(m.GetUidMappings()) > 0 || len(m.GetGidMappings()) > 0 {
+			return nil, nil, status.Errorf(codes.InvalidArgument,
+				"CreateContainer: mount %q requests UID/GID mappings (user-namespaced pod), which the adapter does not apply inside the Pod VM", target)
+		}
+
 		// An empty host path is a guest-local tmpfs (Memory-medium emptyDir): no
 		// host source to validate, allocate in-guest memory at the target.
 		if m.GetHostPath() == "" {

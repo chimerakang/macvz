@@ -13,8 +13,19 @@ import Foundation
 // serializes calls, mirroring the supervisor's actor serialization. Blocking
 // syscalls are acceptable here because they run inside the actor's executor and the
 // supervisor answers one line per request in order.
+// SupervisorIOTimeout distinguishes "the supervisor did not answer within the
+// op's deadline" from genuine transport death (EPIPE/POLLHUP/connect failure).
+// The router must treat the two differently: a timed-out supervisor may still
+// own a healthy Pod VM and is re-probed, never SIGTERMed outright.
+struct SupervisorIOTimeout: Error {
+    let message: String
+}
+
 final class SupervisorClient: @unchecked Sendable {
-    private static let ioTimeoutSeconds: Int = 2
+    // defaultTimeoutSeconds bounds quick control-plane ops (Ping, status). Long
+    // ops (CreatePod VM boot, rootfs staging, ExecSync with a caller deadline)
+    // must pass an explicit per-op timeout via call(op:payload:timeoutSeconds:).
+    static let defaultTimeoutSeconds: Int = 10
 
     let socketPath: String
     private var fd: Int32 = -1
@@ -61,9 +72,8 @@ final class SupervisorClient: @unchecked Sendable {
         // SIG_IGN set at startup.
         var on: Int32 = 1
         _ = setsockopt(s, SOL_SOCKET, SO_NOSIGPIPE, &on, socklen_t(MemoryLayout<Int32>.size))
-        var timeout = timeval(tv_sec: Self.ioTimeoutSeconds, tv_usec: 0)
-        _ = setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
-        _ = setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+        // No SO_RCVTIMEO/SO_SNDTIMEO: every read/write is gated by poll() with the
+        // per-op deadline, which is the single timeout authority.
         fd = s
         readBuffer.removeAll(keepingCapacity: true)
     }
@@ -74,27 +84,31 @@ final class SupervisorClient: @unchecked Sendable {
     }
 
     // call sends one op and returns the parsed response envelope. A transport failure
-    // throws (router treats it as supervisor-unreachable); a backend-level failure is
-    // carried in the envelope's ok/code/error fields for the router to re-encode.
-    func call(op: String, payload: [String: Any]) throws -> [String: Any] {
+    // throws BackendError (router treats it as supervisor-unreachable); exceeding
+    // timeoutSeconds throws SupervisorIOTimeout, which the router treats as
+    // slow-but-possibly-alive; a backend-level failure is carried in the envelope's
+    // ok/code/error fields for the router to re-encode. The connection is closed on
+    // timeout so a late response can never desynchronize a later request.
+    func call(op: String, payload: [String: Any],
+              timeoutSeconds: Int = SupervisorClient.defaultTimeoutSeconds) throws -> [String: Any] {
         try connect()
         let request: [String: Any] = ["op": op, "payload": payload]
         var line = try JSONSerialization.data(withJSONObject: request)
         line.append(UInt8(ascii: "\n"))
-        try writeAll(line)
-        let respLine = try readLine()
+        try writeAll(line, timeoutSeconds: timeoutSeconds)
+        let respLine = try readLine(timeoutSeconds: timeoutSeconds)
         guard let obj = try? JSONSerialization.jsonObject(with: respLine) as? [String: Any] else {
             throw BackendError(code: "Internal", message: "supervisor returned malformed response")
         }
         return obj
     }
 
-    private func writeAll(_ data: Data) throws {
+    private func writeAll(_ data: Data, timeoutSeconds: Int) throws {
         try data.withUnsafeBytes { raw in
             var off = 0
             let base = raw.baseAddress!
             while off < data.count {
-                try waitFD(events: Int16(POLLOUT), what: "write timeout")
+                try waitFD(events: Int16(POLLOUT), what: "write timeout", timeoutSeconds: timeoutSeconds)
                 let w = write(fd, base + off, data.count - off)
                 if w <= 0 {
                     close()
@@ -107,7 +121,7 @@ final class SupervisorClient: @unchecked Sendable {
 
     // readLine returns the next complete NDJSON line, reading from the socket until a
     // newline arrives. A closed/half-open connection (read <= 0) is a transport error.
-    private func readLine() throws -> Data {
+    private func readLine(timeoutSeconds: Int) throws -> Data {
         while true {
             if let nl = readBuffer.firstIndex(of: UInt8(ascii: "\n")) {
                 let line = readBuffer.subdata(in: readBuffer.startIndex..<nl)
@@ -115,7 +129,7 @@ final class SupervisorClient: @unchecked Sendable {
                 return line
             }
             var chunk = [UInt8](repeating: 0, count: 8192)
-            try waitFD(events: Int16(POLLIN), what: "read timeout")
+            try waitFD(events: Int16(POLLIN), what: "read timeout", timeoutSeconds: timeoutSeconds)
             let n = read(fd, &chunk, chunk.count)
             if n <= 0 {
                 close()
@@ -125,12 +139,12 @@ final class SupervisorClient: @unchecked Sendable {
         }
     }
 
-    private func waitFD(events: Int16, what: String) throws {
+    private func waitFD(events: Int16, what: String, timeoutSeconds: Int) throws {
         var pfd = pollfd(fd: fd, events: events, revents: 0)
-        let rc = poll(&pfd, 1, Int32(Self.ioTimeoutSeconds * 1000))
+        let rc = poll(&pfd, 1, Int32(timeoutSeconds * 1000))
         if rc == 0 {
             close()
-            throw BackendError(code: "Internal", message: "supervisor \(socketPath): \(what)")
+            throw SupervisorIOTimeout(message: "supervisor \(socketPath): \(what) after \(timeoutSeconds)s")
         }
         if rc < 0 {
             close()

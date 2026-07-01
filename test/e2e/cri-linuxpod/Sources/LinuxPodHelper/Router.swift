@@ -35,8 +35,15 @@ struct SupervisorEntry: Codable {
     var sandboxNamespace: String
 }
 
+// supervisorJournalSchemaVersion versions the journal file format itself,
+// deliberately decoupled from the NDJSON wire protocol version: a routine wire
+// bump (v5→v7 happened within one branch) must not make an upgraded router
+// abandon live per-Pod supervisors and leak their VMs. Bump only when
+// SupervisorEntry/SupervisorJournal change incompatibly.
+let supervisorJournalSchemaVersion = 1
+
 struct SupervisorJournal: Codable {
-    var protocolVersion = helperProtocolVersion
+    var journalVersion = supervisorJournalSchemaVersion
     var pods: [String: SupervisorEntry] = [:]
 }
 
@@ -103,6 +110,38 @@ actor RouterBackend: LineHandler {
         // Persist the pruned journal (dropped any unreachable supervisors). Called via
         // the static helper because the actor is not yet fully initialized here.
         Self.writeJournal(loaded, to: Self.journalURL(workRoot: workRoot), logger: logger)
+        Self.sweepUnjournaledResidue(workRoot: workRoot, journal: loaded, logger: logger)
+    }
+
+    // sweepUnjournaledResidue removes supervisor artifacts — sup-* work dirs
+    // (each holding a pod's multi-GiB holder.ext4) and s-*.sock sockets — whose
+    // pod is absent from the journal. Pods that fail or crash mid-CreatePod
+    // before being journaled have no other cleanup path: kubelet retries mint a
+    // fresh sandbox ID and every runtime teardown is journal-keyed. Only
+    // router-named artifacts are touched; anything else in the work dir is left
+    // alone.
+    private static func sweepUnjournaledResidue(workRoot: URL, journal: SupervisorJournal, logger: Logger) {
+        let fm = FileManager.default
+        guard let entries = try? fm.contentsOfDirectory(atPath: workRoot.path) else { return }
+        var keep: Set<String> = []
+        for (podID, entry) in journal.pods {
+            keep.insert("sup-\(safeShort(podID))")
+            keep.insert("s-\(safeShort(podID)).sock")
+            keep.insert(URL(fileURLWithPath: entry.socket).lastPathComponent)
+        }
+        var removed = 0
+        for name in entries {
+            let isSupDir = name.hasPrefix("sup-")
+            let isSocket = name.hasPrefix("s-") && name.hasSuffix(".sock")
+            guard isSupDir || isSocket, !keep.contains(name) else { continue }
+            try? fm.removeItem(at: workRoot.appendingPathComponent(name))
+            removed += 1
+            logger.warning("removed unjournaled supervisor residue",
+                metadata: ["name": "\(name)"])
+        }
+        if removed > 0 {
+            logger.info("startup residue sweep complete", metadata: ["removed": "\(removed)"])
+        }
     }
 
     // probe returns true when a supervisor answers a Ping over its socket: the router's
@@ -171,21 +210,30 @@ actor RouterBackend: LineHandler {
         if podID.isEmpty {
             throw BackendError(code: "Invalid", message: "podID is required")
         }
-        // Reconnect on demand: a supervisor that survived the router restart answers
-        // Adopt with adopted:true and its live container statuses. A transport failure
-        // here means the supervisor died mid-flight, so fall through to the honest
-        // adopted:false fallback rather than erroring.
-        if let client = liveClient(for: podID) {
-            if let resp = try? client.call(op: "Adopt", payload: p), (resp["ok"] as? Bool) == true {
-                return resp
-            }
-            markSupervisorLost(podID, reason: "adopt")
-        }
-        // Journaled but unreachable: honest fallback (adopted:false, no error) so the
-        // adapter routes through BackendLost/recreate and cleans the stale entry (#136).
+        // Unknown pod first, before any probe can prune the journal entry: only a
+        // pod the router never journaled is PodNotFound.
         guard journal.pods[podID] != nil else {
             throw BackendError(code: "PodNotFound", message: podID)
         }
+        // Reconnect on demand: a supervisor that survived the router restart answers
+        // Adopt with adopted:true and its live container statuses. A live
+        // supervisor's answer — including its own ok:false envelope — is
+        // authoritative and never a reason to terminate it.
+        if let client = liveClient(for: podID) {
+            do {
+                return try client.call(op: "Adopt", payload: p)
+            } catch is SupervisorIOTimeout {
+                // Slow ≠ dead: drop the desynced connection but keep the journal
+                // entry and the supervisor; report adopted:false so the adapter
+                // recreates, and a later Cleanup settles VM ownership.
+                clients.removeValue(forKey: podID)?.close()
+            } catch {
+                // Transport death mid-Adopt: the supervisor is gone.
+                markSupervisorLost(podID, reason: "adopt")
+            }
+        }
+        // Journaled but unreachable: honest fallback (adopted:false, no error) so the
+        // adapter routes through BackendLost/recreate and cleans the stale entry (#136).
         return [
             "ok": true,
             "result": [
@@ -215,20 +263,25 @@ actor RouterBackend: LineHandler {
             try waitForSupervisor(client: client, socketPath: socketPath)
         } catch {
             terminate(pid: pid)
+            removeSupervisorResidue(podID: id, socketPath: socketPath)
             throw error
         }
 
         let resp: [String: Any]
         do {
-            resp = try client.call(op: "CreatePod", payload: p)
+            // CreatePod boots the LinuxPod micro-VM; give it a boot-scale deadline,
+            // never the quick control-plane one.
+            resp = try client.call(op: "CreatePod", payload: p, timeoutSeconds: 180)
         } catch {
             client.close()
             terminate(pid: pid)
+            removeSupervisorResidue(podID: id, socketPath: socketPath)
             throw error
         }
         guard (resp["ok"] as? Bool) == true, let result = resp["result"] as? [String: Any] else {
             client.close()
             terminate(pid: pid)
+            removeSupervisorResidue(podID: id, socketPath: socketPath)
             // Surface the supervisor's own error envelope verbatim.
             return resp
         }
@@ -262,8 +315,7 @@ actor RouterBackend: LineHandler {
         clients.removeValue(forKey: podID)
         if let entry = journal.pods[podID] {
             terminate(pid: entry.pid)
-            try? FileManager.default.removeItem(atPath: entry.socket)
-            try? FileManager.default.removeItem(at: workRoot.appendingPathComponent("sup-\(safeShort(podID))"))
+            removeSupervisorResidue(podID: podID, socketPath: entry.socket)
             journal.pods.removeValue(forKey: podID)
             persistJournal()
         }
@@ -271,6 +323,28 @@ actor RouterBackend: LineHandler {
     }
 
     // MARK: Generic routing
+
+    // timeoutSeconds picks the routed op's deadline. Long-running ops get deadlines
+    // matched to what they legitimately do (VM boot, rootfs staging, exec with a
+    // caller-supplied timeout, graceful stop); everything else is a quick
+    // control-plane round-trip.
+    private func timeoutSeconds(for op: String, payload: [String: Any]) -> Int {
+        switch op {
+        case "PrepareContainerRootfs":
+            return 300  // unpacks/stages a container rootfs into the Pod VM
+        case "ExecSync":
+            // The supervisor bounds the exec at the caller's timeoutSeconds
+            // (default 30, Backend.execSync); give it headroom to answer.
+            let reqTimeout = (payload["timeoutSeconds"] as? Int) ?? 0
+            return (reqTimeout > 0 ? reqTimeout : 30) + 15
+        case "StopContainer", "RemoveContainer", "Cleanup":
+            return 90  // may honor a kubelet grace period / delete VM processes
+        case "CreateContainer", "StartContainer":
+            return 60
+        default:
+            return SupervisorClient.defaultTimeoutSeconds
+        }
+    }
 
     private func forward(op: String, payload: [String: Any]) throws -> [String: Any] {
         let podID = (payload["podID"] as? String) ?? ""
@@ -283,10 +357,30 @@ actor RouterBackend: LineHandler {
             throw BackendError(code: "PodNotFound", message: podID)
         }
         do {
-            return try client.call(op: op, payload: payload)
+            return try client.call(op: op, payload: payload,
+                                   timeoutSeconds: timeoutSeconds(for: op, payload: payload))
+        } catch is SupervisorIOTimeout {
+            // Slow ≠ dead. The connection is already closed (a late reply can't
+            // desync a later request); re-probe before any destructive action. A
+            // supervisor that still answers Ping keeps its journal entry and Pod
+            // VM, and the op surfaces as a retriable failure.
+            clients.removeValue(forKey: podID)?.close()
+            if let entry = journal.pods[podID] {
+                let probeClient = SupervisorClient(socketPath: entry.socket)
+                if Self.probe(probeClient) {
+                    clients[podID] = probeClient
+                    logger.warning("routed op timed out but supervisor is alive; retaining it",
+                        metadata: ["podID": "\(podID)", "op": "\(op)"])
+                    throw BackendError(code: "Internal",
+                        message: "\(op) timed out for pod \(podID); supervisor still alive, retry")
+                }
+                probeClient.close()
+            }
+            markSupervisorLost(podID, reason: "\(op) timeout; supervisor unresponsive to ping")
+            throw BackendError(code: "Internal", message: "\(op) timed out for pod \(podID)")
         } catch let e as BackendError {
-            // Transport failure mid-op: the supervisor died. Drop the dead client so a
-            // later Adopt/status falls back, and surface the failure to the caller.
+            // Genuine transport failure mid-op: the supervisor died. Drop the dead
+            // client so a later Adopt/status falls back, and surface the failure.
             markSupervisorLost(podID, reason: op)
             throw e
         }
@@ -313,11 +407,18 @@ actor RouterBackend: LineHandler {
         clients.removeValue(forKey: podID)?.close()
         guard let entry = journal.pods.removeValue(forKey: podID) else { return }
         terminate(pid: entry.pid)
-        try? FileManager.default.removeItem(atPath: entry.socket)
-        try? FileManager.default.removeItem(at: workRoot.appendingPathComponent("sup-\(safeShort(podID))"))
+        removeSupervisorResidue(podID: podID, socketPath: entry.socket)
         persistJournal()
         logger.warning("supervisor lost; dropping journal entry",
             metadata: ["podID": "\(podID)", "reason": "\(reason)", "pid": "\(entry.pid)"])
+    }
+
+    // removeSupervisorResidue deletes the on-disk artifacts a supervisor leaves
+    // behind (its socket and sup-* work dir, which holds the pod's holder.ext4).
+    // Shared by every teardown path so no path forgets one of them.
+    private func removeSupervisorResidue(podID: String, socketPath: String) {
+        try? FileManager.default.removeItem(atPath: socketPath)
+        try? FileManager.default.removeItem(at: workRoot.appendingPathComponent("sup-\(safeShort(podID))"))
     }
 
     // MARK: Supervisor process management
@@ -384,6 +485,10 @@ actor RouterBackend: LineHandler {
     }
 
     private func safeShort(_ podID: String) -> String {
+        Self.safeShort(podID)
+    }
+
+    private static func safeShort(_ podID: String) -> String {
         let mapped = podID.unicodeScalars.map { scalar -> Character in
             CharacterSet.alphanumerics.contains(scalar) ? Character(scalar) : "-"
         }
@@ -399,9 +504,19 @@ actor RouterBackend: LineHandler {
         do {
             let data = try Data(contentsOf: url)
             let journal = try JSONDecoder().decode(SupervisorJournal.self, from: data)
-            if journal.protocolVersion == helperProtocolVersion { return journal }
-            logger.warning("ignoring supervisor journal with mismatched protocol",
-                metadata: ["path": "\(url.path)", "version": "\(journal.protocolVersion)"])
+            if journal.journalVersion == supervisorJournalSchemaVersion { return journal }
+            // Incompatible but decodable journal: terminate the supervisors it names
+            // before discarding, so their Pod VMs are not silently leaked with no
+            // remaining record of the pids/sockets that own them.
+            logger.warning("discarding supervisor journal with incompatible schema; terminating its supervisors",
+                metadata: ["path": "\(url.path)", "version": "\(journal.journalVersion)",
+                           "pods": "\(journal.pods.count)"])
+            for (podID, entry) in journal.pods {
+                logger.warning("terminating supervisor from incompatible journal",
+                    metadata: ["podID": "\(podID)", "pid": "\(entry.pid)"])
+                if entry.pid > 0 { kill(entry.pid, SIGTERM) }
+                try? FileManager.default.removeItem(atPath: entry.socket)
+            }
         } catch {
             logger.warning("ignoring unreadable supervisor journal",
                 metadata: ["path": "\(url.path)", "error": "\(error)"])

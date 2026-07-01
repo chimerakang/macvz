@@ -174,6 +174,10 @@ release: ## Build, sign, and package a darwin/arm64 release + install bundle int
 install-rehearsal: ## Rehearse install→upgrade→rollback→uninstall in a temp prefix (no root; issue #70)
 	./scripts/macvz-install-rehearsal.sh
 
+.PHONY: cri-linuxpod-install-rehearsal
+cri-linuxpod-install-rehearsal: ## Rehearse the LinuxPod CRI node pair install→upgrade→rollback→clean→uninstall in a temp prefix (no root; CRI-L9 #149/#152/#153)
+	./scripts/macvz-cri-linuxpod-rehearsal.sh
+
 .PHONY: sign
 sign: build ## Ad-hoc codesign bin/$(BINARY) for local development
 	codesign --force --sign - $(BIN_DIR)/$(BINARY)

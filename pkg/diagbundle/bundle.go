@@ -91,7 +91,21 @@ func (b *Builder) DirName(node string) string {
 // the run. A manifest.txt index is always written. Build does not archive; call
 // Archive on the returned directory to produce a tar.gz.
 func (b *Builder) Build(ctx context.Context, parentDir, node string) (Result, error) {
-	dir := filepath.Join(parentDir, b.DirName(node))
+	return b.buildAt(ctx, filepath.Join(parentDir, b.DirName(node)), node)
+}
+
+// BuildInto is Build without the timestamped subdirectory: the bundle is
+// written directly into dir (created if needed). It exists for callers that
+// already name the output directory themselves (e.g. `macvz-cri
+// --support-bundle --bundle-out DIR`), where nesting a second timestamped
+// directory would be noise.
+func (b *Builder) BuildInto(ctx context.Context, dir, node string) (Result, error) {
+	return b.buildAt(ctx, dir, node)
+}
+
+// buildAt is the shared body of Build/BuildInto: run every source, redact, and
+// write into exactly dir.
+func (b *Builder) buildAt(ctx context.Context, dir, node string) (Result, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return Result{}, fmt.Errorf("create bundle dir: %w", err)
 	}

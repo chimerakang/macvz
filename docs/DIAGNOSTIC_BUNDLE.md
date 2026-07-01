@@ -83,3 +83,59 @@ public keys, CA data, server URLs, interface names, and CIDRs.
 Redaction is best-effort and is the security boundary of this command. Always
 skim the bundle before sharing it; if you spot a secret the redactor missed,
 report it so a pattern can be added.
+
+## macvz-cri support bundle (CRI/LinuxPod path)
+
+`macvz-cri --support-bundle` is the CRI-node counterpart of `macvz-kubelet
+bundle` (CRI-L9-3, #151). It collects the k3s-compatible CRI adapter's state —
+including the experimental LinuxPod backend's helper handshake and journals —
+prints the output path, and exits without serving.
+
+```sh
+# Bundle for a LinuxPod-backed CRI node, including the helper's journals and
+# tails of the adapter/helper logs.
+macvz-cri --support-bundle \
+  --state-dir ~/.macvz/cri/sandboxes \
+  --linuxpod-helper-socket /tmp/linuxpod-helper.sock \
+  --linuxpod-helper-work-dir ~/.macvz/linuxpod-helper \
+  --pod-network-helper-socket /var/run/macvz-netd.sock \
+  --bundle-log-file /usr/local/var/log/macvz-cri.log \
+  --bundle-log-file /usr/local/var/log/linuxpod-helper.log
+```
+
+Flags (in addition to the serving flags it reuses — `--listen`, `--state-dir`,
+`--streaming-addr`, `--linuxpod-helper-socket`, `--pod-network-helper-socket`):
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--support-bundle` | `false` | Collect the bundle, print its path, and exit. |
+| `--bundle-out` | `./macvz-cri-bundle-<timestamp>` | Directory the bundle is written into. |
+| `--bundle-log-file` | _(none)_ | Extra log file whose last ~500 KB is included (repeatable). |
+| `--no-archive` | `false` | Leave the bundle as a directory; do not create a `tar.gz`. |
+| `--linuxpod-helper-work-dir` | _(none)_ | LinuxPod helper `--work-dir` to collect journals and a residue listing from. |
+
+What it collects:
+
+| Path | Source |
+| --- | --- |
+| `meta/version.txt` | macvz-cri version, os/arch, host, timestamp. |
+| `meta/args.txt` | The (redacted) command line. |
+| `linuxpod/helper-info.json` | Helper handshake/Ping: protocol version, capabilities, simulated flag, adoption counts (when `--linuxpod-helper-socket` is set). |
+| `linuxpod/residual-state.json` | The `--diagnose-linuxpod` residual-state report over the persisted stores. |
+| `linuxpod/supervisor-journal.json` | The helper's router journal from `--linuxpod-helper-work-dir`. |
+| `linuxpod/adoption-journal.json` | The helper's backend adoption journal. |
+| `linuxpod/helper-workdir.txt` | Names+sizes listing of the helper work dir (exposes leftover `sup-*` residue). |
+| `state/sandboxes.txt` | Summary of persisted sandbox records (IDs, identity, state, timestamps, Pod IP). |
+| `state/containers.txt` | Summary of persisted container records (IDs, image, state, exit info). |
+| `network/netd-status.json` | `macvz-netd` self-report over `--pod-network-helper-socket`. |
+| `net/sockets.txt` | Existence/mode/age of the CRI socket, helper sockets, and the streaming addr config. |
+| `logs/*` | Tail (last ~500 KB) of each `--bundle-log-file`. |
+| `manifest.txt` | Index of every file, byte counts, and per-source errors. |
+
+The bundle is fail-soft: a source that fails (unreachable helper, missing
+journal) writes a `<name>.error` sidecar and is noted in `manifest.txt`; only a
+bundle that cannot be written at all fails the command. Every byte passes the
+same redactor as the `macvz-kubelet` bundle before it touches disk (PEM private
+keys, WireGuard keys, JWT/bearer tokens, sensitive `key: value` pairs →
+`[REDACTED]`), so the result is safe to attach to a GitHub issue — but as with
+the VK bundle, redaction is best-effort: skim it before sharing.

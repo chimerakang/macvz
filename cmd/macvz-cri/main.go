@@ -113,6 +113,11 @@ func main() {
 		linuxpodSocket  string
 		linuxpodLogRoot string
 		linuxpodDiag    bool
+		supportBundle   bool
+		bundleOut       string
+		bundleLogFiles  stringList
+		bundleNoArchive bool
+		lpWorkDir       string
 		pn              podNetConfig
 	)
 	flag.StringVar(&listen, "listen", defaultListen,
@@ -157,6 +162,16 @@ func main() {
 		"override LinuxPod CRI container log root for rootless/remote test topologies where /var/log/pods is not writable/readable by both helper and kubelet (empty uses kubelet's log_directory)")
 	flag.BoolVar(&linuxpodDiag, "diagnose-linuxpod", false,
 		"scan persisted LinuxPod CRI state for residual/stale records (CRI-L6-2, #136), print a machine-readable JSON report to stdout, and exit without serving; read-only (never mutates records, IP reservations, or host routes). Pass --linuxpod-helper-socket to probe the live helper backend, otherwise sandbox liveness is reported as unprobed")
+	flag.BoolVar(&supportBundle, "support-bundle", false,
+		"collect a redacted CRI-node diagnostic bundle (CRI-L9-3, #151) — adapter metadata, LinuxPod helper handshake/journals, persisted sandbox/container store summaries, macvz-netd status, socket health, and --bundle-log-file tails — print its path, and exit without serving; individual source failures are recorded inside the bundle (fail-soft) and do not fail the command")
+	flag.StringVar(&bundleOut, "bundle-out", "",
+		"directory the support bundle is written into (default ./macvz-cri-bundle-<timestamp>)")
+	flag.Var(&bundleLogFiles, "bundle-log-file",
+		"extra log file whose tail is included in the support bundle, e.g. the adapter or helper log (repeatable)")
+	flag.BoolVar(&bundleNoArchive, "no-archive", false,
+		"with --support-bundle, leave the bundle as a directory; do not create a tar.gz")
+	flag.StringVar(&lpWorkDir, "linuxpod-helper-work-dir", "",
+		"LinuxPod helper --work-dir to collect supervisor/adoption journals and a residue listing from in the support bundle (optional)")
 	flag.BoolVar(&showVersion, "version", false, "print version and exit")
 
 	klog.InitFlags(nil)
@@ -169,6 +184,27 @@ func main() {
 
 	mc := mountConfig{kubeletPodsDir: kubeletPodsDir, hostPathAllowed: hostPathAllowed}
 	hc := handoffConfig{enabled: handoff, root: handoffRoot}
+
+	if supportBundle {
+		cfg := supportBundleConfig{
+			outDir:        bundleOut,
+			logFiles:      bundleLogFiles,
+			noArchive:     bundleNoArchive,
+			helperWorkDir: lpWorkDir,
+			listen:        listen,
+			stateDir:      stateDir,
+			streamingAddr: streamingAddr,
+			lc:            linuxpodConfig{enabled: linuxpodBackend, helperSocket: linuxpodSocket, logRoot: linuxpodLogRoot},
+			pn:            pn,
+		}
+		if err := runSupportBundle(context.Background(), cfg); err != nil {
+			klog.ErrorS(err, "macvz-cri support bundle failed")
+			klog.Flush()
+			os.Exit(1)
+		}
+		klog.Flush()
+		return
+	}
 
 	if linuxpodDiag {
 		lc := linuxpodConfig{enabled: linuxpodBackend, helperSocket: linuxpodSocket, logRoot: linuxpodLogRoot}

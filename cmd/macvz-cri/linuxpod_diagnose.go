@@ -24,9 +24,27 @@ import (
 // runLinuxPodDiagnose loads the persisted CRI stores under stateDir, optionally
 // connects to the LinuxPod helper, and writes a JSON residual-state report to out.
 func runLinuxPodDiagnose(ctx context.Context, out io.Writer, stateDir string, lc linuxpodConfig) error {
+	report, err := collectLinuxPodResidualReport(ctx, stateDir, lc)
+	if err != nil {
+		return err
+	}
+	enc := json.NewEncoder(out)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(report); err != nil {
+		return fmt.Errorf("encode LinuxPod residual report: %w", err)
+	}
+	return nil
+}
+
+// collectLinuxPodResidualReport is the reusable guts of --diagnose-linuxpod: it
+// loads the persisted CRI stores under stateDir read-only, optionally probes the
+// live LinuxPod helper, and returns the residual-state report. It is shared by
+// the standalone diagnostic above and the --support-bundle collector (CRI-L9-3,
+// #151) so the two never drift.
+func collectLinuxPodResidualReport(ctx context.Context, stateDir string, lc linuxpodConfig) (criserver.LinuxPodResidualReport, error) {
 	sandboxes, skipped, err := store.New(stateDir)
 	if err != nil {
-		return fmt.Errorf("open sandbox store: %w", err)
+		return criserver.LinuxPodResidualReport{}, fmt.Errorf("open sandbox store: %w", err)
 	}
 	if skipped > 0 {
 		klog.InfoS("skipped unparseable sandbox records during diagnostic", "count", skipped, "stateDir", stateDir)
@@ -39,7 +57,7 @@ func runLinuxPodDiagnose(ctx context.Context, out io.Writer, stateDir string, lc
 	}
 	containers, cSkipped, err := store.NewContainerStore(containerDir)
 	if err != nil {
-		return fmt.Errorf("open container store: %w", err)
+		return criserver.LinuxPodResidualReport{}, fmt.Errorf("open container store: %w", err)
 	}
 	if cSkipped > 0 {
 		klog.InfoS("skipped unparseable container records during diagnostic", "count", cSkipped, "stateDir", containerDir)
@@ -55,16 +73,10 @@ func runLinuxPodDiagnose(ctx context.Context, out io.Writer, stateDir string, lc
 	var backend linuxpod.Backend
 	if lc.helperSocket != "" {
 		if _, _, err := (linuxpodConfig{enabled: true, helperSocket: lc.helperSocket}).handshake(ctx); err != nil {
-			return fmt.Errorf("probe LinuxPod helper for diagnostic: %w", err)
+			return criserver.LinuxPodResidualReport{}, fmt.Errorf("probe LinuxPod helper for diagnostic: %w", err)
 		}
 		backend = linuxpod.NewSocketClient(lc.helperSocket)
 	}
 
-	report := criserver.DiagnoseLinuxPodStores(ctx, sandboxes, containers, backend)
-	enc := json.NewEncoder(out)
-	enc.SetIndent("", "  ")
-	if err := enc.Encode(report); err != nil {
-		return fmt.Errorf("encode LinuxPod residual report: %w", err)
-	}
-	return nil
+	return criserver.DiagnoseLinuxPodStores(ctx, sandboxes, containers, backend), nil
 }

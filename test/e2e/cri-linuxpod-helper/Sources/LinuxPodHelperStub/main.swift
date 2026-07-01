@@ -12,7 +12,11 @@ import Foundation
 //
 // Usage: linuxpod-helper-stub --socket /path/to/helper.sock
 
-let protocolVersion = 6
+// Must equal pkg/runtime/linuxpod ProtocolVersion: the macvz-cri handshake
+// rejects any mismatch, so a stale stub version breaks the documented
+// stub-backed adapter flow even though Go tests (which skip the handshake)
+// stay green.
+let protocolVersion = 7
 
 // Capabilities advertised in Ping. The stub backs the kubelet surfaces — logs,
 // exec, stats (CRI-L4 #129), execStream (CRI-L4 follow-up #132), and attach,

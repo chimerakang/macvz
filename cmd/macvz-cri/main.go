@@ -507,11 +507,16 @@ func setupPodNetwork(ctx context.Context, pn podNetConfig) (criserver.PodNetwork
 	if err := router.Start(ctx); err != nil {
 		return nil, nil, noop, fmt.Errorf("start pod network path: %w", err)
 	}
+	// Re-assert the anchor on a timer: macOS's internet-sharing/vmnet NAT
+	// rewrites pf wholesale on VM lifecycle events and flushes our anchor,
+	// which would otherwise sever Pod-IP translation until a sandbox recreate.
+	stopKeepalive := router.StartAnchorKeepalive(ctx, 0)
 	klog.InfoS("Pod networking enabled for CRI adapter",
 		"podCIDR", ipam.CIDR(), "interface", pn.iface, "meshInterface", pn.meshInterface,
 		"ingressInterfaces", []string(pn.ingressInterfaces))
 
 	cleanup := func() {
+		stopKeepalive()
 		if err := router.Stop(context.Background()); err != nil {
 			klog.ErrorS(err, "failed to stop pod network path")
 		}

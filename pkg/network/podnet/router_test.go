@@ -5,6 +5,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // fakeRunner records commands and can inject failures.
@@ -373,5 +374,51 @@ func TestAttachDetachPreservesGlobalDefaultRoute(t *testing.T) {
 		if strings.Contains(cmd, "delete -inet default -interface") {
 			t.Errorf("Router used the unsafe -interface default-route form: %q", cmd)
 		}
+	}
+}
+
+// TestAnchorKeepaliveReasserts proves the keepalive re-loads the anchor ruleset
+// on its timer while endpoints exist (recovering from an external pf wipe, e.g.
+// macOS internet-sharing rewriting pf on VM lifecycle events) and stops
+// re-asserting once stopped.
+func TestAnchorKeepaliveReasserts(t *testing.T) {
+	fr := newFakeRunner()
+	rt := newTestRouter(fr)
+	ctx := context.Background()
+	if err := rt.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := rt.Attach(ctx, Endpoint{PodKey: "ns/pod", PodIP: "10.244.102.2", VMIP: "192.168.74.2", Interface: "bridge100"}); err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	countLoads := func() int {
+		n := 0
+		for _, s := range fr.strings() {
+			if strings.Contains(s, "-f -") {
+				n++
+			}
+		}
+		return n
+	}
+	base := countLoads()
+
+	stop := rt.StartAnchorKeepalive(ctx, 10*time.Millisecond)
+	deadline := time.After(3 * time.Second)
+	for countLoads() < base+2 {
+		select {
+		case <-deadline:
+			t.Fatalf("keepalive did not re-assert the anchor (loads=%d, want >= %d)", countLoads(), base+2)
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	rules, ok := fr.lastAnchorLoad()
+	if !ok || !strings.Contains(rules, "binat on bridge100 from 192.168.74.2 to any -> 10.244.102.2") {
+		t.Fatalf("keepalive reloaded wrong ruleset: %q", rules)
+	}
+	stop()
+	after := countLoads()
+	time.Sleep(50 * time.Millisecond)
+	if got := countLoads(); got != after {
+		t.Fatalf("keepalive kept re-asserting after stop: %d -> %d", after, got)
 	}
 }

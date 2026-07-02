@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"k8s.io/klog/v2"
 )
@@ -169,6 +170,47 @@ func (rt *Router) Start(ctx context.Context) error {
 	}
 	klog.InfoS("pod network started", "interface", rt.cfg.Interface, "anchor", rt.cfg.Anchor, "forwarding", rt.cfg.EnableForwarding)
 	return nil
+}
+
+// StartAnchorKeepalive re-asserts the pf anchor ruleset every interval.
+// macOS services that reprogram pf wholesale — observed live on macOS 26:
+// com.apple.internet-sharing, which vmnet NAT rewrites on VM lifecycle
+// events — flush every other anchor's contents, silently severing Pod-IP
+// translation until the next Attach (which, for a Ready sandbox, kubelet
+// never re-triggers). pf offers no unprivileged way to observe the wipe, so
+// the router re-loads its ruleset blindly on a timer; loadAnchorLocked is
+// idempotent and costs one helper round-trip. Only re-asserts while
+// endpoints or service rules exist. Returns a stop func that waits for the
+// keepalive goroutine to exit.
+func (rt *Router) StartAnchorKeepalive(ctx context.Context, interval time.Duration) func() {
+	if interval <= 0 {
+		interval = 15 * time.Second
+	}
+	kctx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-kctx.Done():
+				return
+			case <-ticker.C:
+				rt.mu.Lock()
+				if rt.started && (len(rt.endpoints) > 0 || len(rt.services) > 0) {
+					if err := rt.loadAnchorLocked(kctx); err != nil {
+						klog.ErrorS(err, "pod network anchor keepalive re-assert failed", "anchor", rt.cfg.Anchor)
+					}
+				}
+				rt.mu.Unlock()
+			}
+		}
+	}()
+	return func() {
+		cancel()
+		<-done
+	}
 }
 
 // Attach maps a Pod's IP to its micro-VM's address. It is idempotent: attaching

@@ -398,10 +398,15 @@ func setupPodNetwork(ctx context.Context, cfg config.Config, p *provider.Provide
 	if err := router.Start(ctx); err != nil {
 		return nil, nil, fmt.Errorf("start pod network path: %w", err)
 	}
+	// Re-assert the anchor on a timer: macOS's internet-sharing/vmnet NAT
+	// rewrites pf wholesale on VM lifecycle events and flushes our anchor,
+	// which would otherwise sever Pod-IP translation until a Pod recreate.
+	stopKeepalive := router.StartAnchorKeepalive(ctx, 0)
 	p.SetPodNetwork(router)
 	klog.InfoS("Pod network path started", "interface", cfg.PodNetwork.Interface)
 
 	return router, func() {
+		stopKeepalive()
 		if err := router.Stop(context.Background()); err != nil {
 			klog.ErrorS(err, "failed to stop pod network path")
 		}
